@@ -180,6 +180,7 @@ int linux_sparc_siginfo_bug = 0;
 int
 isnptl (void)
 {
+#ifdef __GLIBC__
   size_t n = confstr (_CS_GNU_LIBPTHREAD_VERSION, NULL, 0);
   if (n > 0) {
       char *buf = alloca (n);
@@ -189,6 +190,10 @@ isnptl (void)
       }
   }
   return 0;
+#else
+  // Musl supports NTPL by default.
+  return 1;
+#endif
 }
 #endif
 
