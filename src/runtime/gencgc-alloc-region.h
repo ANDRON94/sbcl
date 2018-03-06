@@ -1,7 +1,6 @@
 #ifndef _GENCGC_ALLOC_REGION_H_
 #define _GENCGC_ALLOC_REGION_H_
 
-#define SEGREGATED_CODE 1
 #include "gc.h"
 
 #ifndef LISP_FEATURE_GENCGC
@@ -17,18 +16,17 @@ struct alloc_region {
     void  *end_addr; /* pointer to the byte after the last usable byte */
 
     /* These are needed when closing the region. */
-    page_index_t  first_page;
+    /* 'last_page' is identical to 'find_page_index((char*)end_addr - 1)'
+     * whenever the region is in an open state. The value is preserved on
+     * closing so that allocation can potentially resume where it left off,
+     * though that's not quite how things are implemented at present.
+     */
     page_index_t  last_page;
     void  *start_addr;
 };
 
-#if SEGREGATED_CODE
 // One region for each of {BOXED,UNBOXED,CODE}_PAGE_FLAG
 extern struct alloc_region  gc_alloc_region[3];
-#else
-extern struct alloc_region  boxed_region;
-extern struct alloc_region  unboxed_region;
-#endif
 extern generation_index_t from_space, new_space;
 extern struct weak_pointer *weak_pointers;
 

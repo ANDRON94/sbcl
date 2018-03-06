@@ -28,7 +28,9 @@
 
 (in-package "SB!FASL")
 
-;;; a magic number used to identify our core files
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (use-package "SB-COREFILE")) ; not SB!COREFILE
+
 (defconstant core-magic
   (logior (ash (sb!xc:char-code #\S) 24)
           (ash (sb!xc:char-code #\B) 16)
@@ -74,8 +76,10 @@
 ;;; portable, because as of sbcl-0.7.4 we need somewhat more than
 ;;; 16Mbytes to represent a core, and ANSI only guarantees that
 ;;; ARRAY-DIMENSION-LIMIT is not less than 1024. -- WHN 2002-06-13
-(defstruct bigvec
+(defstruct (bigvec (:constructor %make-bigvec))
   (outer-vector (vector (make-smallvec)) :type (vector smallvec)))
+(defun make-bigvec (&optional (min-size 0))
+  (expand-bigvec (%make-bigvec) min-size))
 
 ;;; analogous to SVREF, but into a BIGVEC
 (defun bvref (bigvec index)
@@ -118,17 +122,18 @@
 
 ;;; Grow BIGVEC (exponentially, so that large increases in size have
 ;;; asymptotic logarithmic cost per byte).
-(defun expand-bigvec (bigvec)
-  (let* ((old-outer-vector (bigvec-outer-vector bigvec))
-         (length-old-outer-vector (length old-outer-vector))
-         (new-outer-vector (make-array (* 2 length-old-outer-vector))))
-    (replace new-outer-vector old-outer-vector)
-    (loop for i from length-old-outer-vector below (length new-outer-vector) do
-          (setf (svref new-outer-vector i)
-                (make-smallvec)))
-    (setf (bigvec-outer-vector bigvec)
-          new-outer-vector))
-  bigvec)
+(defun expand-bigvec (bigvec required-length)
+  (loop
+    (when (>= (bvlength bigvec) required-length)
+      (return bigvec))
+    (let* ((old-outer-vector (bigvec-outer-vector bigvec))
+           (length-old-outer-vector (length old-outer-vector))
+           (new-outer-vector (make-array (* 2 length-old-outer-vector))))
+      (replace new-outer-vector old-outer-vector)
+      (loop for i from length-old-outer-vector below (length new-outer-vector)
+            do (setf (svref new-outer-vector i) (make-smallvec)))
+      (setf (bigvec-outer-vector bigvec)
+            new-outer-vector))))
 
 ;;;; looking up bytes and multi-byte values in a BIGVEC (considering
 ;;;; it as an image of machine memory on the cross-compilation target)
@@ -173,24 +178,16 @@
 ;;; copying GC is in use), then only the active dynamic space gets
 ;;; dumped to core.
 (defvar *dynamic*)
-(defconstant dynamic-core-space-id 1)
-
 (defvar *static*)
-(defconstant static-core-space-id 2)
-
 (defvar *read-only*)
-(defconstant read-only-core-space-id 3)
 
 #!+immobile-space
 (progn
   (defvar *immobile-fixedobj*)
   (defvar *immobile-varyobj*)
-  (defconstant immobile-fixedobj-core-space-id 4)
-  (defconstant immobile-varyobj-core-space-id 5)
   (defvar *immobile-space-map* nil))
 
 (defconstant max-core-space-id (+ 3 #!+immobile-space 2))
-(defconstant deflated-core-space-id-flag 8)
 
 ;;; a GENESIS-time representation of a memory space (e.g. read-only
 ;;; space, dynamic space, or static space)
@@ -203,6 +200,7 @@
   (word-address (missing-arg) :type unsigned-byte :read-only t)
   ;; the gspace contents as a BIGVEC
   (data (make-bigvec) :type bigvec :read-only t)
+  (objects nil)
   ;; the index of the next unwritten word (i.e. chunk of
   ;; SB!VM:N-WORD-BYTES bytes) in DATA, or equivalently the number of
   ;; words actually written in DATA. In order to convert to an actual
@@ -231,6 +229,9 @@
              byte-address target-space-alignment)))
   (%make-gspace :name name
                 :identifier identifier
+                ;; Track object boundaries if a page table will be produced.
+                :objects (if (= identifier dynamic-core-space-id)
+                             (make-array 5000 :fill-pointer 0 :adjustable t))
                 :word-address (ash byte-address (- sb!vm:word-shift))))
 
 ;;;; representation of descriptors
@@ -295,6 +296,23 @@
   (let* ((word-index
           (gspace-claim-n-bytes gspace length page-attributes))
          (ptr (+ (gspace-word-address gspace) word-index)))
+    #!+gencgc
+    (when (gspace-objects gspace)
+      (let ((this (ash word-index sb!vm:word-shift))
+            (next (ash (gspace-free-word-index gspace) sb!vm:word-shift))
+            (objects (gspace-objects gspace)))
+        (flet ((page-index (offset) (floor offset sb!vm:gencgc-card-bytes)))
+          ;; Record this object's byte offset unless it is unimportant
+          ;; for finding page scan start offsets. Define "unimportant" as:
+          ;; starts and ends on same page, and the preceding object does too.
+          ;; This records more objects than are strictly necessary,
+          ;; but it makes life simpler.
+          (unless (and (plusp (length objects))
+                       (= (page-index (aref objects (1- (length objects))))
+                          (page-index (1- this))
+                          (page-index this)
+                          (page-index (1- next))))
+            (vector-push-extend this objects)))))
     (make-descriptor (logior (ash ptr sb!vm:word-shift) lowtag)
                      gspace
                      word-index)))
@@ -302,12 +320,8 @@
 (defun gspace-claim-n-words (gspace n-words)
   (let* ((old-free-word-index (gspace-free-word-index gspace))
          (new-free-word-index (+ old-free-word-index n-words)))
-    ;; Grow GSPACE as necessary until it's big enough to handle
-    ;; NEW-FREE-WORD-INDEX.
-    (do ()
-        ((>= (bvlength (gspace-data gspace))
-             (* new-free-word-index sb!vm:n-word-bytes)))
-      (expand-bigvec (gspace-data gspace)))
+    ;; Grow GSPACE as necessary
+    (expand-bigvec (gspace-data gspace) (* new-free-word-index sb!vm:n-word-bytes))
     ;; Now that GSPACE is big enough, we can meaningfully grab a chunk of it.
     (setf (gspace-free-word-index gspace) new-free-word-index)
     old-free-word-index))
@@ -852,13 +866,13 @@ core and return a descriptor to it."
 
 ;; Simulate *FREE-TLS-INDEX*. This is a count, not a displacement.
 ;; In C, sizeof counts 1 word for the variable-length interrupt_contexts[]
-;; but primitive-object-size counts 0, so add 1, though in fact the C code
+;; but primitive-object-length counts 0, so add 1, though in fact the C code
 ;; implies that it might have overcounted by 1. We could make this agnostic
 ;; of MAX-INTERRUPTS by moving the thread base register up by TLS-SIZE words,
 ;; using negative offsets for all dynamically assigned indices.
 (defvar *genesis-tls-counter*
   (+ 1 sb!vm:max-interrupts
-     (sb!vm:primitive-object-size
+     (sb!vm:primitive-object-length
       (find 'sb!vm::thread sb!vm:*primitive-objects*
             :key #'sb!vm:primitive-object-name))))
 
@@ -923,9 +937,8 @@ core and return a descriptor to it."
 
 (defun unbound-cold-symbol-handler (symbol)
   (let ((host-val (and (boundp symbol) (symbol-value symbol))))
-    (if (typep host-val 'sb!kernel:named-type)
-        (let ((target-val (ctype-to-core (sb!kernel:named-type-name host-val)
-                                         host-val)))
+    (if (typep host-val 'named-type)
+        (let ((target-val (ctype-to-core (named-type-name host-val) host-val)))
           ;; Though it looks complicated to assign cold symbols on demand,
           ;; it avoids writing code to build the layout of NAMED-TYPE in the
           ;; way we build other primordial stuff such as layout-of-layout.
@@ -1128,7 +1141,7 @@ core and return a descriptor to it."
        (cond ((dd-predicate-name (layout-info (classoid-layout classoid))))
              ;; All early INSTANCEs should be STRUCTURE-OBJECTs.
              ;; Except: see hack for CONDITIONs in CLASS-DEPTHOID.
-             ((eq type-name 'structure-object) 'sb!kernel:%instancep)))
+             ((eq type-name 'structure-object) '%instancep)))
       (built-in-classoid
        (let ((translation (specifier-type type-name)))
          (aver (not (contains-unknown-type-p translation)))
@@ -1136,7 +1149,7 @@ core and return a descriptor to it."
                                 :test #'type= :key #'car)))
            (cond (predicate (cdr predicate))
                  ((eq type-name 'stream) 'streamp)
-                 ((eq type-name 't) 'sb!int:constantly-t)
+                 ((eq type-name 't) 'constantly-t)
                  (t (error "No predicate for builtin: ~S" type-name))))))
       (null
        #+nil (format t "~&; PREDICATE-FOR-SPECIALIZER: no classoid for ~S~%"
@@ -1508,6 +1521,7 @@ core and return a descriptor to it."
                          (gspace (symbol-value *cold-symbol-gspace*))
                     &aux (package (symbol-package-for-target-symbol symbol)))
 
+  (declare (symbol symbol))
   ;; Anything on the cross-compilation host which refers to the target
   ;; machinery through the host SB!XC package should be translated to
   ;; something on the target which refers to the same machinery
@@ -1654,11 +1668,18 @@ core and return a descriptor to it."
     ;; Assign the initialization vector for create_thread_struct()
     (cold-set 'sb!thread::*thread-initial-bindings*
               (vector-in-core
-               (mapcar (lambda (pair)
-                         (let* ((name (cold-intern (car pair)))
+               (mapcar (lambda (pair &aux (name (car pair)))
+                         ;; Sanity check - no overlap with GC/interrupt controls
+                         (aver (not (member name sb!vm::!per-thread-c-interface-symbols)))
+                         (let* ((name (cold-intern name))
                                 (value (cdr pair))
-                                (initform (cold-intern value)))
-                           (aver (symbolp value))
+                                (initform
+                                 (cond ((symbolp value)
+                                        (cold-intern value))
+                                       ((is-fixnum-lowtag (descriptor-lowtag value))
+                                        value)
+                                       (t
+                                        (bug "Unsupported thread-local initform")))))
                            (if (null value) name (cold-cons initform name))))
                        bindings)))
     (dolist (binding bindings)
@@ -1842,14 +1863,9 @@ core and return a descriptor to it."
      (ash sb!vm:simple-fun-code-offset sb!vm:word-shift)))
 
 ;;; Handle a DEFUN in cold-load.
-(defun cold-fset (name defn source-loc &optional inline-expansion)
-  ;; SOURCE-LOC can be ignored, because functions intrinsically store
-  ;; their location as part of the code component.
-  ;; The argument is supplied here only to provide context for
-  ;; a redefinition warning, which can't happen in cold load.
-  (declare (ignore source-loc))
-  (sb!int:binding* (((cold-name warm-name)
-                     ;; (SETF f) was descriptorized when dumped, symbols were not.
+(defun cold-fset (name defn &optional inline-expansion)
+  (binding* (((cold-name warm-name)
+              ;; (SETF f) was descriptorized when dumped, symbols were not.
                      (if (symbolp name)
                          (values (cold-intern name) name)
                          (values name (warm-fun-name name))))
@@ -1862,8 +1878,8 @@ core and return a descriptor to it."
     (push (cold-cons cold-name inline-expansion) *!cold-defuns*)
     (write-wordindexed fdefn sb!vm:fdefn-fun-slot defn)
     (let ((fun-entry-addr
-           (+ (logandc2 (descriptor-bits defn) sb!vm:lowtag-mask)
-              (ash sb!vm:simple-fun-code-offset sb!vm:word-shift))))
+            (+ (logandc2 (descriptor-bits defn) sb!vm:lowtag-mask)
+               (ash sb!vm:simple-fun-code-offset sb!vm:word-shift))))
       (declare (ignorable fun-entry-addr)) ; sparc and arm don't need
       #!+(and immobile-code x86-64)
       (write-wordindexed/raw fdefn sb!vm:fdefn-raw-addr-slot
@@ -2028,15 +2044,17 @@ core and return a descriptor to it."
                  *cold-foreign-symbol-table*)
         (error "The foreign symbol ~S is undefined." name))))
 
-(defvar *cold-assembler-objects*) ; list of the code components
+(defvar *cold-assembler-obj*) ; a single code component
 (defvar *cold-assembler-routines*)
-
-(defvar *cold-assembler-fixups*)
 (defvar *cold-static-call-fixups*)
 
 (defun lookup-assembler-reference (symbol &optional (errorp t))
-  (or (cadr (assoc symbol *cold-assembler-routines*))
-      (and errorp (error "Assembler routine ~S not defined." symbol))))
+  (let ((code-component (car *cold-assembler-obj*))
+        (offset (or (cdr (assoc symbol *cold-assembler-routines*))
+                    (and errorp (error "Assembler routine ~S not defined." symbol)))))
+    (when offset
+      (+ (logandc2 (descriptor-bits code-component) sb!vm:lowtag-mask)
+         (calc-offset code-component offset)))))
 
 ;;; Unlike in the target, FOP-KNOWN-FUN sometimes has to backpatch.
 (defvar *deferred-known-fun-refs*)
@@ -2055,16 +2073,16 @@ core and return a descriptor to it."
           sb!vm:word-shift)
      insts-offset-bytes))
 
-(declaim (ftype (function (descriptor sb!vm:word sb!vm:word
-                           keyword &optional keyword) descriptor)
+(declaim (ftype (sfunction (descriptor sb!vm:word sb!vm:word keyword keyword)
+                           descriptor)
                 cold-fixup))
-(defun cold-fixup (code-object after-header value kind &optional flavor)
+(defun cold-fixup (code-object after-header value kind flavor)
   (declare (ignorable flavor))
   (let* ((offset-within-code-object (calc-offset code-object after-header))
          (gspace-byte-offset (+ (descriptor-byte-offset code-object)
                                 offset-within-code-object)))
     #!-(or x86 x86-64)
-    (sb!vm::fixup-code-object code-object gspace-byte-offset value kind)
+    (sb!vm::fixup-code-object code-object gspace-byte-offset value kind flavor)
 
     #!+(or x86 x86-64)
     (let* ((gspace-data (descriptor-mem code-object))
@@ -2087,9 +2105,13 @@ core and return a descriptor to it."
       (assert (= obj-start-addr
                  (+ gspace-base (descriptor-byte-offset code-object))))
 
+      ;; FIXME: every other backend has the code factored out nicely into
+      ;; {target}-vm.lisp, but x86 doesn't. Is it really so impossible?
       ;; See FIXUP-CODE-OBJECT in x86-vm.lisp and x86-64-vm.lisp.
       ;; Except for the use of saps, this is basically identical.
-      (when (ecase kind
+      (let
+          ((savep
+            (ecase kind
              (:absolute
               (setf (bvref-32 gspace-data gspace-byte-offset)
                     (the (unsigned-byte 32) addr))
@@ -2102,6 +2124,12 @@ core and return a descriptor to it."
               #!+x86-64
               (member flavor '(:named-call :layout :immobile-object
                                :assembly-routine :static-call)))
+             #!+x86-64
+             (:absolute64
+              (setf (bvref-64 gspace-data gspace-byte-offset)
+                    (the (unsigned-byte 64) addr))
+              ;; Never record it. (FIXME: this is a problem for relocatable heap)
+              nil)
              (:relative ; (used for arguments to X86 relative CALL instruction)
               (setf (bvref-32 gspace-data gspace-byte-offset)
                     (the (signed-byte 32)
@@ -2111,26 +2139,33 @@ core and return a descriptor to it."
               ;; and we don't record those fixups.
               #!+x86 (and in-dynamic-space
                           (not (< obj-start-addr addr code-end-addr)))
-              #!+x86-64 nil))
-        (push after-header (gethash (descriptor-bits code-object)
-                                    *code-fixup-notes*)))))
+              #!+x86-64 (if (eq flavor :foreign) :relative)))))
+        (when savep
+          (push (cons (if (eq savep :relative) :relative :absolute) after-header)
+                (gethash (descriptor-bits code-object)
+                         *code-fixup-notes*))))))
   code-object)
 
-(defun resolve-assembler-fixups ()
-  (dolist (fixup *cold-assembler-fixups*)
-    (let* ((routine (car fixup))
-           (value (lookup-assembler-reference routine)))
-      (when value
-        (cold-fixup (second fixup) (third fixup) value (fourth fixup)
-                    :assembly-routine))))
-  ;; Static calls are very similar to assembler routine calls,
-  ;; so take care of those too.
+(defun resolve-static-call-fixups ()
   (dolist (fixup *cold-static-call-fixups*)
     (destructuring-bind (name kind code offset) fixup
       (cold-fixup code offset
                   (cold-fun-entry-addr
                    (cold-fdefn-fun (cold-fdefinition-object name)))
                   kind :static-call))))
+
+;;; Save a cons of both kinds of fixups if there are both, otherwise just the
+;;; not-explicitly-relative kind (which include both kinds for 32-bit x86)
+;;; (cf. FINISH-FIXUPS in generic/target-core.)
+(defun repack-fixups (list)
+  (collect ((relative) (absolute))
+    (dolist (item list)
+      (if (eq (car item) :relative)
+          (relative (cdr item))
+          (absolute (cdr item))))
+    (let ((packed-rel (number-to-core (sb!c::pack-code-fixup-locs (relative))))
+          (packed-abs (number-to-core (sb!c::pack-code-fixup-locs (absolute)))))
+      (if (relative) (cold-cons packed-abs packed-rel) packed-abs))))
 
 #!+sb-dynamic-core
 (defun dyncore-note-symbol (symbol-name datap)
@@ -2163,10 +2198,11 @@ core and return a descriptor to it."
                                                     (if (listp key) (car key) key)))))
                (if (listp key) (cold-list sym) sym))
              'sb!vm::+required-foreign-symbols+)
-    (to-core (sort (copy-list *cold-assembler-routines*) #'string< :key #'car)
+    (cold-set (cold-intern '*assembler-routines*) (car *cold-assembler-obj*))
+    (to-core (setq *cold-assembler-routines*
+                   (sort (copy-list *cold-assembler-routines*) #'< :key 'cdr))
              (lambda (rtn)
-               (cold-list (cold-intern (first rtn))
-                          (third rtn) (number-to-core (fourth rtn))))
+               (cold-cons (cold-intern (first rtn)) (make-fixnum-descriptor (cdr rtn))))
              '*!initial-assembler-routines*)))
 
 
@@ -2550,6 +2586,11 @@ core and return a descriptor to it."
             (%svset (apply 'cold-svset args))
             (t (call fun :sb-cold-funcall-handler/for-effect args)))))))
 
+;;; Needed for certain L-T-V lambdas that use the -NO-SKIP variant of funcall.
+#-c-headers-only
+(setf (svref **fop-funs** (get 'fop-funcall-no-skip 'opcode))
+      (svref **fop-funs** (get 'fop-funcall 'opcode)))
+
 (defun finalize-load-time-value-noise ()
   (cold-set '*!load-time-values*
             (allocate-vector-object *dynamic*
@@ -2603,10 +2644,6 @@ core and return a descriptor to it."
          (fun (cold-fdefn-fun (cold-fdefinition-object name))))
     (if (cold-null fun) `(:known-fun . ,name) fun)))
 
-#!-(or x86 (and x86-64 (not immobile-space)))
-(define-cold-fop (fop-sanctify-for-execution)
-  (pop-stack))
-
 ;;; Setting this variable shows what code looks like before any
 ;;; fixups (or function headers) are applied.
 #!+sb-show (defvar *show-pre-fixup-code-p* nil)
@@ -2617,18 +2654,13 @@ core and return a descriptor to it."
             ;; Note that the number of constants is rounded up to ensure
             ;; that the code vector will be properly aligned.
             (header-n-words (round-up raw-header-n-words 2))
-            (toplevel-p (pop-stack))
+            (immobile-p (pop-stack))
             (debug-info (pop-stack))
             (des (allocate-cold-descriptor
-                  #!-immobile-code *dynamic*
-                  ;; toplevel-p is an indicator of whether the code will
-                  ;; will become garbage. If so, put it in dynamic space,
-                  ;; otherwise immobile space.
-                  #!+immobile-code
-                  (if toplevel-p *dynamic* *immobile-varyobj*)
+                  (or #!+immobile-code (and immobile-p *immobile-varyobj*) *dynamic*)
                   (+ (ash header-n-words sb!vm:word-shift) code-size)
                   sb!vm:other-pointer-lowtag)))
-       (declare (ignorable toplevel-p))
+       (declare (ignorable immobile-p))
        (write-header-word des header-n-words sb!vm:code-header-widetag)
        (write-wordindexed des sb!vm:code-code-size-slot
                           (make-fixnum-descriptor code-size))
@@ -2680,7 +2712,7 @@ core and return a descriptor to it."
                      "/#X~8,'0x: #X~8,'0x~%"
                      (+ i (gspace-byte-address (descriptor-gspace des)))
                      (bvref-32 (descriptor-mem des) i)))))
-       des)))
+       (apply-fixups (%fasl-input-stack fasl-input) des 0))))
 
 #-c-headers-only
 (let ((i (get 'fop-code 'opcode)))
@@ -2741,148 +2773,89 @@ core and return a descriptor to it."
   (fill **fop-funs** #'cold-fop-fun-entry :start i :end (+ i 4))
   (values))
 
-#!+sb-thread
-(define-cold-fop (fop-symbol-tls-fixup)
-  (let* ((symbol (pop-stack))
-         (kind (pop-stack))
-         (code-object (pop-stack)))
-    (cold-fixup code-object
-                (read-word-arg (fasl-input-stream))
-                (ensure-symbol-tls-index symbol)
-                kind))) ; and re-push code-object
-
-(define-cold-fop (fop-foreign-fixup)
-  (let* ((kind (pop-stack))
-         (code-object (pop-stack))
-         (len (read-byte-arg (fasl-input-stream)))
-         (sym (make-string len))
-         (dummy (read-string-as-bytes (fasl-input-stream) sym))
-         (offset (read-word-arg (fasl-input-stream)))
-         (value #!+sb-dynamic-core (dyncore-note-symbol sym nil)
-                #!-sb-dynamic-core (cold-foreign-symbol-address sym)))
-    (declare (ignore dummy))
-    (cold-fixup code-object offset value kind :foreign))) ; and re-push code-object
-
-#!+linkage-table
-(define-cold-fop (fop-foreign-dataref-fixup)
-  (let* ((kind (pop-stack))
-         (code-object (pop-stack))
-         (len (read-byte-arg (fasl-input-stream)))
-         (sym (make-string len)))
-    #!-sb-dynamic-core (declare (ignore code-object))
-    (read-string-as-bytes (fasl-input-stream) sym)
-    #!+sb-dynamic-core
-    (let ((offset (read-word-arg (fasl-input-stream)))
-          (value (dyncore-note-symbol sym t)))
-      (cold-fixup code-object offset value kind :foreign-dataref)) ; and re-push code-object
-    #!-sb-dynamic-core
-    (progn
-      (maphash (lambda (k v)
-                 (format *error-output* "~&~S = #X~8X~%" k v))
-               *cold-foreign-symbol-table*)
-      (error "shared foreign symbol in cold load: ~S (~S)" sym kind))))
-
 (define-cold-fop (fop-assembler-code)
   (let* ((length (read-word-arg (fasl-input-stream)))
+         (aligned-length (round-up length (* 2 sb!vm:n-word-bytes)))
          (header-n-words
           ;; Note: we round the number of constants up to ensure that
           ;; the code vector will be properly aligned.
           (round-up sb!vm:code-constants-offset 2))
-         (des (allocate-cold-descriptor (or #!+immobile-space *immobile-varyobj*
-                                            *read-only*)
-                                        (+ (ash header-n-words
-                                                sb!vm:word-shift)
-                                           length)
-                                        sb!vm:other-pointer-lowtag)))
-    (push des *cold-assembler-objects*)
-    (write-header-word des header-n-words sb!vm:code-header-widetag)
-    (write-wordindexed des
-                       sb!vm:code-code-size-slot
-                       (make-fixnum-descriptor length))
-    (write-wordindexed des sb!vm:code-debug-info-slot *nil-descriptor*)
-
-    (let* ((start (+ (descriptor-byte-offset des)
-                     (ash header-n-words sb!vm:word-shift)))
-           (end (+ start length)))
+         (asm-code *cold-assembler-obj*)
+         (des (car asm-code))
+         (cur-length 0)
+         (space (or #!+immobile-space *immobile-varyobj* *read-only*)))
+    (cond (des
+           (setq cur-length
+                 (descriptor-fixnum (read-wordindexed des sb!vm:code-code-size-slot)))
+           (aver (= (gspace-free-word-index space)
+                    (+ (/ cur-length sb!vm:n-word-bytes) header-n-words)))
+           (incf (gspace-free-word-index space) (/ aligned-length sb!vm:n-word-bytes)))
+          (t
+           (setq des (allocate-cold-descriptor
+                      space
+                      (+ (ash header-n-words sb!vm:word-shift) length)
+                      sb!vm:other-pointer-lowtag))
+           (setf asm-code (list des) *cold-assembler-obj* asm-code)
+           (write-header-word des header-n-words sb!vm:code-header-widetag)))
+    (write-wordindexed  des sb!vm:code-code-size-slot
+                        (make-fixnum-descriptor (+ cur-length aligned-length)))
+    (push aligned-length (cdr asm-code))
+    (let ((start (+ (descriptor-byte-offset des)
+                    (ash header-n-words sb!vm:word-shift)
+                    cur-length)))
       (read-bigvec-as-sequence-or-die (descriptor-mem des)
                                       (fasl-input-stream)
                                       :start start
-                                      :end end))
-    des))
+                                      :end (+ start length)))
+    ;; Extra offset is the amount by which this assembly code component moves
+    ;; to stick it on to the end of the previous batch of assembly routines.
+    (let ((extra-offset (apply #'+ (cddr asm-code))))
+      ;; Update the name -> address table.
+      (dotimes (i (descriptor-fixnum (pop-stack)))
+        (let ((offset (+ (descriptor-fixnum (pop-stack)) extra-offset))
+              (name (pop-stack)))
+          (push (cons name offset) *cold-assembler-routines*)))
+      (apply-fixups (%fasl-input-stack (fasl-input)) des extra-offset))))
 
-(define-cold-fop (fop-assembler-routine)
-  (let* ((name (pop-stack))
-         (code-component (pop-stack))
-         (offset (read-word-arg (fasl-input-stream))))
-    (push (list name
-                ;; Compute the value to write at the fixup location
-                (+ (logandc2 (descriptor-bits code-component) sb!vm:lowtag-mask)
-                   (calc-offset code-component offset))
-                ;; Store the bits to correctly compute *ASSEMBLER-ROUTINES*
-                ;; even if the routines are loaded at a differet address
-                ;; from expected (which implies not readonly space)
-                code-component offset)
-          *cold-assembler-routines*)
-    code-component))
-
-(define-cold-fop (fop-assembler-fixup)
-  (let* ((routine (pop-stack))
-         (kind (pop-stack))
-         (code-object (pop-stack))
-         (offset (read-word-arg (fasl-input-stream))))
-    (push (list routine code-object offset kind) *cold-assembler-fixups*)
-    code-object))
-
-(define-cold-fop (fop-code-object-fixup)
-  (let* ((kind (pop-stack))
-         (code-object (pop-stack))
-         (offset (read-word-arg (fasl-input-stream)))
-         (value (descriptor-bits code-object)))
-    (cold-fixup code-object offset value kind))) ; and re-push code-object
-
-#!+immobile-space
-(progn
-  (define-cold-fop (fop-layout-fixup)
-    (let* ((obj (pop-stack))
-           (kind (pop-stack))
-           (code-object (pop-stack))
-           (offset (read-word-arg (fasl-input-stream)))
-           (cold-layout (or (gethash obj *cold-layouts*)
-                            (error "No cold-layout for ~S~%" obj))))
-      (cold-fixup code-object offset
-                  (descriptor-bits cold-layout)
-                  kind :layout)))
-  (define-cold-fop (fop-immobile-obj-fixup)
-    (let ((obj (pop-stack))
-          (kind (pop-stack))
-          (code-object (pop-stack))
-          (offset (read-word-arg (fasl-input-stream))))
-      (cold-fixup code-object offset
-                  (descriptor-bits (if (symbolp obj) (cold-intern obj) obj))
-                  kind :immobile-object))))
-
-#!+immobile-code
-(define-cold-fop (fop-named-call-fixup)
-  (let* ((name (pop-stack))
-         (fdefn (cold-fdefinition-object name))
-         (kind (pop-stack))
-         (code-object (pop-stack))
-         (offset (read-word-arg (fasl-input-stream))))
-    (cold-fixup code-object offset
-                (+ (descriptor-bits fdefn)
-                   (ash sb!vm:fdefn-raw-addr-slot sb!vm:word-shift)
-                   (- sb!vm:other-pointer-lowtag))
-                kind :named-call)))
-
-#!+immobile-code
-(define-cold-fop (fop-static-call-fixup)
-  (let ((name (pop-stack))
-        (kind (pop-stack))
-        (code-object (pop-stack))
-        (offset (read-word-arg (fasl-input-stream))))
-    (push (list name kind code-object offset) *cold-static-call-fixups*)
-    code-object))
-
+;;; Target variant of this is defined in 'target-load'
+(defun apply-fixups (fop-stack code-obj extra-offset)
+  (dotimes (i (descriptor-fixnum (pop-fop-stack fop-stack)) code-obj)
+    (binding* ((info (descriptor-fixnum (pop-fop-stack fop-stack)))
+               (sym (pop-fop-stack fop-stack))
+               ((offset kind flavor) (!unpack-fixup-info info)))
+      (incf offset extra-offset) ; for assembler routines
+      (if (eq flavor :static-call)
+          (push (list sym kind code-obj offset) *cold-static-call-fixups*)
+          (cold-fixup
+           code-obj offset
+           (ecase flavor
+             (:assembly-routine (lookup-assembler-reference sym))
+             (:foreign
+              (let ((sym (base-string-from-core sym)))
+                #!+sb-dynamic-core (dyncore-note-symbol sym nil)
+                #!-sb-dynamic-core (cold-foreign-symbol-address sym)))
+             (:foreign-dataref
+              (let ((sym (base-string-from-core sym)))
+                #!+sb-dynamic-core (dyncore-note-symbol sym t)
+                #!-sb-dynamic-core
+                (progn (maphash (lambda (k v)
+                                  (format *error-output* "~&~S = #X~8X~%" k v))
+                                *cold-foreign-symbol-table*)
+                       (error "shared foreign symbol in cold load: ~S (~S)" sym kind))))
+             (:code-object (descriptor-bits code-obj))
+             #!+sb-thread ; ENSURE-SYMBOL-TLS-INDEX isn't defined otherwise
+             (:symbol-tls-index (ensure-symbol-tls-index sym))
+             (:layout (descriptor-bits (or (gethash sym *cold-layouts*)
+                                           (error "No cold-layout for ~S~%" sym))))
+             (:immobile-object
+              ;; an interned symbol is represented by its host symbol,
+              ;; but an uninterned symbol is a descriptor.
+              (descriptor-bits (if (symbolp sym) (cold-intern sym) sym)))
+             (:named-call
+              (+ (descriptor-bits (cold-fdefinition-object sym))
+                 (ash sb!vm:fdefn-raw-addr-slot sb!vm:word-shift)
+                 (- sb!vm:other-pointer-lowtag))))
+           kind flavor)))))
 
 ;;;; sanity checking space layouts
 
@@ -2909,9 +2882,7 @@ core and return a descriptor to it."
       (assert (zerop (rem sb!vm:fixedobj-space-size
                           (* 32 sb!vm:immobile-card-bytes))))
       #!-gencgc
-      (progn
-        (check sb!vm:dynamic-0-space-start sb!vm:dynamic-0-space-end :dynamic-0)
-        (check sb!vm:dynamic-1-space-start sb!vm:dynamic-1-space-end :dynamic-1))
+      (check sb!vm:dynamic-0-space-start sb!vm:dynamic-0-space-end :dynamic-0)
       #!+linkage-table
       (check sb!vm:linkage-table-space-start sb!vm:linkage-table-space-end :linkage-table))))
 
@@ -2982,7 +2953,10 @@ core and return a descriptor to it."
                             ;; We also propagate magic numbers
                             ;; related to file format,
                             ;; which live here instead of SB!VM.
-                            "SB!FASL"))
+                            "SB!FASL"
+                            ;; Home package of some constants which aren't
+                            ;; in the target Lisp but are propagated to C.
+                            "SB-COREFILE"))
       (do-external-symbols (symbol (find-package package-name))
         (when (constantp symbol)
           (let ((name (symbol-name symbol)))
@@ -3088,15 +3062,16 @@ core and return a descriptor to it."
     (terpri))
 
   (format t "#define BACKEND_PAGE_BYTES ~D~%" sb!c:+backend-page-bytes+)
-  #!+gencgc
-  (progn
-    ;; value never needed in Lisp, so therefore not a defconstant
-    (format t "#define GENCGC_CARD_SHIFT ~D~%"
+  #!+gencgc ; value never needed in Lisp, so therefore not a defconstant
+  (format t "#define GENCGC_CARD_SHIFT ~D~%"
             (1- (integer-length sb!vm:gencgc-card-bytes)))
-    ;; symbol intentionally internal to sb-vm so that it won't add a #define
+
+  (let ((size #!+cheneygc (- sb!vm:dynamic-0-space-end sb!vm:dynamic-0-space-start)
+              #!+gencgc sb!vm::default-dynamic-space-size))
+  ;; "-DDEFAULT_DYNAMIC_SPACE_SIZE=n" in CFLAGS will override this.
     (format t "#ifndef DEFAULT_DYNAMIC_SPACE_SIZE
 #define DEFAULT_DYNAMIC_SPACE_SIZE ~D /* ~:*0x~X */
-#endif~2%" sb!vm::default-dynamic-space-size))
+#endif~2%" size))
 
   ;; writing information about internal errors
   ;; Assembly code needs only the constants for UNDEFINED_[ALIEN_]FUN_ERROR
@@ -3127,10 +3102,15 @@ core and return a descriptor to it."
   #!+sb-safepoint
   (format t "#define GC_SAFEPOINT_PAGE_ADDR ((void*)0x~XUL) /* ~:*~A */~%"
             sb!vm:gc-safepoint-page-addr)
+  #!+sb-safepoint
+  (format t "#define GC_SAFEPOINT_TRAP_ADDR ((void*)0x~XUL) /* ~:*~A */~%"
+            (+ sb!vm:gc-safepoint-page-addr
+               sb!c:+backend-page-bytes+
+               (- sb!vm:gc-safepoint-trap-offset)))
 
-  (dolist (symbol '(sb!vm::float-traps-byte
+  (dolist (symbol '(sb!vm:float-traps-byte
                     sb!vm::float-exceptions-byte
-                    sb!vm::float-sticky-bits
+                    sb!vm:float-sticky-bits
                     sb!vm::float-rounding-mode))
     (format t "#define ~A_POSITION ~A /* ~:*0x~X */~%"
             (c-symbol-name symbol)
@@ -3266,7 +3246,7 @@ core and return a descriptor to it."
 
 (defun write-thread-init (stream)
   (dolist (binding sb!vm::!per-thread-c-interface-symbols)
-    (format stream "write_TLS(~A, ~A, th);~%" ; KLUDGE: 'th' is a thread
+    (format stream "INITIALIZE_TLS(~A, ~A);~%"
             (c-symbol-name (if (listp binding) (car binding) binding) "*")
             (if (listp binding) (second binding)))))
 
@@ -3348,8 +3328,9 @@ core and return a descriptor to it."
         (format t "~4<~@R.~> ~A~%" (1+ i) (nth i sections))))
     (format t "=================~2%")
     (format t "I. assembler routines defined in core image:~2%")
-    (dolist (routine (sort (copy-list *cold-assembler-routines*) #'< :key #'cadr))
-      (format t "~8,'0X: ~S~%" (cadr routine) (car routine)))
+    (dolist (routine *cold-assembler-routines*)
+      (let ((name (car routine)))
+        (format t "~8,'0X: ~S~%" (lookup-assembler-reference name) name)))
     (let ((funs nil)
           (undefs nil))
       (maphash (lambda (name fdefn &aux (fun (cold-fdefn-fun fdefn)))
@@ -3405,23 +3386,6 @@ III. initially undefined function references (alphabetically):
 ;;;; writing core file
 
 (defvar *core-file*)
-(defvar *data-page*)
-
-;;; magic numbers to identify entries in a core file
-;;;
-;;; (In case you were wondering: No, AFAIK there's no special magic about
-;;; these which requires them to be in the 38xx range. They're just
-;;; arbitrary words, tested not for being in a particular range but just
-;;; for equality. However, if you ever need to look at a .core file and
-;;; figure out what's going on, it's slightly convenient that they're
-;;; all in an easily recognizable range, and displacing the range away from
-;;; zero seems likely to reduce the chance that random garbage will be
-;;; misinterpreted as a .core file.)
-(defconstant build-id-core-entry-type-code 3860)
-(defconstant new-directory-core-entry-type-code 3861)
-(defconstant initial-fun-core-entry-type-code 3863)
-(defconstant page-table-core-entry-type-code 3880)
-(defconstant end-core-entry-type-code 3840)
 
 (declaim (ftype (function (sb!vm:word) sb!vm:word) write-word))
 (defun write-word (num)
@@ -3435,15 +3399,14 @@ III. initially undefined function references (alphabetically):
                    *core-file*))))
   num)
 
-(defun output-gspace (gspace verbose)
+(defun output-gspace (gspace data-page verbose)
   (force-output *core-file*)
   (let* ((posn (file-position *core-file*))
          (bytes (* (gspace-free-word-index gspace) sb!vm:n-word-bytes))
          (pages (ceiling bytes sb!c:+backend-page-bytes+))
          (total-bytes (* pages sb!c:+backend-page-bytes+)))
 
-    (file-position *core-file*
-                   (* sb!c:+backend-page-bytes+ (1+ *data-page*)))
+    (file-position *core-file* (* sb!c:+backend-page-bytes+ (1+ data-page)))
     (when verbose
       (format t "writing ~S byte~:P [~S page~:P] from ~S~%"
               total-bytes pages gspace))
@@ -3469,14 +3432,61 @@ III. initially undefined function references (alphabetically):
     ;;   PAGE COUNT
     (write-word (gspace-identifier gspace))
     (write-word (gspace-free-word-index gspace))
-    (write-word *data-page*)
-    (multiple-value-bind (floor rem)
-        (floor (gspace-byte-address gspace) 1024) ; units as per core.h
-      (aver (zerop rem))
-      (write-word floor))
+    (write-word data-page)
+    (write-word (gspace-byte-address gspace))
     (write-word pages)
 
-    (incf *data-page* pages)))
+    (+ data-page pages)))
+
+#!+gencgc
+(defun output-page-table (gspace data-page verbose)
+  (declare (ignore verbose))
+  ;; Write as many PTEs as there are pages used.
+  ;; A corefile PTE is { uword_t scan_start_offset; page_bytes_t bytes_used; }
+  (let* ((data-bytes (* (gspace-free-word-index gspace) sb!vm:n-word-bytes))
+         (n-ptes (ceiling data-bytes sb!vm:gencgc-card-bytes))
+         (sizeof-usage ; see similar expression in 'src/code/room'
+          (if (typep sb!vm:gencgc-card-bytes '(unsigned-byte 16)) 2 4))
+         (sizeof-corefile-pte (+ sb!vm:n-word-bytes sizeof-usage))
+         (pte-bytes (round-up (* sizeof-corefile-pte n-ptes) sb!vm:n-word-bytes))
+         (ptes (make-bigvec))
+         (start 0))
+    (expand-bigvec ptes pte-bytes)
+    (dotimes (page-index n-ptes)
+      ;; compute scan-start-offset
+      (let ((sso (let* ((page-start (* page-index sb!vm:gencgc-card-bytes))
+                        (p (position page-start (gspace-objects gspace)
+                                     :test #'<= :start start)))
+                   ;; P is the position in OBJECTS of the first object whose start
+                   ;; is >= PAGE-START. If page-spanning, we want the preceding object
+                   ;; because SCAN-START must satisfy the condition that it points to
+                   ;; an object such that scanning from it will cover every byte of the
+                   ;; page. If the very last item in OBJECTS spans pages, P will be NIL,
+                   ;; because no object's start is >= PAGE-START.
+                   (cond ((not p)
+                          (setq p (1- (length (gspace-objects gspace)))))
+                         ((> (aref (gspace-objects gspace) p) page-start)
+                          (decf p)))
+                   ;; This is an optimization, not a correctness requirement:
+                   ;; the next scan-start object can't be at an index less than P.
+                   (setq start p)
+                   (- page-start (aref (gspace-objects gspace) p))))
+            (usage sb!vm:gencgc-card-bytes)
+            (pte-offset (* page-index sizeof-corefile-pte)))
+        (when (= page-index (1- n-ptes)) ; calculate last page's exact usage
+          (decf usage (- (* n-ptes sb!vm:gencgc-card-bytes) data-bytes)))
+        ;; #b11 = worst-case assumption: boxed and unboxed data on the page
+        (setf (bvref-word ptes pte-offset) (logior sso #b11))
+        (funcall (if (eql sizeof-usage 2) #'(setf bvref-16) #'(setf bvref-32))
+                 usage ptes (+ pte-offset sb!vm:n-word-bytes))))
+    (force-output *core-file*)
+    (let ((posn (file-position *core-file*)))
+      (file-position *core-file* (* sb!c:+backend-page-bytes+ (1+ data-page)))
+      (write-bigvec-as-sequence ptes *core-file* :end pte-bytes)
+      (force-output *core-file*)
+      (file-position *core-file* posn))
+    (mapc 'write-word ; 5 = number of words in this core header entry
+          `(,page-table-core-entry-type-code 5 ,n-ptes ,pte-bytes ,data-page))))
 
 ;;; Create a core file created from the cold loaded image. (This is
 ;;; the "initial core file" because core files could be created later
@@ -3485,7 +3495,7 @@ III. initially undefined function references (alphabetically):
 (defun write-initial-core-file (filename verbose)
 
   (let ((filenamestring (namestring filename))
-        (*data-page* 0))
+        (data-page 0))
 
     (when verbose
       (format t "[building initial core file in ~S: ~%" filenamestring))
@@ -3514,8 +3524,8 @@ III. initially undefined function references (alphabetically):
         (dovector (char build-id) (write-byte (sb!xc:char-code char) *core-file*))
         (dotimes (j (- padding)) (write-byte #xff *core-file*)))
 
-      ;; Write the New Directory entry header.
-      (write-word new-directory-core-entry-type-code)
+      ;; Write the Directory entry header.
+      (write-word directory-core-entry-type-code)
       (let ((spaces (nconc (list *read-only* *static*)
                            #!+immobile-space
                            (list *immobile-fixedobj* *immobile-varyobj*)
@@ -3523,7 +3533,8 @@ III. initially undefined function references (alphabetically):
         ;; length = (5 words/space) * N spaces + 2 for header.
         (write-word (+ (* (length spaces) 5) 2))
         (dolist (space spaces)
-          (output-gspace space verbose)))
+          (setq data-page (output-gspace space data-page verbose))))
+      #!+gencgc (output-page-table *dynamic* data-page verbose)
 
       ;; Write the initial function.
       (write-word initial-fun-core-entry-type-code)
@@ -3562,7 +3573,7 @@ III. initially undefined function references (alphabetically):
 ;;;   CORE-FILE-NAME gets a Lisp core.
 ;;;   C-HEADER-DIR-NAME gets the path in which to place generated headers
 ;;;   MAP-FILE-NAME gets the name of the textual 'cold-sbcl.map' file
-(defun sb-cold:genesis (&key object-file-names preload-file
+(defun sb-cold:genesis (&key object-file-names
                              core-file-name c-header-dir-name map-file-name
                              symbol-table-file-name (verbose t))
   (declare (ignorable symbol-table-file-name))
@@ -3643,22 +3654,19 @@ III. initially undefined function references (alphabetically):
            (*cold-methods* nil)
            (*!cold-toplevels* nil)
            *cold-static-call-fixups*
-           *cold-assembler-fixups*
            *cold-assembler-routines*
-           *cold-assembler-objects*
+           *cold-assembler-obj*
            (*code-fixup-notes* (make-hash-table))
            (*deferred-known-fun-refs* nil))
 
       (setf *nil-descriptor* (make-nil-descriptor)
             *simple-vector-0-descriptor* (vector-in-core nil))
 
-      ;; If we're given a preload file, it contains tramps and whatnot
-      ;; that must be loaded before we create any FDEFNs.  It can in
-      ;; theory be loaded any time between binding
-      ;; *COLD-ASSEMBLER-ROUTINES* above and calling
-      ;; INITIALIZE-STATIC-SPACE below.
-      (when preload-file
-        (cold-load preload-file verbose))
+      ;; Load all assembler code
+      (flet ((assembler-file-p (name) (tailwise-equal (namestring name) ".assem-obj")))
+        (dolist (file-name (remove-if-not #'assembler-file-p object-file-names))
+          (cold-load file-name verbose))
+        (setf object-file-names (remove-if #'assembler-file-p object-file-names)))
 
       ;; Prepare for cold load.
       (initialize-layouts)
@@ -3681,13 +3689,6 @@ III. initially undefined function references (alphabetically):
       ;; Create SB!KERNEL::*TYPE-CLASSES* as an array of NIL
       (cold-set (cold-intern 'sb!kernel::*type-classes*)
                 (vector-in-core (make-list (length sb!kernel::*type-classes*))))
-
-      ;; Load the remaining assembler code into immobile space
-      #!+immobile-space
-      (flet ((assembler-file-p (name) (tailwise-equal (namestring name) ".assem-obj")))
-        (dolist (file-name (remove-if-not #'assembler-file-p object-file-names))
-          (cold-load file-name verbose))
-        (setf object-file-names (remove-if #'assembler-file-p object-file-names)))
 
       ;; Cold load.
       (dolist (file-name object-file-names)
@@ -3737,21 +3738,12 @@ III. initially undefined function references (alphabetically):
 
       ;; Tidy up loose ends left by cold loading. ("Postpare from cold load?")
       (resolve-deferred-known-funs)
-      (resolve-assembler-fixups)
+      (resolve-static-call-fixups)
       (foreign-symbols-to-core)
       #!+(or x86 immobile-space)
       (dolist (pair (sort (%hash-table-alist *code-fixup-notes*) #'< :key #'car))
         (write-wordindexed (make-random-descriptor (car pair))
-                           sb!vm::code-fixups-slot
-                           #!+x86 (ub32-vector-in-core (cdr pair))
-                           #!+x86-64 (number-to-core
-                                      (sb!c::pack-code-fixup-locs
-                                       (sort (cdr pair) #'<)))))
-      (when *cold-assembler-objects*
-        (unless (eq *read-only* ; "Stayin' Alive"
-                    (descriptor-gspace (car *cold-assembler-objects*)))
-          (cold-set (cold-intern '*assembler-objects*)
-                    (vector-in-core (nreverse *cold-assembler-objects*)))))
+                           sb!vm::code-fixups-slot (repack-fixups (cdr pair))))
       (when core-file-name
         (finish-symbols))
       (finalize-load-time-value-noise)

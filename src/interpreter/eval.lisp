@@ -102,7 +102,7 @@
                                   (make-proto-fn fname) env nil))
                (compile-it)))
           ((not (symbolp fname))
-           (ip-error "Invalid function name: ~S" fname))
+           (%program-error "Invalid function name: ~S" fname))
           ;; CLHS 3.1.2.1.2.1 Special Forms
           ;; Pick off special forms first for speed. Special operators
           ;; can't be shadowed by local defs.
@@ -170,7 +170,7 @@
            (return-from digest-form
              (digest-form `(funcall #',fname ,@(cdr form)) env sexpr)))
           ((not (symbolp fname))
-           (ip-error "Invalid function name: ~S" fname)))
+           (%program-error "Invalid function name: ~S" fname)))
     ;; CLHS 3.1.2.1.2.1 Special Forms.
     (let ((fdefn (sb-impl::symbol-fdefn fname)))
       (awhen (and fdefn (!special-form-handler fdefn))
@@ -244,7 +244,7 @@
         ;; affect the policy in an interpreter environment.
         (%eval form interpreter-env))))
 
-(defun !unintern-symbols ()
+(push
   (let ((this-pkg (find-package "SB-INTERPRETER")))
     `("SB-INTERPRETER"
       %%eval ; got inlined
@@ -254,4 +254,5 @@
                        (macro-function s)
                        (not (member s '(defspecial with-subforms do-decl-spec)))) ; for SB-CLTL2
               (push s macros)))
-          macros))))
+          macros)))
+  sb-impl::*!removable-symbols*)

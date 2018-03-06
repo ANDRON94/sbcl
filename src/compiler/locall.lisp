@@ -303,7 +303,8 @@
   (declare (type ref ref))
   (let ((fun (ref-leaf ref)))
     (unless (or (xep-p fun)
-                (member (functional-kind fun) '(:escape :cleanup)))
+                (member (functional-kind fun) '(:escape :cleanup
+                                                :zombie :deleted)))
       (change-ref-leaf ref (or (functional-entry-fun fun)
                                (make-xep fun))))))
 
@@ -1038,6 +1039,7 @@
         (let ((this-call (node-dest ref)))
           (when (and this-call
                      (node-tail-p this-call)
+                     (not (node-to-be-deleted-p this-call))
                      (eq (node-home-lambda this-call) fun))
             (setf (node-tail-p this-call) nil)
             (ecase (functional-kind called)
@@ -1207,11 +1209,8 @@
               (let ((use-component (node-component use)))
                 (substitute-leaf-if
                  (lambda (ref)
-                   (cond ((eq (node-component ref) use-component)
-                          (setf done-something t))
-                         (t
-                          (aver (lambda-toplevelish-p (lambda-home fun)))
-                          nil)))
+                   (when (eq (node-component ref) use-component)
+                     (setf done-something t)))
                  leaf var)))
              ;; otherwise, we can still play LVAR-level tricks for single
              ;;  destination variables.

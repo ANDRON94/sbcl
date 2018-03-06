@@ -68,7 +68,9 @@
   ;; executing all other toplevel forms.
   (flet ((expand (form)
            (if expand
-               (%macroexpand form *lexenv*)
+               (handler-case
+                   (%macroexpand form *lexenv*)
+                 (error () (return-from fopcompilable-p)))
                (values form nil)))
          (expand-cm (form)
            (if expand
@@ -462,8 +464,7 @@
                          ;; other operations, but I don't see any good
                          ;; candidates in a quick read-through of
                          ;; src/code/fop.lisp.)
-                         ((and (eq operator
-                                   'sb!int:find-undeleted-package-or-lose)
+                         ((and (eq operator 'find-undeleted-package-or-lose)
                                (= 1 (length args))
                                for-value-p)
                           (fopcompile (first args) path t)

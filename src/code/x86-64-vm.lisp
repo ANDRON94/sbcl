@@ -18,15 +18,17 @@
 
 ;;; This gets called by LOAD to resolve newly positioned objects
 ;;; with things (like code instructions) that have to refer to them.
-(defun fixup-code-object (code offset fixup kind &optional flavor)
+;;; Return :ABSOLUTE if an absolute fixup needs to be recorded in %CODE-FIXUPS,
+;;; and return :RELATIVE if a relative fixup needs to be recorded.
+;;; The code object we're fixing up is pinned whenever this is called.
+(defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset) (ignorable flavor))
-  (without-gcing
-      (let* ((sap (code-instructions code))
-             (fixup (+ (if (eq kind :absolute64)
-                           (signed-sap-ref-64 sap offset)
-                           (signed-sap-ref-32 sap offset))
-                       fixup)))
-      (ecase kind
+  (let* ((sap (code-instructions code))
+         (fixup (+ (if (eq kind :absolute64)
+                       (signed-sap-ref-64 sap offset)
+                       (signed-sap-ref-32 sap offset))
+                   fixup)))
+    (ecase kind
         (:absolute64
          ;; Word at sap + offset contains a value to be replaced by
          ;; adding that value to fixup.
@@ -49,31 +51,26 @@
                   ;; JMP/CALL are relative to the next instruction,
                   ;; so add 4 bytes for the size of the displacement itself.
                   (- fixup
-                     (the (unsigned-byte 64) (+ (sap-int sap) offset 4))))))))))
+                     (the (unsigned-byte 64) (+ (sap-int sap) offset 4)))))))))
   ;; An absolute fixup is stored in the code header's %FIXUPS slot if it
   ;; references an immobile-space (but not static-space) object.
-  ;; This needn't be inside WITHOUT-GCING, because code fixups will point
-  ;; only to objects that don't move except during save-lisp-and-die.
-  ;; So there is no race with GC here.
   ;; Note that:
   ;;  (1) Call fixups occur in both :RELATIVE and :ABSOLUTE kinds.
-  ;;      We can ignore the :RELATIVE kind.
+  ;;      We can ignore the :RELATIVE kind, except for foreign call.
   ;;  (2) :STATIC-CALL fixups point to immobile space, not static space.
   #!+immobile-space
-  (when (and (eq kind :absolute)
-             (member flavor '(:named-call :layout :immobile-object ; -> fixedobj subspace
-                              :assembly-routine :static-call))) ; -> varyobj subspace
-    (let ((fixups (%code-fixups code)))
-      ;; Sanctifying the code component will compact these into a bignum.
-      (setf (%code-fixups code) (cons offset (if (eql fixups 0) nil fixups)))))
-  nil)
-
-#!+immobile-space
-(defun sanctify-for-execution (code)
-  (let ((fixups (%code-fixups code)))
-    (when (listp fixups)
-      (setf (%code-fixups code) (sb!c::pack-code-fixup-locs fixups))))
-  nil)
+  (return-from fixup-code-object
+    (case flavor
+      ((:named-call :layout :immobile-object ; -> fixedobj subspace
+        :assembly-routine :static-call)      ; -> varyobj subspace
+       (if (eq kind :absolute) :absolute))
+      (:foreign
+       ;; linkage-table calls using the "CALL rel32" format need to be saved,
+       ;; because the linkage table resides at a fixed address.
+       ;; Space defragmentation can handle the fixup automatically,
+       ;; but core relocation can't - it can't find all the call sites.
+       (if (eq kind :relative) :relative))))
+  nil) ; non-immobile-space builds never record code fixups
 
 #!+(or darwin linux win32)
 (define-alien-routine ("os_context_float_register_addr" context-float-register-addr)
@@ -153,26 +150,21 @@
 ;;; arguments from the instruction stream.
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
-  (/show0 "entering INTERNAL-ERROR-ARGS, CONTEXT=..")
-  (/hexstr context)
   (let* ((pc (context-pc context))
          (trap-number (sap-ref-8 pc 0)))
     (declare (type system-area-pointer pc))
-    (/show0 "got PC")
-    ;; using INT3 the pc is .. INT3 <here> code length bytes...
     (if (= trap-number invalid-arg-count-trap)
         (values #.(error-number-or-lose 'invalid-arg-count-error)
                 '(#.arg-count-sc))
-        (let ((error-number (sap-ref-8 pc 1)))
-          (values error-number
-                  (sb!kernel::decode-internal-error-args (sap+ pc 2) error-number)
-                  trap-number)))))
+        (sb!kernel::decode-internal-error-args (sap+ pc 1) trap-number))))
 
 
 #!+immobile-code
 (progn
 (defun fun-immobilize (fun)
-  (let ((code (%primitive sb!vm::alloc-fun-tramp fun)))
+  (let ((code (truly-the (values code-component &optional)
+                         (sb!vm::alloc-immobile-trampoline))))
+    (setf (%code-debug-info code) fun)
     (let ((sap (code-instructions code))
           (ea (+ (logandc2 (get-lisp-obj-address code) lowtag-mask)
                  (ash code-debug-info-slot word-shift))))
@@ -209,12 +201,12 @@
         (t
          (closurep fun))))
 
-(defun %set-fin-trampoline (fin)
-  (let ((sap (int-sap (- (get-lisp-obj-address fin) fun-pointer-lowtag)))
-        (insts-offs (ash (1+ funcallable-instance-info-offset) word-shift)))
-    (setf (sap-ref-word sap insts-offs) #xFFFFFFE9058B48 ; MOV RAX,[RIP-23]
-          (sap-ref-32 sap (+ insts-offs 7)) #x00FD60FF)) ; JMP [RAX-3]
-  fin)
+(defmacro !set-fin-trampoline (fin)
+  `(let ((sap (int-sap (get-lisp-obj-address ,fin)))
+         (insts-offs (- (ash (1+ funcallable-instance-info-offset) word-shift)
+                        fun-pointer-lowtag)))
+     (setf (sap-ref-word sap insts-offs) #xFFFFFFE9058B48 ; MOV RAX,[RIP-23]
+           (sap-ref-32 sap (+ insts-offs 7)) #x00FD60FF))) ; JMP [RAX-3]
 
 (defun %set-fdefn-fun (fdefn fun)
   (declare (type fdefn fdefn) (type function fun)

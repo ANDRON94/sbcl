@@ -13,6 +13,8 @@
 
 (cl:in-package :cl-user)
 
+(load "compiler-test-util.lisp")
+
 (with-test (:name (:infinities :comparison))
   (dolist (ifnis (list (cons single-float-positive-infinity
                              single-float-negative-infinity)
@@ -430,3 +432,16 @@
                     '(lambda ()
                       (declare (optimize (debug 2)))
                       (typep #c(1.0 1.0) '(member #c(1.0 1.0))))))))
+
+(with-test (:name (truncate float :no-consing)
+                  :skipped-on :interpreter)
+  (let ((f (checked-compile
+            '(lambda (x)
+              (values (truncate (the double-float x)))))))
+    (ctu:assert-no-consing (funcall f 1d0))
+    (ctu:assert-no-consing (funcall f (float most-negative-fixnum 1d0))))
+  (let ((f (checked-compile
+            '(lambda (x)
+              (values (truncate (the single-float x)))))))
+    (ctu:assert-no-consing (funcall f 1f0))
+    (ctu:assert-no-consing (funcall f (float most-negative-fixnum 1f0)))))

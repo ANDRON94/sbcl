@@ -358,6 +358,14 @@
   ;; implementations we may use a call instruction that requires the
   ;; return PC to be passed in a particular place.
   (return-pc-pass (missing-arg) :type tn :read-only t)
+  ;; a label that marks the first instruction after the RETURN-PC has
+  ;; been moved from its passing location to its save location.
+  #!-fp-and-pc-standard-save
+  (lra-saved-pc nil :type (or label null))
+  ;; a label that marks the first instruction after the OLD-FP has
+  ;; been moved from its passing location to its save location.
+  #!-fp-and-pc-standard-save
+  (cfp-saved-pc nil :type (or label null))
   ;; True if this function has a frame on the number stack. This is
   ;; set by representation selection whenever it is possible that some
   ;; function in our tail set will make use of the number stack.
@@ -782,9 +790,9 @@
 (defmacro finite-sb-last-block-count (sb)
   `(fsb-last-block-count (svref *finite-sbs* (finite-sb-index ,sb))))
 
-;;; the SC structure holds the storage base that storage is allocated
+;;; the STORAGE-CLASS structure holds the storage base that storage is allocated
 ;;; in and information used to select locations within the SB
-(def!struct (sc (:copier nil))
+(def!struct (storage-class (:conc-name "SC-") (:copier nil) (:predicate nil))
   ;; name, for printing and reference
   (name nil :type symbol)
   ;; the number used to index SC cost vectors
@@ -795,6 +803,8 @@
   (element-size 0 :type index)
   ;; if our SB is finite, a vector of the locations in this SC
   (locations (missing-arg) :type sc-locations :read-only t)
+  ;; information for the assembler when moving to/from the locations
+  (operand-size nil :type (or null keyword) :read-only t)
   ;; a list of the alternate (save) SCs for this SC
   (alternate-scs nil :type list)
   ;; a list of the constant SCs that can me moved into this SC
@@ -852,7 +862,7 @@
   ;; for operand loading. This prevents load-TN packing from thrashing
   ;; by spilling a lot.
   (reserve-locations (missing-arg) :type sc-locations :read-only t))
-(defprinter (sc)
+(defprinter (storage-class :conc-name "SC-")
   name)
 
 ;;;; TNs
@@ -921,7 +931,8 @@
         :type (member :normal :environment :debug-environment
                       :save :save-once  :load :constant
                       :component :alias :unused
-                      #!-fp-and-pc-standard-save :specified-save))
+                      #!-fp-and-pc-standard-save :specified-save
+                      :arg-pass))
   ;; the primitive-type for this TN's value. Null in restricted or
   ;; wired TNs.
   (primitive-type nil :type (or primitive-type null))
@@ -971,7 +982,7 @@
   (save-tn nil :type (or tn null))
   ;; After pack, the SC we packed into. Beforehand, the SC we want to
   ;; pack into, or null if we don't know.
-  (sc nil :type (or sc null))
+  (sc nil :type (or storage-class null))
   ;; the offset within the SB that this TN is packed into. This is what
   ;; indicates that the TN is packed
   (offset nil :type (or index null))

@@ -18,19 +18,19 @@
 ;; but it's compiled after this file is.
 (!defglobal *user-hash-table-tests* nil)
 
-(sb!int::/show0 "fdefinition.lisp 22")
 
 ;;;; fdefinition (fdefn) objects
 
 (defun make-fdefn (name)
   #!-immobile-space (make-fdefn name)
-  ;; This is %primitive because it needs pseudo-atomic,
-  ;; otherwise it would just be an alien-funcall.
   #!+immobile-space
-  (let ((fdefn (truly-the (values fdefn)
-                 (%primitive sb!vm::alloc-immobile-fdefn name))))
-    (%primitive fdefn-makunbound fdefn)
-    fdefn))
+  (let ((fdefn (truly-the (values fdefn &optional)
+                          (sb!vm::alloc-immobile-fdefn))))
+    (sb!vm::%set-fdefn-name fdefn name)
+    ;; Return the result of FDEFN-MAKUNBOUND because it (strangely) returns its
+    ;; argument. Using FDEFN as the value of this function, as if we didn't know
+    ;; that FDEFN-MAKUNBOUND did that, would cause a redundant register move.
+    (truly-the fdefn (fdefn-makunbound fdefn))))
 
 (defun fdefn-name (fdefn)
   (declare (type fdefn fdefn))
@@ -200,6 +200,10 @@
   (etypecase callable
     (function callable)
     (symbol (%coerce-name-to-fun callable symbol-fdefn t))))
+
+;;; Bevahes just like %COERCE-CALLABLE-TO-FUN but has an ir2-convert optimizer.
+(%defun '%coerce-callable-for-call
+        #'%coerce-callable-to-fun)
 
 
 ;;;; definition encapsulation

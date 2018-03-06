@@ -249,7 +249,7 @@ void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
     unsigned int code = *((u32 *)(*os_context_pc_addr(context)));
-    int register_offset = code >> 5 & 0x1f;
+    int register_offset = code >> 8 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
 }
@@ -326,7 +326,7 @@ static void sigill_handler(int signal, siginfo_t *siginfo,
         unsigned int* pc = (unsigned int*) siginfo->si_addr;
 
         inst = *pc;
-        trap = inst & 0x1f;
+        trap = inst & 0xff;
         handle_trap(context,trap);
     }
     else if ((siginfo->si_code) == ILL_ILLTRP

@@ -231,6 +231,8 @@ Examples:
 ;;; Is NAME something that no conforming program can rely on
 ;;; defining?
 (defun name-reserved-by-ansi-p (name kind)
+  (declare (ignorable name kind))
+  #-sb-xc-host ; always return NIL in the cross-compiler
   (ecase kind
     (:function
      (eq (symbol-package (fun-name-block-name name))
@@ -399,7 +401,6 @@ Examples:
 ;;; I'd have liked the data to be associated with the fasl, except that
 ;;; as indicated above, the second line hides some information.
 (defun style-warn-once (thing fmt &rest args)
-  (declare (special *compile-object*))
   (declare (notinline style-warn)) ; See COMPILER-STYLE-WARN for rationale
   (let* ((source-info *source-info*)
          (file-info (and (source-info-p source-info)
@@ -547,31 +548,28 @@ necessary, since type inference may take arbitrarily long to converge.")
         (return))
       (incf loop-count)))
 
-  (when *check-consistency*
-    (do-blocks-backwards (block component)
-      (awhen (flush-dead-code block)
-        (let ((*compiler-error-context* it))
-          (compiler-warn "dead code detected at the end of ~S"
-                         'ir1-phases)))))
-
   (ir1-finalize component)
   (values))
 
 #!+immobile-code
 (progn
-  (declaim (type (member :immobile :dynamic) *compile-to-memory-space*))
+  (declaim (type (member :immobile :dynamic)
+                 *compile-to-memory-space*
+                 *compile-file-to-memory-space*))
   ;; COMPILE-FILE puts all nontoplevel code in immobile space, but COMPILE
   ;; offers a choice. Because the collector does not run often enough (yet),
   ;; COMPILE usually places code in the dynamic space managed by our copying GC.
   ;; Change this variable if your application always demands immobile code.
   ;; The real default is set to :DYNAMIC in make-target-2-load.lisp
   (defvar *compile-to-memory-space* :immobile) ; BUILD-TIME default
+  (defvar *compile-file-to-memory-space* :immobile) ; BUILD-TIME default
   (defun code-immobile-p (node-or-component)
     (if (fasl-output-p *compile-object*)
-        (neq (component-kind (if (node-p node-or-component)
-                                 (node-component node-or-component)
-                                 node-or-component))
-             :toplevel)
+        (and (eq *compile-file-to-memory-space* :immobile)
+             (neq (component-kind (if (node-p node-or-component)
+                                      (node-component node-or-component)
+                                      node-or-component))
+                  :toplevel))
         (eq *compile-to-memory-space* :immobile))))
 
 (defun %compile-component (component)
@@ -584,6 +582,7 @@ necessary, since type inference may take arbitrarily long to converge.")
     (maybe-mumble "LTN ")
     (ltn-analyze component)
     (dfo-as-needed component)
+
     (maybe-mumble "control ")
     (control-analyze component #'make-ir2-block)
 
@@ -660,23 +659,15 @@ necessary, since type inference may take arbitrarily long to converge.")
               (sb!disassem:disassemble-assem-segment *code-segment*
                                                      *compiler-trace-output*))
 
-            (etypecase *compile-object*
-              (fasl-output
-               (maybe-mumble "fasl")
-               (fasl-dump-component component
-                                    *code-segment*
-                                    code-length
-                                    fixup-notes
-                                    *compile-object*))
-              #-sb-xc-host ; no compiling to core
-              (core-object
-               (maybe-mumble "core")
-               (make-core-component component
-                                    *code-segment*
-                                    code-length
-                                    fixup-notes
-                                    *compile-object*))
-              (null))))))
+            (let ((object *compile-object*))
+              (funcall (etypecase object
+                        (fasl-output (maybe-mumble "fasl") #'fasl-dump-component)
+                        #-sb-xc-host ; no compiling to core
+                        (core-object (maybe-mumble "core") #'make-core-component)
+                        (null (lambda (&rest dummies)
+                                (declare (ignore dummies)))))
+                       component *code-segment* code-length fixup-notes
+                       object))))))
 
   ;; We're done, so don't bother keeping anything around.
   (setf (component-info component) :dead)
@@ -1205,8 +1196,7 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;;
 ;;; If NAME is provided, then we try to use it as the name of the
 ;;; function for debugging/diagnostic information.
-(defun %compile (lambda-expression
-                 *compile-object*
+(defun %compile (lambda-expression object
                  &key
                  name
                  (path
@@ -1215,7 +1205,8 @@ necessary, since type inference may take arbitrarily long to converge.")
                   ;; from the CMU CL code and experiment, so it's a
                   ;; nice default for things where we don't have a
                   ;; real source path (as in e.g. inside CL:COMPILE).
-                  '(original-source-start 0 0)))
+                  '(original-source-start 0 0))
+                 &aux (*compile-object* object))
   (when name
     (legal-fun-name-or-type-error name))
   (with-ir1-namespace
@@ -1223,7 +1214,7 @@ necessary, since type inference may take arbitrarily long to converge.")
                       :policy *policy*
                       :handled-conditions *handled-conditions*
                       :disabled-package-locks *disabled-package-locks*))
-           (*compiler-sset-counter* 0)
+           (*compiler-sset-counter* 1)
            (fun (make-functional-from-toplevel-lambda lambda-expression
                                                       :name name
                                                       :path path)))
@@ -1243,11 +1234,9 @@ necessary, since type inference may take arbitrarily long to converge.")
           (compile-component component-from-dfo)
           (replace-toplevel-xeps component-from-dfo))
 
-        (let ((entry-table (etypecase *compile-object*
-                             (fasl-output (fasl-output-entry-table
-                                           *compile-object*))
-                             (core-object (core-object-entry-table
-                                           *compile-object*)))))
+        (let ((entry-table (etypecase object
+                             (fasl-output (fasl-output-entry-table object))
+                             (core-object (core-object-entry-table object)))))
           (multiple-value-bind (result found-p)
               (gethash (leaf-info fun) entry-table)
             (aver found-p)
@@ -1286,10 +1275,10 @@ necessary, since type inference may take arbitrarily long to converge.")
               ;; work when it has been compiled as part of the top-level
               ;; EVAL strategy of compiling everything inside (LAMBDA ()
               ;; ...).  -- CSR, 2002-11-02
-              (when (core-object-p *compile-object*)
+              (when (core-object-p object)
                 #+sb-xc-host (error "Can't compile to core")
                 #-sb-xc-host
-                (fix-core-source-info *source-info* *compile-object*
+                (fix-core-source-info *source-info* object
                                       (and (policy (lambda-bind fun)
                                                (> eval-store-source-form 0))
                                            result)))
@@ -1324,23 +1313,24 @@ necessary, since type inference may take arbitrarily long to converge.")
 ;;; compilation. Normally just evaluate in the appropriate
 ;;; environment, but also compile if outputting a CFASL.
 (defun eval-compile-toplevel (body path)
-  (flet ((frob ()
-           (eval-tlf `(progn ,@body) (source-path-tlf-number path) *lexenv*)
-           (when *compile-toplevel-object*
-             (let ((*compile-object* *compile-toplevel-object*))
-               (convert-and-maybe-compile `(progn ,@body) path)))))
-    (if (null *macro-policy*)
-        (frob)
-        (let* ((*lexenv*
-                (make-lexenv
-                 :policy (process-optimize-decl
-                          `(optimize ,@(policy-to-decl-spec *macro-policy*))
-                          (lexenv-policy *lexenv*))
-                 :default *lexenv*))
-               ;; In case a null lexenv is created, it needs to get the newly
-               ;; effective global policy, not the policy currently in *POLICY*.
-               (*policy* (lexenv-policy *lexenv*)))
-          (frob)))))
+  (let ((*compile-time-eval* t))
+    (flet ((frob ()
+             (eval-tlf `(progn ,@body) (source-path-tlf-number path) *lexenv*)
+             (when *compile-toplevel-object*
+               (let ((*compile-object* *compile-toplevel-object*))
+                 (convert-and-maybe-compile `(progn ,@body) path)))))
+      (if (null *macro-policy*)
+          (frob)
+          (let* ((*lexenv*
+                   (make-lexenv
+                    :policy (process-optimize-decl
+                             `(optimize ,@(policy-to-decl-spec *macro-policy*))
+                             (lexenv-policy *lexenv*))
+                    :default *lexenv*))
+                 ;; In case a null lexenv is created, it needs to get the newly
+                 ;; effective global policy, not the policy currently in *POLICY*.
+                 (*policy* (lexenv-policy *lexenv*)))
+            (frob))))))
 
 ;;; Process a top level FORM with the specified source PATH.
 ;;;  * If this is a magic top level form, then do stuff.
@@ -1388,7 +1378,8 @@ necessary, since type inference may take arbitrarily long to converge.")
                  #+sb-xc-host
                  (progn
                    (when compile-time-too
-                     (eval form)) ; letting xc host EVAL do its own macroexpansion
+                     (let ((*compile-time-eval* t))
+                      (eval form))) ; letting xc host EVAL do its own macroexpansion
                    (let* (;; (We uncross the operator name because things
                           ;; like SB!XC:DEFCONSTANT and SB!XC:DEFTYPE
                           ;; should be equivalent to their CL: counterparts
@@ -1731,7 +1722,7 @@ necessary, since type inference may take arbitrarily long to converge.")
            (declare (ignore error))
            (return-from sub-compile-file (values t t t))))
         (*current-path* nil)
-        (*compiler-sset-counter* 0)
+        (*compiler-sset-counter* 1)
         (sb!xc:*gensym-counter* 0))
     (handler-case
         (handler-bind (((satisfies handle-condition-p) #'handle-condition-handler))
@@ -2064,11 +2055,18 @@ SPEED and COMPILATION-SPEED optimization values, and the
         (throw 'pending-init circular-ref)))
     ;; If this is a global constant reference, we can call SYMBOL-GLOBAL-VALUE
     ;; during LOAD as a fasl op, and not compile a lambda.
-    (when namep
+    ;; However: the cross-compiler can not always emit fop-funcall for this,
+    ;; because the order of load-time actions is not strictly preserved as it
+    ;; would be for normal compilation. If the symbol's value needs computation,
+    ;; then it is unbound during genesis.
+    ;; So check if assignment was deferred, and if so, also defer the use.
+    (when (and namep #+sb-xc-host (not (member name *!const-value-deferred*)))
       (fopcompile `(symbol-global-value ',name) nil t nil)
       (fasl-note-handle-for-constant constant (sb!fasl::dump-pop fasl) fasl)
       (return-from emit-make-load-form nil))
-    (multiple-value-bind (creation-form init-form) (%make-load-form constant)
+    (multiple-value-bind (creation-form init-form)
+        (cond (namep (values `(symbol-global-value ',name) nil))
+              (t (%make-load-form constant)))
       (case creation-form
         (sb!fasl::fop-struct
          (fasl-validate-structure constant fasl)

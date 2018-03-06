@@ -46,10 +46,8 @@
        (inst mov ,n-dst ,n-src))))
 
 (defmacro align-stack-pointer (tn)
-  #!-darwin (declare (ignore tn))
-  #!+darwin
   ;; 16 byte alignment.
-  `(inst and ,tn #xfffffff0))
+  `(inst and ,tn -16))
 
 (defmacro make-ea-for-object-slot (ptr slot lowtag &optional (size :dword))
   `(make-ea ,size :base ,ptr :disp (- (* ,slot n-word-bytes) ,lowtag)))
@@ -173,170 +171,6 @@
               (make-ea :byte :base ,n-source
                              :disp (+ ,n-offset (1- n-word-bytes))))))))
 
-;;;; allocation helpers
-
-;;; Allocation within alloc_region (which is thread local) can be done
-;;; inline.  If the alloc_region is overflown allocation is done by
-;;; calling the C alloc() function.
-
-;;; C calls for allocation don't /seem/ to make an awful lot of
-;;; difference to speed. On pure consing it's about a 25%
-;;; gain. Guessing from historical context, it looks like inline
-;;; allocation was introduced before pseudo-atomic, at which time all
-;;; calls to alloc() would have needed a syscall to mask signals for
-;;; the duration.  Now we have pseudoatomic there's no need for that
-;;; overhead.
-
-(defun allocation-dynamic-extent (alloc-tn size lowtag)
-  (aver (not (location= alloc-tn esp-tn)))
-  (inst sub esp-tn size)
-  ;; FIXME: SIZE _should_ be double-word aligned (suggested but
-  ;; unfortunately not enforced by PAD-DATA-BLOCK and
-  ;; WITH-FIXED-ALLOCATION), so that ESP is always divisible by 8 (for
-  ;; 32-bit lispobjs).  In that case, this AND instruction is
-  ;; unneccessary and could be removed.  If not, explain why.  -- CSR,
-  ;; 2004-03-30
-  (inst and esp-tn (lognot lowtag-mask))
-  (inst lea alloc-tn (make-ea :byte :base esp-tn :disp lowtag))
-  (values))
-
-(defun allocation-notinline (alloc-tn size)
-  (let* ((alloc-tn-offset (tn-offset alloc-tn))
-         ;; C call to allocate via dispatch routines. Each
-         ;; destination has a special entry point. The size may be a
-         ;; register or a constant.
-         (tn-text (ecase alloc-tn-offset
-                    (#.eax-offset "eax")
-                    (#.ecx-offset "ecx")
-                    (#.edx-offset "edx")
-                    (#.ebx-offset "ebx")
-                    (#.esi-offset "esi")
-                    (#.edi-offset "edi")))
-         (size-text (case size (8 "8_") (16 "16_") (t ""))))
-    (unless (or (eql size 8) (eql size 16))
-      (unless (and (tn-p size) (location= alloc-tn size))
-        (inst mov alloc-tn size)))
-    (inst call (make-fixup (concatenate 'string
-                                         "alloc_" size-text
-                                         "to_" tn-text)
-                           :foreign))))
-
-(defun allocation-inline (alloc-tn size)
-  (let* ((ok (gen-label))
-         (done (gen-label))
-         #!+(and sb-thread win32)
-         (scratch-tns (loop for my-tn in `(,eax-tn ,ebx-tn ,edx-tn ,ecx-tn)
-                            when (and (not (location= alloc-tn my-tn))
-                                      (or (not (tn-p size))
-                                          (not (location= size my-tn))))
-                            collect my-tn))
-         (tls-prefix #!+sb-thread :fs)
-         #!+(and sb-thread win32) (scratch-tn (pop scratch-tns))
-         #!+(and sb-thread win32) (swap-tn (pop scratch-tns))
-         (free-pointer
-           ;; thread->alloc_region.free_pointer
-           (make-ea :dword
-                    :base (or #!+(and sb-thread win32)
-                              scratch-tn)
-                    :disp
-                    #!+sb-thread (* n-word-bytes thread-alloc-region-slot)
-                    #!-sb-thread (make-fixup "gc_alloc_region" :foreign)))
-         (end-addr
-            ;; thread->alloc_region.end_addr
-           (make-ea :dword
-                    :base (or #!+(and sb-thread win32)
-                              scratch-tn)
-                    :disp
-                    #!+sb-thread (* n-word-bytes (1+ thread-alloc-region-slot))
-                    #!-sb-thread (make-fixup "gc_alloc_region" :foreign 4))))
-    (unless (and (tn-p size) (location= alloc-tn size))
-      (inst mov alloc-tn size))
-    #!+(and sb-thread win32)
-    (progn
-      (inst push scratch-tn)
-      (inst push swap-tn)
-      (inst mov scratch-tn
-            (make-ea :dword :disp
-                     +win32-tib-arbitrary-field-offset+) tls-prefix)
-      (setf tls-prefix nil))
-    (inst add alloc-tn free-pointer tls-prefix)
-    (inst cmp alloc-tn end-addr tls-prefix)
-    (inst jmp :be ok)
-    (let ((dst (ecase (tn-offset alloc-tn)
-                 (#.eax-offset "alloc_overflow_eax")
-                 (#.ecx-offset "alloc_overflow_ecx")
-                 (#.edx-offset "alloc_overflow_edx")
-                 (#.ebx-offset "alloc_overflow_ebx")
-                 (#.esi-offset "alloc_overflow_esi")
-                 (#.edi-offset "alloc_overflow_edi"))))
-      (inst call (make-fixup dst :foreign)))
-    (inst jmp-short done)
-    (emit-label ok)
-    ;; Swap ALLOC-TN and FREE-POINTER
-    (cond ((and (tn-p size) (location= alloc-tn size))
-           ;; XCHG is extremely slow, use the xor swap trick
-           #!-(and sb-thread win32)
-           (progn
-             (inst xor alloc-tn free-pointer tls-prefix)
-             (inst xor free-pointer alloc-tn tls-prefix)
-             (inst xor alloc-tn free-pointer tls-prefix))
-           #!+(and sb-thread win32)
-           (progn
-             (inst mov swap-tn free-pointer tls-prefix)
-             (inst mov free-pointer alloc-tn tls-prefix)
-             (inst mov alloc-tn swap-tn)))
-          (t
-           ;; It's easier if SIZE is still available.
-           (inst mov free-pointer alloc-tn tls-prefix)
-           (inst sub alloc-tn size)))
-    (emit-label done)
-    #!+(and sb-thread win32)
-    (progn
-      (inst pop swap-tn)
-      (inst pop scratch-tn))
-    (values)))
-
-;;; Emit code to allocate an object with a size in bytes given by
-;;; SIZE.  The size may be an integer or a TN. If Inline is a VOP
-;;; node-var then it is used to make an appropriate speed vs size
-;;; decision.
-
-;;; Allocation should only be used inside a pseudo-atomic section, which
-;;; should also cover subsequent initialization of the object.
-
-;;; (FIXME: so why aren't we asserting this?)
-
-(defun allocation (alloc-tn size &optional inline dynamic-extent lowtag)
-  (declare (ignorable inline))
-  (cond
-    (dynamic-extent
-     (allocation-dynamic-extent alloc-tn size lowtag))
-    ;; Inline allocation can't work if (and (not sb-thread) sb-dynamic-core)
-    ;; because boxed_region points to the linkage table, not the alloc region.
-    #!+(or sb-thread (not sb-dynamic-core))
-    ((or (null inline) (policy inline (>= speed space)))
-     (allocation-inline alloc-tn size))
-    (t
-     (allocation-notinline alloc-tn size)))
-  (when (and lowtag (not dynamic-extent))
-    (inst lea alloc-tn (make-ea :byte :base alloc-tn :disp lowtag)))
-  (values))
-
-;;; Allocate an other-pointer object of fixed SIZE with a single word
-;;; header having the specified WIDETAG value. The result is placed in
-;;; RESULT-TN.
-(defmacro with-fixed-allocation ((result-tn widetag size &optional inline stack-allocate-p)
-                                 &body forms)
-  (unless forms
-    (bug "empty &body in WITH-FIXED-ALLOCATION"))
-  (once-only ((result-tn result-tn) (size size) (stack-allocate-p stack-allocate-p))
-    `(maybe-pseudo-atomic ,stack-allocate-p
-       (allocation ,result-tn (pad-data-block ,size) ,inline ,stack-allocate-p
-                   other-pointer-lowtag)
-       (storew (logior (ash (1- ,size) n-widetag-bits) ,widetag)
-               ,result-tn 0 other-pointer-lowtag)
-       ,@forms)))
-
 ;;;; error code
 (defun emit-error-break (vop kind code values)
   (assemble ()
@@ -353,9 +187,7 @@
     ;; The return PC points here; note the location for the debugger.
     (when vop
       (note-this-location vop :internal-error))
-    (inst byte kind)                    ; e.g. trap_xyyy
-    (inst byte code)
-    (encode-internal-error-args values)))
+    (emit-internal-error kind code values)))
 
 (defun generate-error-code (vop error-code &rest values)
   "Generate-Error-Code Error-code Value*
@@ -395,20 +227,24 @@
 
 #!+sb-safepoint
 (defun emit-safepoint ()
-  (inst test eax-tn (make-ea :dword :disp gc-safepoint-page-addr)))
+  (inst test eax-tn (make-ea :dword :disp
+                             (- nil-value n-word-bytes other-pointer-lowtag
+                                gc-safepoint-trap-offset))))
 
-#!+sb-thread
 (defmacro pseudo-atomic (&rest forms)
   #!+sb-safepoint-strictly
   `(progn ,@forms (emit-safepoint))
   #!-sb-safepoint-strictly
-  (with-unique-names (label)
-    `(let ((,label (gen-label)))
-       (inst mov (make-ea :dword :disp (* 4 thread-pseudo-atomic-bits-slot))
-             ebp-tn :fs)
+  (with-unique-names (label pa-bits-ea)
+    `(let ((,label (gen-label))
+           (,pa-bits-ea
+            #!+sb-thread
+            (make-ea :dword :disp (* 4 thread-pseudo-atomic-bits-slot))
+            #!-sb-thread
+            (make-ea-for-symbol-value *pseudo-atomic-bits* :dword)))
+       (inst mov ,pa-bits-ea ebp-tn #!+sb-thread :fs)
        ,@forms
-       (inst xor (make-ea :dword :disp (* 4 thread-pseudo-atomic-bits-slot))
-             ebp-tn :fs)
+       (inst xor ,pa-bits-ea ebp-tn #!+sb-thread :fs)
        (inst jmp :z ,label)
        ;; if PAI was set, interrupts were disabled at the same time
        ;; using the process signal mask.
@@ -420,21 +256,6 @@
        ;; trap instead.  Let's take the opportunity to trigger that
        ;; safepoint right now.
        (emit-safepoint))))
-
-#!-sb-thread
-(defmacro pseudo-atomic (&rest forms)
-  (with-unique-names (label)
-    `(let ((,label (gen-label)))
-       (inst mov (make-ea-for-symbol-value *pseudo-atomic-bits* :dword)
-             ebp-tn)
-       ,@forms
-       (inst xor (make-ea-for-symbol-value *pseudo-atomic-bits* :dword)
-             ebp-tn)
-       (inst jmp :z ,label)
-       ;; if PAI was set, interrupts were disabled at the same time
-       ;; using the process signal mask.
-       (inst break pending-interrupt-trap)
-       (emit-label ,label))))
 
 ;;;; indexed references
 

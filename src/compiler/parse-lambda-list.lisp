@@ -9,8 +9,6 @@
 
 (in-package "SB!C")
 
-(/show0 "parse-lambda-list.lisp 12")
-
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defconstant-eqx lambda-list-parser-states
     #(:required &optional &rest &more &key &aux &environment &whole
@@ -355,11 +353,12 @@
   (let ((names (make-repeated-name-check :signal-via signal-via))
         (keywords (make-repeated-name-check
                    :kind "keyword" :signal-via signal-via)))
-    (flet ((check-name (name)
+    (flet ((check-name (name &key allow-repeating)
              (check-variable-name-for-binding
               name :context context :signal-via signal-via
               :allow-symbol-macro allow-symbol-macro)
-             (funcall names name)))
+             (unless allow-repeating
+               (funcall names name))))
       (mapc #'check-name required)
       (mapc (lambda (spec)
               (multiple-value-bind (name default suppliedp-var)
@@ -370,6 +369,12 @@
                   (check-name (first suppliedp-var)))))
             optional)
       (mapc #'check-name rest)
+      (mapc (lambda (spec)
+              (check-name (if (consp spec)
+                              (car spec)
+                              spec)
+                          :allow-repeating t))
+            aux)
       (mapc (lambda (spec)
               (multiple-value-bind (keyword name default suppliedp-var)
                   (parse-key-arg-spec spec)
@@ -770,13 +775,16 @@
                                   (if sup-p-var `(values ,val-form t) val-form)
                                   def)))
              (cond ((not sup-p-var) (bind-pat var vals))
-                   ((symbolp var) (bind `((,var ,suppliedp) ,vals)))
-                   (t
+                   ((not (symbolp var))
                     (let ((var-temp (sb!xc:gensym))
                           (sup-p-temp (copy-symbol suppliedp)))
                       (bind `((,var-temp ,sup-p-temp) ,vals))
                       (descend var var-temp)
-                      (bind `(,suppliedp ,sup-p-temp)))))))
+                      (bind `(,suppliedp ,sup-p-temp))))
+                   ((eq var suppliedp)
+                    (bind `((nil ,suppliedp) ,vals)))
+                   (t
+                    (bind `((,var ,suppliedp) ,vals))))))
          (gen-test (sense test then else)
            (cond ((eq sense t) `(if ,test ,then ,@(if else (list else))))
                  (else `(if ,test ,else ,then)) ; flip the branches
@@ -1158,7 +1166,6 @@
               ;; MACROLET doesn't produce an object capable of reflection,
               ;; so don't bother inserting a different lambda-list.
               ,@(unless (eq kind 'macrolet)
-
                   `((declare ,declared-lambda-list)))
               ,@(if outer-decls (list outer-decls))
               ,@(and (not env) (eq envp t) `((declare (ignore ,@ll-env))))
@@ -1202,5 +1209,3 @@
          ;; It is harmful to the space-saving effect of this function
          ;; if reconstituting the list results in an unnecessary copy.
          (if (equal new lambda-list) lambda-list new))))))
-
-(/show0 "parse-lambda-list.lisp end of file")

@@ -175,14 +175,14 @@
   (!with-init-wrappers
    (dolist (x *!cold-defuns*)
      (destructuring-bind (name . inline-expansion) x
-       (%defun name (fdefinition name) nil inline-expansion))))
+       (%defun name (fdefinition name) inline-expansion))))
 
   ;; KLUDGE: Why are fixups mixed up with toplevel forms? Couldn't
   ;; fixups be done separately? Wouldn't that be clearer and better?
   ;; -- WHN 19991204
   (/show0 "doing cold toplevel forms and fixups")
   (unless (!c-runtime-noinform-p)
-    (write `("Length(TLFs)= " ,(length *!cold-toplevels*)))
+    (write `("Length(TLFs)=" ,(length *!cold-toplevels*)) :escape nil)
     (terpri))
   ;; only the basic external formats are present at this point.
   (setq sb!impl::*default-external-format* :latin-1)
@@ -376,6 +376,7 @@ process to continue normally."
   (setf sb!alien::*default-c-string-external-format* nil)
   ;; WITHOUT-GCING implies WITHOUT-INTERRUPTS.
   (without-gcing
+    (finalizers-reinit)
     ;; Create *CURRENT-THREAD* first, since initializing a stream calls
     ;; ALLOC-BUFFER which calls FINALIZE which acquires **FINALIZER-STORE-LOCK**
     ;; which needs a valid thread in order to grab a mutex.
@@ -444,15 +445,15 @@ process to continue normally."
     (%cold-print x 0))
   (values))
 
-(in-package "SB!INT")
-(defun !unintern-symbols ()
     ;; For some reason uninterning these:
     ;;    DEF!TYPE DEF!CONSTANT DEF!STRUCT
     ;; does not work, they stick around as uninterned symbols.
     ;; Some other macros must expand into them. Ugh.
+(push
   '("SB-INT"
     defenum defun-cached with-globaldb-name
     .
     #!+sb-show ()
     #!-sb-show (/hexstr /nohexstr /noshow /noshow0 /noxhow
-                /primitive-print /show /show0 /xhow)))
+                /primitive-print /show /show0 /xhow))
+  sb!impl::*!removable-symbols*)

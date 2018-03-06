@@ -118,24 +118,6 @@
                                                           data-offset)
         `(integer ,min ,max)))))
 
-;;; the default value used for initializing character data. The ANSI
-;;; spec says this is arbitrary, so we use the value that falls
-;;; through when we just let the low-level consing code initialize
-;;; all newly-allocated memory to zero.
-;;;
-;;; KLUDGE: It might be nice to use something which is a
-;;; STANDARD-CHAR, both to reduce user surprise a little and, probably
-;;; more significantly, to help SBCL's cross-compiler (which knows how
-;;; to dump STANDARD-CHARs). Unfortunately, the old CMU CL code is
-;;; shot through with implicit assumptions that it's #\NULL, and code
-;;; in several places (notably both DEFUN MAKE-ARRAY and DEFTRANSFORM
-;;; MAKE-ARRAY) would have to be rewritten. -- WHN 2001-10-04
-(eval-when (:compile-toplevel :load-toplevel :execute)
-  ;; an expression we can use to construct a DEFAULT-INIT-CHAR value
-  ;; at load time (so that we don't need to teach the cross-compiler
-  ;; how to represent and dump non-STANDARD-CHARs like #\NULL)
-  (defparameter *default-init-char-form* '(code-char 0)))
-
 ;;; CHAR-CODE values for ASCII characters which we care about but
 ;;; which aren't defined in section "2.1.3 Standard Characters" of the
 ;;; ANSI specification for Lisp
@@ -1592,13 +1574,19 @@ NOTE: This interface is experimental and subject to change."
 (defmacro with-sane-io-syntax (&body forms)
   `(call-with-sane-io-syntax (lambda () ,@forms)))
 
+(!defvar *print-vector-length* nil
+  "Like *PRINT-LENGTH* but works on strings and bit-vectors.
+Does not affect the cases that are already controlled by *PRINT-LENGTH*")
+(declaim (always-bound *print-vector-length*))
+
 (defun call-with-sane-io-syntax (function)
   (declare (type function function))
   (macrolet ((true (sym)
                `(and (boundp ',sym) ,sym)))
     (let ((*print-readably* nil)
           (*print-level* (or (true *print-level*) 6))
-          (*print-length* (or (true *print-length*) 12)))
+          (*print-length* (or (true *print-length*) 12))
+          (*print-vector-length* (or (true *print-vector-length*) 200)))
       (funcall function))))
 
 ;;; Returns a list of members of LIST. Useful for dealing with circular lists.
@@ -1623,7 +1611,7 @@ NOTE: This interface is experimental and subject to change."
   "Toggle between different evaluator implementations. If set to :COMPILE,
 an implementation of EVAL that calls the compiler will be used. If set
 to :INTERPRET, an interpreter will be used.")
-
+(declaim (always-bound *evaluator-mode*))
 ;; This is not my preferred name for this function, but chosen for harmony
 ;; with everything else that refers to these as 'hash-caches'.
 ;; Hashing is just one particular way of memoizing, and it would have been

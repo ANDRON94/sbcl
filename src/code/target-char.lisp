@@ -16,7 +16,7 @@
 (declaim (inline standard-char-p graphic-char-p alpha-char-p
                  alphanumericp))
 (declaim (maybe-inline upper-case-p lower-case-p both-case-p
-                       digit-char-p two-arg-char-equal))
+                       digit-char-p))
 
 (deftype char-code ()
   `(integer 0 (,sb!xc:char-code-limit)))
@@ -182,7 +182,7 @@
                                                    key-length
                                                    :element-type '(unsigned-byte 32)))
                                              (codepoints nil))
-                                        (assert (and (/= cp-length 0) (/= key-length 0)))
+                                        (aver (and (/= cp-length 0) (/= key-length 0)))
                                         (loop repeat cp-length do
                                               (push (dpb 0 (byte 10 22) (aref info index))
                                                     codepoints)
@@ -662,7 +662,8 @@ is either numeric or alphabetic."
               code
               down-code)))))
 
-(defun two-arg-char-equal (c1 c2)
+(declaim (inline two-arg-char-equal-inline))
+(defun two-arg-char-equal-inline (c1 c2)
   (flet ((base-char-equal-p ()
            (let* ((code1 (char-code c1))
                   (code2 (char-code c2))
@@ -690,14 +691,12 @@ is either numeric or alphabetic."
              (or (= (aref cases index) (char-code c2)) ;; lower case
                  (= (aref cases (1+ index)) (char-code c2))))))))
 
-(defun char-equal-constant (x char reverse-case-char)
-  (declare (type character x) (explicit-check))
-  (or (eq char x)
-      (eq reverse-case-char x)))
+;;; There are transforms on two-arg-char-equal, don't make it inlinable itself.
+(defun two-arg-char-equal (c1 c2)
+  (two-arg-char-equal-inline c1 c2))
 
 (defun two-arg-char-not-equal (c1 c2)
-  (declare (inline two-arg-char-equal))
-  (not (two-arg-char-equal c1 c2)))
+  (not (two-arg-char-equal-inline c1 c2)))
 
 (macrolet ((def (name test doc)
              `(defun ,name (character &rest more-characters)

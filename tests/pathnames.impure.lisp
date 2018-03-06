@@ -19,6 +19,122 @@
 
 (load "test-util.lisp")
 (use-package "TEST-UTIL")
+
+;;;; Pathname accessors
+
+(with-test (:name (pathname :accessors :stream-not-associated-to-file type-error))
+  (let ((*stream* (make-string-output-stream)))
+    (declare (special *stream*))
+    (checked-compile-and-assert ()
+        '(lambda (pathname) (pathname-host pathname))
+      (((make-string-output-stream))     (condition 'type-error))
+      (((make-synonym-stream '*stream*)) (condition 'type-error)))))
+
+(with-test (:name (pathname :accessors file-stream))
+  (let* ((name "pathnames.impure")
+         (type "lisp"))
+    (with-open-file (stream (make-pathname :name name :type type))
+      (assert (equal (pathname-name stream) name))
+      (assert (equal (pathname-type stream) type)))))
+
+(with-test (:name (pathname :accessors synonym-stream))
+  (let* ((name "pathnames.impure")
+         (type "lisp"))
+    (with-open-file (stream (make-pathname :name name :type type))
+      (let* ((*stream1* stream)
+             (stream1 (make-synonym-stream '*stream1*))
+             (*stream2* stream1)
+             (stream2 (make-synonym-stream '*stream2*)))
+        (declare (special *stream1* *stream2*))
+        (assert (equal (pathname-name stream1) name))
+        (assert (equal (pathname-name stream2) name))
+        (assert (equal (pathname-type stream1) type))
+        (assert (equal (pathname-type stream2) type))))))
+
+(labels ((unpattern (thing)
+           (typecase thing
+             (cons
+              (list* (unpattern (first thing))
+                     (map 'list #'unpattern (rest thing))))
+             (sb-impl::pattern
+              (sb-impl::pattern-pieces thing))
+             (t
+              thing)))
+         (pattern (thing)
+           (typecase thing
+             ((cons (member :absolute :relative))
+              (list* (pattern (first thing))
+                     (map 'list #'pattern (cdr thing))))
+             (cons
+              (sb-impl::make-pattern thing))
+             (t
+              thing)))
+         (accessor-cases (initarg accessor cases)
+           (map nil (lambda (test-case)
+                      (destructuring-bind (pathname case expected) test-case
+                        ;; Check accessor directory.
+                        (let ((result (funcall accessor pathname :case case)))
+                          (assert (equal (unpattern result) expected)))
+                        ;; Check roundtrip.
+                        (let* ((pathname (make-pathname initarg (pattern expected) :case case))
+                               (result (funcall accessor pathname :case case)))
+                          (assert (equal (unpattern result) expected)))))
+                cases)))
+
+  (with-test (:name (pathname-device :case))
+    (accessor-cases
+     :device #'pathname-device
+     `((,(make-pathname :device "foo") :local  "foo")
+       (,(make-pathname :device "FOO") :local  "FOO")
+       (,(make-pathname :device "Foo") :local  "Foo")
+
+       (,(make-pathname :device "foo") :common "FOO")
+       (,(make-pathname :device "FOO") :common "foo")
+       (,(make-pathname :device "Foo") :common "Foo"))))
+
+  (with-test (:name (pathname-directory :case))
+    (accessor-cases
+     :directory #'pathname-directory
+     `((,#P"/ab/cd/" :local  (:absolute "ab" "cd"))
+       (,#P"/AB/CD/" :local  (:absolute "AB" "CD"))
+       (,#P"/Ab/Cd/" :local  (:absolute "Ab" "Cd"))
+       (,#P"/AB/cd/" :local  (:absolute "AB" "cd"))
+       (,#P"/a*b/"   :local  (:absolute ("a" :multi-char-wild "b")))
+
+       (,#P"/ab/cd/" :common (:absolute "AB" "CD"))
+       (,#P"/AB/CD/" :common (:absolute "ab" "cd"))
+       (,#P"/Ab/Cd/" :common (:absolute "Ab" "Cd"))
+       (,#P"/AB/cd/" :common (:absolute "ab" "CD"))
+       (,#P"/a*b/"   :common (:absolute ("A" :multi-char-wild "B"))))))
+
+  (with-test (:name (pathname-name :case))
+    (accessor-cases
+     :name #'pathname-name
+     `((,#P"foo" :local  "foo")
+       (,#P"FOO" :local  "FOO")
+       (,#P"Foo" :local  "Foo")
+       (,#P"a*b" :local  ("a" :multi-char-wild "b"))
+
+       (,#P"foo" :common "FOO")
+       (,#P"FOO" :common "foo")
+       (,#P"Foo" :common "Foo")
+       (,#P"a*b" :common ("A" :multi-char-wild "B")))))
+
+  (with-test (:name (pathname-type :case))
+    (accessor-cases
+     :type #'pathname-type
+     `((,#P"n.foo" :local  "foo")
+       (,#P"n.FOO" :local  "FOO")
+       (,#P"n.Foo" :local  "Foo")
+       (,#P"n.a*b" :local  ("a" :multi-char-wild "b"))
+
+       (,#P"n.foo" :common "FOO")
+       (,#P"n.FOO" :common "foo")
+       (,#P"n.Foo" :common "Foo")
+       (,#P"n.a*b" :common ("A" :multi-char-wild "B"))))))
+
+
+;;;; Logical pathnames
 
 (setf (logical-pathname-translations "demo0")
       '(("**;*.*.*" "/tmp/")))
@@ -34,7 +150,7 @@
 
 ;;; some things SBCL-0.6.9 used not to parse correctly:
 ;;;
-;;; SBCL used to throw an error saying there's no translation.
+;;; SBCL used to signal an error saying there's no translation.
 (with-test (:name (:logical-pathname 1))
   (assert (equal (namestring (translate-logical-pathname "demo0:file.lisp"))
                  "/tmp/file.lisp")))
@@ -382,10 +498,43 @@
 (with-test (:name enough-namestring)
   (assert (equal (enough-namestring #p"foo" #p"./") "foo")))
 
+;;;; NAMESTRING
+
 ;;; bug reported by Artem V. Andreev: :WILD not handled in unparsing
-;;; directory lists.
-(with-test (:name (namestring :unparse-wild))
-  (assert (equal (namestring #p"/tmp/*/") "/tmp/*/")))
+;;; directory lists. lp#1738775, reported by Richard M. Kreuter, added
+;;; more cases.
+(with-test (:name (namestring :wild :wild-inferiors :up :lp-1738775))
+  (flet ((test (expected pathname)
+           (assert (equal (namestring pathname) expected))))
+    ;; The second variant using MAKE-PATHNAME makes sure we don't just
+    ;; return the original namestring.
+    (test "/tmp/*/" #P"/tmp/*/")
+    (test "/tmp/*/" (make-pathname :directory '(:absolute "tmp" :wild)))
+
+    ;; lp#1738775 reported breakage in case FIRST in (:absolute FIRST
+    ;; ...) is not of type STRING.
+    (test "/*/" #P"/*/")
+    (test "/*/" (make-pathname :directory '(:absolute :wild)))
+
+    (test "/**/" #P"/**/")
+    (test "/**/" (make-pathname :directory '(:absolute :wild-inferiors)))
+
+    ;; FIXME "Invalid combinations" in 19.2.2.4.3 requires :ABSOLUTE
+    ;; :UP to signal a FILE-ERROR, but we don't.
+    (test "/../" #P"/../")
+    (test "/../" (make-pathname :directory '(:absolute :up)))))
+
+(with-test (:name (namestring :escape-pattern-pieces))
+  (labels ((prepare (namestring)
+             #-win32 (substitute #\\ #\E namestring)
+             #+win32 (substitute #\^ #\E namestring))
+           (test (expected namestring)
+             (let ((pathname (pathname (prepare namestring))))
+               (assert (string= (prepare expected) (namestring pathname))))))
+    #-win32 (test "*E?"    "*E?")
+    #-win32 (test "*E*"    "*E*")
+            (test "*E[ab]" "*E[ab]")
+            (test "*EE"    "*EE")))
 
 ;;; Printing of pathnames; see CLHS 22.1.3.1. This section was started
 ;;; to confirm that pathnames are printed as their namestrings under

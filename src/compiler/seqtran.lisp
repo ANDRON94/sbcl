@@ -255,16 +255,18 @@
     (give-up-ir1-transform "RESULT-TYPE argument not constant"))
   (flet ( ;; 1-valued SUBTYPEP, fails unless second value of SUBTYPEP is true
          (1subtypep (x y)
-           (multiple-value-bind (subtype-p valid-p) (sb!xc:subtypep x y)
+           (multiple-value-bind (subtype-p valid-p)
+               (csubtypep x (specifier-type y))
              (if valid-p
                  subtype-p
                  (give-up-ir1-transform
                   "can't analyze sequence type relationship")))))
     (let* ((result-type-value (lvar-value result-type))
+           (result-type-ctype (ir1-transform-specifier-type result-type-value))
            (result-supertype (cond ((null result-type-value) 'null)
-                                   ((1subtypep result-type-value 'vector)
+                                   ((1subtypep result-type-ctype 'vector)
                                     'vector)
-                                   ((1subtypep result-type-value 'list)
+                                   ((1subtypep result-type-ctype 'list)
                                     'list)
                                    (t
                                     (give-up-ir1-transform
@@ -961,9 +963,9 @@
                       ;; SEQ2 must be distinct arrays.
                       ,(eql sequence-type1 sequence-type2)
                       (eq seq1 seq2) (> start1 start2))
-                     (do ((i (truly-the index (+ start1 replace-len -1))
+                     (do ((i (truly-the (or (eql -1) index) (+ start1 replace-len -1))
                              (1- i))
-                          (j (truly-the index (+ start2 replace-len -1))
+                          (j (truly-the (or (eql -1) index) (+ start2 replace-len -1))
                              (1- j)))
                          ((< i start1))
                        (declare (optimize (insert-array-bounds-checks 0)))
@@ -1685,7 +1687,8 @@
         ((and (union-type-p type)
               (csubtypep type (specifier-type 'string))
               (loop for type in (union-type-types type)
-                    always (equal (array-type-dimensions type) '(*))))
+                    always (and (array-type-p type)
+                                (equal (array-type-dimensions type) '(*)))))
          #!+sb-unicode
          sb!vm:simple-character-string-widetag
          #!-sb-unicode
@@ -1766,8 +1769,9 @@
     (unless (eq key-fun 'identity)
       (acond ((info :function :info key-fun)
               (let ((type (info :function :type key-fun)))
-                (awhen (fun-type-required type)
-                  (return-from find-derive-type-optimizer
+                (return-from find-derive-type-optimizer
+                  (awhen (and (fun-type-p type)
+                              (fun-type-required type))
                     (type-union (first it) (specifier-type 'null))))))
              ((structure-instance-accessor-p key-fun)
               (return-from find-derive-type-optimizer
@@ -1775,14 +1779,13 @@
   ;; Otherwise maybe FIND returns ITEM itself (or an EQL number).
   ;; :TEST is allowed only if EQ or EQL (where NIL means EQL).
   ;; :KEY is allowed only if IDENTITY or NIL.
-  (if (and (or (not test)
-               (lvar-fun-is test '(eq eql))
-               (and (constant-lvar-p test) (null (lvar-value test))))
-           (or (not key)
-               (lvar-fun-is key '(identity))
-               (and (constant-lvar-p key) (null (lvar-value key)))))
-        (type-union (lvar-type item) (specifier-type 'null))
-        (specifier-type 't)))
+  (when (and (or (not test)
+                 (lvar-fun-is test '(eq eql))
+                 (and (constant-lvar-p test) (null (lvar-value test))))
+             (or (not key)
+                 (lvar-fun-is key '(identity))
+                 (and (constant-lvar-p key) (null (lvar-value key)))))
+    (type-union (lvar-type item) (specifier-type 'null))))
 
 ;;; We want to make sure that %FIND-POSITION is inline-expanded into
 ;;; %FIND-POSITION-IF only when %FIND-POSITION-IF has an inline

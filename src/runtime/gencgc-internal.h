@@ -25,7 +25,6 @@
 #include "genesis/code.h"
 #include "hopscotch.h"
 
-void gc_free_heap(void);
 extern char *page_address(page_index_t);
 int gencgc_handle_wp_violation(void *);
 
@@ -98,17 +97,20 @@ struct page {
     // !!! If bit positions are changed, be sure to reflect the changes into
     // page_extensible_p() as well as ALLOCATION-INFORMATION in sb-introspect
     unsigned char
-        /*  000 free
-         *  ?01 boxed data
-         *  ?10 unboxed data
-         *  ?11 code
-         *  1?? open region
-         *
+        /*
+         * The low 4 bits of 'type' are interpreted as:
+         *  0000 free
+         *  ?001 boxed data
+         *  ?010 unboxed data
+         *  ?011 code
+         *  1??? open region
+         * The high bit indicates that the page holds part of or the entirety
+         * of a single object and no other objects.
          * Constants for this field are defined in gc-internal.h, the
          * xxx_PAGE_FLAG definitions.
          *
          * If the page is free, all the following fields are zero. */
-        allocated :3,
+        type :5,
         /* This is set when the page is write-protected. This should
          * always reflect the actual write_protect status of a page.
          * (If the page is written into, we catch the exception, make
@@ -121,16 +123,7 @@ struct page {
         write_protected_cleared :1,
         /* If this page should not be moved during a GC then this flag
          * is set. It's only valid during a GC for allocated pages. */
-        dont_move :1,
-        // FIXME: this should be identical to (dont_move & !large_object),
-        // so we don't need to store it as a bit unto itself.
-        /* If this page is not a large object page and contains
-         * any objects which are pinned */
-        has_pins :1,
-        /* If the page is part of a large object then this flag is
-         * set. No other objects should be allocated to these pages.
-         * This is only valid when the page is allocated. */
-        large_object :1;
+        pinned :1;
 
     /* the generation that this page belongs to. This should be valid
      * for all pages that may have objects allocated, even current
@@ -140,31 +133,17 @@ struct page {
 };
 extern struct page *page_table;
 #ifdef LISP_FEATURE_BIG_ENDIAN
-#define WRITE_PROTECTED_BIT (1<<4)
-#define WP_CLEARED_BIT (1<<3)
+# define WP_CLEARED_FLAG      (1<<1)
+# define WRITE_PROTECTED_FLAG (1<<2)
 #else
-#define WRITE_PROTECTED_BIT (1<<3)
-#define WP_CLEARED_BIT (1<<4)
+# define WRITE_PROTECTED_FLAG (1<<5)
+# define WP_CLEARED_FLAG      (1<<6)
 #endif
 
 struct __attribute__((packed)) corefile_pte {
   uword_t sso; // scan start offset
   page_bytes_t bytes_used;
 };
-
-/// There is some additional cleverness that could potentially be had -
-/// the "need_to_zero" bit (a/k/a "page dirty") is obviously 1 if the page
-/// contains objects. Only for an empty page must we distinguish between pages
-/// not needing be zero-filled before next use and those which must be.
-/// Thus, masking off the dirty bit could be avoided by not storing it for
-/// any in-use page. But since that's not what we do - we set the bit to 1
-/// as soon as a page is used - we do have to mask off the bit.
-#define page_bytes_used(index) (page_table[index].bytes_used_ & ~1)
-#define page_need_to_zero(index) (page_table[index].bytes_used_ & 1)
-#define set_page_bytes_used(index,val) \
-  page_table[index].bytes_used_ = (val) | page_need_to_zero(index)
-#define set_page_need_to_zero(index,val) \
-  page_table[index].bytes_used_ = page_bytes_used(index) | val
 
 /* values for the page.allocated field */
 
@@ -175,9 +154,26 @@ extern page_index_t page_table_pages;
 /* forward declarations */
 
 void update_dynamic_space_free_pointer(void);
-void gc_alloc_update_page_tables(int page_type_flag, struct alloc_region *alloc_region);
-void gc_alloc_update_all_page_tables(int);
-void gc_set_region_empty(struct alloc_region *region);
+void gc_close_region(struct alloc_region *alloc_region, int page_type_flag);
+static void inline ensure_region_closed(struct alloc_region *alloc_region,
+                                        int page_type_flag)
+{
+    if (alloc_region->start_addr)
+        gc_close_region(alloc_region, page_type_flag);
+}
+
+static void inline gc_set_region_empty(struct alloc_region *region)
+{
+    /* last_page is not reset. It can be used as a hint where to resume
+     * allocating after closing and re-opening the region */
+    region->start_addr = region->free_pointer = region->end_addr = 0;
+}
+
+static void inline gc_init_region(struct alloc_region *region)
+{
+    region->last_page = 0; // must always be a valid page index
+    gc_set_region_empty(region);
+}
 
 /*
  * predicates
@@ -199,20 +195,25 @@ find_page_index(void *addr)
     return (-1);
 }
 
+#define SINGLE_OBJECT_FLAG (1<<4)
+#define page_single_obj_p(page) ((page_table[page].type & SINGLE_OBJECT_FLAG)!=0)
 #ifdef PIN_GRANULARITY_LISPOBJ
 #ifndef GENCGC_IS_PRECISE
 #error "GENCGC_IS_PRECISE must be #defined as 0 or 1"
 #endif
+#define page_has_smallobj_pins(page) \
+  (page_table[page].pinned && !page_single_obj_p(page))
 static inline boolean pinned_p(lispobj obj, page_index_t page)
 {
     extern struct hopscotch_table pinned_objects;
     gc_dcheck(compacting_p());
 #if !GENCGC_IS_PRECISE
-    return page_table[page].has_pins
+    return page_has_smallobj_pins(page)
         && hopscotch_containsp(&pinned_objects, obj);
 #else
     /* There is almost never anything in the hashtable on precise platforms */
-    if (!pinned_objects.count || !page_table[page].has_pins) return 0;
+    if (!pinned_objects.count || !page_has_smallobj_pins(page))
+        return 0;
 # ifdef RETURN_PC_WIDETAG
     /* Conceivably there could be a precise GC without RETURN-PC objects */
     if (widetag_of(*native_pointer(obj)) == RETURN_PC_WIDETAG)
@@ -237,6 +238,13 @@ from_space_p(lispobj obj)
     return page_index >= 0
         && page_table[page_index].gen == from_space
         && !pinned_p(obj, page_index);
+}
+
+static boolean __attribute__((unused)) new_space_p(lispobj obj)
+{
+    gc_dcheck(compacting_p());
+    page_index_t page_index = find_page_index((void*)obj);
+    return page_index >= 0 && page_table[page_index].gen == new_space;
 }
 
 #include "genesis/weak-pointer.h"
@@ -278,7 +286,6 @@ extern struct fixedobj_page *fixedobj_pages;
 #endif
 
 extern page_index_t last_free_page;
-extern boolean gencgc_partial_pickup;
 
 extern uword_t
 walk_generation(uword_t (*proc)(lispobj*,lispobj*,uword_t),

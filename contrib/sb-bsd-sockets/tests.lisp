@@ -24,6 +24,13 @@
             #(255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255))
   t)
 
+#-win32
+(deftest unparse-inet6-address
+    (string= (sb-bsd-sockets::unparse-inet6-address
+              (make-inet6-address "fe80::abcd:1234"))
+             "fe80::abcd:1234")
+  t)
+
 (deftest get-protocol-by-name/tcp
     (integerp (get-protocol-by-name "tcp"))
   t)
@@ -506,9 +513,13 @@
   (define-shutdown-tests :output)
   (define-shutdown-tests :io))
 
+(defun poor-persons-random-address ()
+  (let ((base (expt 36 8)))
+    (format nil "~36R" (+ base (random base (make-random-state t))))))
+
 #+linux
 (deftest abstract.smoke
-    (let* ((address "J9dbfDNuVewDs")
+    (let* ((address (poor-persons-random-address))
            (message "message")
            (buffer (make-string (length message))))
       (with-client-and-server ((local-abstract-socket :type :stream)
@@ -521,7 +532,7 @@
 
 #+linux
 (deftest abstract.socket-peername
-    (let ((address "J9dbfDNuVewDs"))
+    (let ((address (poor-persons-random-address)))
       (with-client-and-server ((local-abstract-socket :type :stream)
                                (listener address)
                                (client address)

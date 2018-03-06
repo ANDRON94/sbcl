@@ -116,11 +116,14 @@
     (assert (zerop (length (sb-impl::%pqueue-contents sb-impl::*schedule*))))))
 
 (with-test (:name (:timer :other-thread) :skipped-on (not :sb-thread))
-  (let* ((thread (make-kill-thread (lambda () (sleep 2))))
+  (let* ((sem (sb-thread:make-semaphore))
+         (thread (sb-thread:make-thread (lambda () (sb-thread:wait-on-semaphore sem))))
          (timer (make-timer (lambda ()
                               (assert (eq thread sb-thread:*current-thread*)))
                             :thread thread)))
-    (schedule-timer timer 0.1)))
+    (schedule-timer timer 0.1)
+    (sb-thread:signal-semaphore sem)
+    (assert (sb-thread:join-thread thread))))
 
 (with-test (:name (:timer :new-thread) :skipped-on (not :sb-thread))
   (let* ((original-thread sb-thread:*current-thread*)
@@ -199,7 +202,8 @@
   (loop while (some #'sb-thread:thread-alive-p threads) do (sleep 0.01)))
 
 (with-test (:name (:with-timeout :many-at-the-same-time)
-                  :skipped-on (not :sb-thread))
+                  :skipped-on (not :sb-thread)
+                  :broken-on :win32)
   (let ((ok t))
     (let ((threads (loop repeat 10 collect
                          (sb-thread:make-thread
@@ -250,7 +254,7 @@
 ;;; before they ran) and dying threads were open interrupts.
 (with-test (:name (:timer :parallel-unschedule)
             :skipped-on (not :sb-thread)
-            :broken-on :ppc)
+            :broken-on (or :ppc :win32))
   (let ((timer (sb-ext:make-timer (lambda () 42) :name "parallel schedulers"))
         (other nil))
     (flet ((flop ()
@@ -277,7 +281,8 @@
 ;;;;
 ;;;; Used to have problems in genereal, see comment on (:TIMER
 ;;;; :PARALLEL-UNSCHEDULE).
-(with-test (:name (:timer :schedule-stress) :skipped-on :win32)
+(with-test (:name (:timer :schedule-stress)
+            :broken-on :win32)
   (flet ((test ()
          (let* ((slow-timers
                  (loop for i from 1 upto 1
@@ -301,8 +306,9 @@
   (loop repeat 10 do (test))))
 
 (with-test (:name (:timer :threaded-stress)
-                  :skipped-on (not :sb-thread)
-                  :fails-on :win32)
+            :skipped-on (not :sb-thread)
+            :broken-on :x86
+            :fails-on :win32)
   #+win32
   (error "fixme")
   (let ((barrier (sb-thread:make-semaphore))
@@ -327,7 +333,8 @@
                                                 do (sb-ext:schedule-timer (make-timer #'one :thread thread) 0.001))))))
           (dolist (thread threads)
             (sched thread)))
-        (mapcar #'sb-thread:join-thread threads)))))
+        (loop for thread in threads
+              do (sb-thread:join-thread thread :timeout 20))))))
 
 ;; SB-THREAD:MAKE-THREAD used to lock SB-THREAD:*MAKE-THREAD-LOCK*
 ;; before entering WITHOUT-INTERRUPTS. When a thread which was

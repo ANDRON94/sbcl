@@ -2698,8 +2698,10 @@
   (catch-compiled-program-error
    '(lambda (x) (typep x '(values 10)))
    1)
-  (catch-compiled-program-error
-   '(lambda () (declare (sb-ext:muffle-conditions 10)))))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda () (declare (sb-ext:muffle-conditions 10)))
+                      :allow-warnings t))))
 
 (with-test (:name :coverage-and-errors)
   (ctu:file-compile
@@ -2758,27 +2760,31 @@
        ((function (function *))       "(FUNCTION (FUNCTION *))")
        ((function (function (eql 1))) "(FUNCTION (FUNCTION (EQL 1))")))))
 
-(with-test (:name :boxed-ref-setf-special)
+(with-test (:name :boxed-ref-setf-special
+            :skipped-on :interpreter)
   (let* ((var (gensym))
          (fun (checked-compile `(lambda ()
                                   (declare (special ,var))
                                   (setf ,var 10d0)))))
     (ctu:assert-no-consing (funcall fun))))
 
-(with-test (:name :boxed-ref-bind-special)
+(with-test (:name :boxed-ref-bind-special
+            :skipped-on :interpreter)
   (let* ((var (gensym))
          (fun (checked-compile `(lambda ()
                                   (let ((,var 10d0))
                                     (declare (special ,var)))))))
     (ctu:assert-no-consing (funcall fun))))
 
-(with-test (:name :boxed-ref-svref)
+(with-test (:name :boxed-ref-svref
+            :skipped-on :interpreter)
   (let ((fun (checked-compile `(lambda (x)
                                  (setf (svref x 0) 10d0))))
         (vector (vector nil)))
     (ctu:assert-no-consing (funcall fun vector))))
 
-(with-test (:name :boxed-ref-instance-set)
+(with-test (:name :boxed-ref-instance-set
+            :skipped-on :interpreter)
   (let* ((name (gensym "STRUCT"))
          (fun (progn
                 (eval `(defstruct ,name x))
@@ -2788,7 +2794,8 @@
          (instance (funcall (sb-int:symbolicate 'make- name))))
     (ctu:assert-no-consing (funcall fun instance))))
 
-(with-test (:name :boxed-ref-car)
+(with-test (:name :boxed-ref-car
+            :skipped-on :interpreter)
   (let ((fun (checked-compile `(lambda (x)
                                  (setf (car x) 10d0)
                                  (setf (cdr x) 10d0))))
@@ -2796,8 +2803,11 @@
     (ctu:assert-no-consing (funcall fun list))))
 
 
-(with-test (:name :ftype-return-type-conflict)
-  (declaim (ftype (function () fixnum) ftype-return-type-conflict))
+(with-test (:name :ftype-return-type-conflict
+            ;; Not having UNWIND-TO-FRAME-AND-CALL-VOP changes
+            ;; the condition type here?
+            :fails-on (not :unwind-to-frame-and-call-vop))
+  (proclaim '(ftype (function () fixnum) ftype-return-type-conflict))
   (checked-compile-and-assert (:optimize :safe :allow-warnings t)
       `(sb-int:named-lambda ftype-return-type-conflict () nil)
     (() (condition 'type-error))))
@@ -2825,3 +2835,32 @@
 
 (with-test (:name :defined-fun-in-a-deleted-home-lambda)
   (checked-compile `(lambda (cache key) (bug-1728074-foo cache key #'bug-1728074-to-boolean))))
+
+(defstruct (lambda-var-ref-lvar-null (:type list))
+  (x nil)
+  (y 0))
+
+(with-test (:name :lambda-var-ref-lvar-null)
+  (assert (nth-value 1
+                     (checked-compile
+                      `(lambda (a)
+                         (setf (lambda-var-ref-lvar-null-x :b) nil
+                               (lambda-var-ref-lvar-null-y a) 0))
+                      :allow-warnings t))))
+
+(sb-c:defknown blah * * (sb-c:foldable))
+(defun blah (x) (- x))
+(with-test (:name :foldable-wild-args-fun)
+  (assert (eql (funcall (checked-compile '(lambda () (blah (+ 1 2))))) -3)))
+
+
+(declaim (ftype (function * (values cons &optional)) safety-zero-return-checking)
+         (inline safety-zero-return-checking))
+(defun safety-zero-return-checking (x)
+  x)
+
+(with-test (:name :safety-zero-return-checking)
+  (assert (nth-value 1 (checked-compile `(lambda ()
+                                           (declare (optimize (safety 0)))
+                                           (safety-zero-return-checking 1))
+                                        :allow-warnings t))))

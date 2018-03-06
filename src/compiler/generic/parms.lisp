@@ -161,11 +161,9 @@
     *alloc-signal*
     sb!sys:*interrupt-pending*
     #!+sb-thruption sb!sys:*thruption-pending*
-    #!+sb-thruption sb!kernel:*restart-clusters*
     *in-without-gcing*
     *gc-inhibit*
     *gc-pending*
-    #!+sb-safepoint sb!impl::*gc-safe*
     #!+sb-safepoint sb!impl::*in-safepoint*
     #!+sb-thread *stop-for-gc-pending*
     ;; non-x86oid gencgc object pinning
@@ -190,7 +188,7 @@
 
     ;; sb-safepoint in addition to accessing this symbol via TLS,
     ;; uses the symbol itself as a value. Kinda weird.
-    #!+sb-safepoint *in-without-gcing*
+    #!+(and sb-safepoint sb-thread) *in-without-gcing*
 
     #!+immobile-space *immobile-freelist* ; not per-thread (yet...)
 
@@ -214,12 +212,8 @@
     ;; dynamic runtime linking support
     #!+sb-dynamic-core +required-foreign-symbols+
 
-    ;; for looking up assembler routine by name
-    ;; and patching them on runtime startup
-    sb!fasl::*assembler-routines*
-
     ;; List of Lisp specials bindings made by create_thread_struct()
-    ;; other than the per-thread-c-interface-symbols.
+    ;; excluding the names in !PER-THREAD-C-INTERFACE-SYMBOLS.
     sb!thread::*thread-initial-bindings*
 
     ;;; The following symbols aren't strictly required to be static
@@ -249,7 +243,5 @@
   (defconstant +highest-normal-generation+ 5)
   (defconstant +pseudo-static-generation+ 6))
 
-(defun !unintern-symbols ()
-  '("SB-VM"
-    +c-callable-fdefns+
-    +common-static-symbols+))
+(push '("SB-VM" +c-callable-fdefns+ +common-static-symbols+)
+      sb!impl::*!removable-symbols*)

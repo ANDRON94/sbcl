@@ -371,7 +371,7 @@
     (define-float-fop 52 fop-long-float long-float)))
 
 #!+sb-simd-pack
-(!define-fop 88 (fop-simd-pack)
+(!define-fop 88 :not-host (fop-simd-pack)
   (with-fast-read-byte ((unsigned-byte 8) (fasl-input-stream))
     (%make-simd-pack (fast-read-s-integer 8)
                      (fast-read-u-integer 8)
@@ -582,11 +582,6 @@
 (!define-fop 65 :not-host (fop-known-fun (name))
   (%coerce-name-to-fun name))
 
-#!-(or x86 (and x86-64 (not immobile-space)))
-(!define-fop 61 :not-host (fop-sanctify-for-execution (component))
-  (sb!vm:sanctify-for-execution component)
-  component)
-
 ;;; Modify a slot in a CONSTANTS object.
 (!define-fop 140 :not-host (fop-alter-code ((:operands index) code value) nil)
   (setf (code-header-ref code index) value)
@@ -617,84 +612,6 @@
 
 (!define-fop 144 (fop-assembler-code)
   (error "cannot load assembler code except at cold load"))
-
-(!define-fop 145 (fop-assembler-routine)
-  (error "cannot load assembler code except at cold load"))
-
-(!define-fop 146 :not-host (fop-symbol-tls-fixup (code-object kind symbol))
-  (sb!vm:fixup-code-object code-object
-                           (read-word-arg (fasl-input-stream))
-                           (ensure-symbol-tls-index symbol)
-                           kind)
-  code-object)
-
-#!+immobile-space
-(progn
-  (!define-fop 133 :not-host (fop-layout-fixup (code-object kind obj))
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (get-lisp-obj-address (find-layout obj))
-                             kind :immobile-object)
-    code-object)
-  (!define-fop 134 :not-host (fop-immobile-obj-fixup (code-object kind obj))
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (get-lisp-obj-address obj) ; OBJ can't move
-                             kind :immobile-object)
-    code-object))
-
-#!+immobile-code
-(progn
-  (!define-fop 135 :not-host (fop-named-call-fixup (code-object kind name))
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (sb!vm::fdefn-entry-address name)
-                             kind :named-call)
-    code-object)
-
-  (!define-fop 136 :not-host (fop-static-call-fixup (code-object kind name))
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (sb!vm::function-raw-address name)
-                             kind :static-call)
-    code-object))
-
-(!define-fop 147 :not-host (fop-foreign-fixup (code-object kind))
-  (let* ((len (read-byte-arg (fasl-input-stream)))
-         (sym (make-string len :element-type 'base-char)))
-    (read-n-bytes (fasl-input-stream) sym 0 len)
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (foreign-symbol-address sym)
-                             kind)
-    code-object))
-
-(!define-fop 148 :not-host (fop-assembler-fixup (code-object kind routine))
-  (multiple-value-bind (value found) (gethash routine *assembler-routines*)
-    (unless found
-      (error "undefined assembler routine: ~S" routine))
-    (sb!vm:fixup-code-object code-object (read-word-arg (fasl-input-stream))
-                             value kind :assembly-routine))
-  code-object)
-
-(!define-fop 149 :not-host (fop-code-object-fixup (code-object kind))
-    ;; Note: We don't have to worry about GC moving the code-object after
-    ;; the GET-LISP-OBJ-ADDRESS and before that value is deposited, because
-    ;; we can only use code-object fixups when code-objects don't move.
-  (sb!vm:fixup-code-object code-object (read-word-arg (fasl-input-stream))
-                           (get-lisp-obj-address code-object) kind)
-  code-object)
-
-#!+linkage-table
-(!define-fop 150 :not-host (fop-foreign-dataref-fixup (code-object kind))
-  (let* ((len (read-byte-arg (fasl-input-stream)))
-         (sym (make-string len :element-type 'base-char)))
-    (read-n-bytes (fasl-input-stream) sym 0 len)
-    (sb!vm:fixup-code-object code-object
-                             (read-word-arg (fasl-input-stream))
-                             (foreign-symbol-address sym t)
-                             kind)
-    code-object))
 
 ;;; FOPs needed for implementing an IF operator in a FASL
 

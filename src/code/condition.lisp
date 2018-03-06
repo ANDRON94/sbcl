@@ -598,23 +598,39 @@
                      ~2I~_~S~:>"
              'values-list (type-error-datum condition)))))
 
-(define-condition unbound-variable (cell-error) ()
+(define-condition unbound-variable (cell-error)
+  ((not-yet-loaded :initform nil :reader not-yet-loaded :initarg :not-yet-loaded))
   (:report
    (lambda (condition stream)
      (format stream
-             "The variable ~S is unbound."
-             (cell-error-name condition)))))
+             "~@<The variable ~S is unbound.~@?~@:>"
+             (cell-error-name condition)
+             (case (not-yet-loaded condition)
+               (:local
+                "~:@_It is a local variable ~
+                       not available at compile-time.")
+               (t
+                ""))))))
 
 (define-condition retry-unbound-variable
     (simple-condition unbound-variable) ())
 
-(define-condition undefined-function (cell-error) ()
+(define-condition undefined-function (cell-error)
+  ((not-yet-loaded :initform nil :reader not-yet-loaded :initarg :not-yet-loaded))
   (:report
    (lambda (condition stream)
      (let ((*package* (find-package :keyword)))
        (format stream
-               "The function ~S is undefined."
-               (cell-error-name condition))))))
+               "~@<The function ~S is undefined.~@?~@:>"
+               (cell-error-name condition)
+               (case (not-yet-loaded condition)
+                 (:local
+                  "~:@_It is a local function ~
+                       not available at compile-time.")
+                 ((t) "~:@_It is defined earlier in the ~
+                           file but is not available at compile-time.")
+                 (t
+                  "")))))))
 
 (define-condition retry-undefined-function
     (simple-condition undefined-function) ())
@@ -837,11 +853,13 @@
   (:report report-duplicate-definition))
 
 (define-condition constant-modified (reference-condition warning)
-  ((fun-name :initarg :fun-name :reader constant-modified-fun-name))
+  ((fun-name :initarg :fun-name :reader constant-modified-fun-name)
+   (value :initarg :value :reader constant-modified-value))
   (:report (lambda (c s)
              (format s "~@<Destructive function ~S called on ~
-                        constant data.~@:>"
-                     (constant-modified-fun-name c))))
+                        constant data: ~s.~@:>"
+                     (constant-modified-fun-name c)
+                     (constant-modified-value c))))
   (:default-initargs :references '((:ansi-cl :special-operator quote)
                                    (:ansi-cl :section (3 2 2 3)))))
 
@@ -914,9 +932,6 @@
   ()
   (:default-initargs :references '((:ansi-cl :section (2 4 8 13)))))
 
-#!+sb-package-locks
-(progn
-
 (define-condition package-lock-violation (package-error
                                           reference-condition
                                           simple-condition)
@@ -953,8 +968,6 @@ signalled when an operation on a package violates a package lock."))
 signalled when an operation on a symbol violates a package lock. The
 symbol that caused the violation is accessed by the function
 SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
-
-) ; progn
 
 (define-condition undefined-alien-error (cell-error) ()
   (:report
@@ -1187,13 +1200,15 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
                      (standard-pprint-dispatch-table-modified-operation
                       condition))))
   (:default-initargs
-      :references `((:ansi-cl :glossary "standard pprint dispatch table"))))
+   :references `((:ansi-cl :glossary "standard pprint dispatch table"))))
 
 (define-condition timeout (serious-condition)
   ((seconds :initarg :seconds :initform nil :reader timeout-seconds))
   (:report (lambda (condition stream)
-             (format stream "Timeout occurred~@[ after ~A seconds~]."
-                     (timeout-seconds condition)))))
+             (format stream "Timeout occurred~@[ after ~A second~:P~]."
+                     (timeout-seconds condition))))
+  (:documentation
+   "Signaled when an operation does not complete within an allotted time budget."))
 
 (define-condition io-timeout (stream-error timeout)
   ((direction :reader io-timeout-direction :initarg :direction))
@@ -1205,10 +1220,14 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
              (io-timeout-direction condition)
              (stream-error-stream condition)))))
 
-(define-condition deadline-timeout (timeout) ()
+(define-condition deadline-timeout (timeout)
+  ()
   (:report (lambda (condition stream)
-             (format stream "A deadline was reached after ~A seconds."
-                     (timeout-seconds condition)))))
+             (format stream "A deadline was reached after ~A second~:P."
+                     (timeout-seconds condition))))
+  (:documentation
+   "Signaled when an operation in the context of a deadline takes
+longer than permitted by the deadline."))
 
 (define-condition declaration-type-conflict-error (reference-condition
                                                    simple-error)
@@ -1223,7 +1242,6 @@ SB-EXT:PACKAGE-LOCKED-ERROR-SYMBOL."))
 
 (define-condition step-condition ()
   ((form :initarg :form :reader step-condition-form))
-
   (:documentation "Common base class of single-stepping conditions.
 STEP-CONDITION-FORM holds a string representation of the form being
 stepped."))
@@ -1356,8 +1374,7 @@ handled by any other handler, it will be muffled.")
     namestring))
 
 (defun interesting-function-redefinition-warning-p (warning old)
-  (let ((new (function-redefinition-warning-new-function warning))
-        (source-location (redefinition-warning-new-location warning)))
+  (let ((new (function-redefinition-warning-new-function warning)))
     (or
      ;; compiled->interpreted is interesting.
      (and (typep old 'compiled-function)
@@ -1365,14 +1382,11 @@ handled by any other handler, it will be muffled.")
      ;; fin->regular is interesting except for interpreted->compiled.
      (and (typep new '(not funcallable-instance))
           (typep old '(and funcallable-instance
-                           #!+sb-fasteval (not sb!interpreter:interpreted-function)
-                           #!+sb-eval (not sb!eval:interpreted-function))))
+                       #!+sb-fasteval (not sb!interpreter:interpreted-function)
+                       #!+sb-eval (not sb!eval:interpreted-function))))
      ;; different file or unknown location is interesting.
      (let* ((old-namestring (function-file-namestring old))
-            (new-namestring
-             (or (function-file-namestring new)
-                 (when source-location
-                   (sb!c::definition-source-location-namestring source-location)))))
+            (new-namestring (function-file-namestring new)))
        (and (or (not old-namestring)
                 (not new-namestring)
                 (not (string= old-namestring new-namestring))))))))
@@ -1752,4 +1766,179 @@ the restart does not exist."))
 ;; it should be exported from SB-EXT so that people can muffle it.
 (define-condition sb!c:inlining-dependency-failure (simple-style-warning) ())
 
-(/show0 "condition.lisp end of file")
+
+(define-condition layout-invalid (type-error)
+  ()
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "~@<invalid structure layout: ~
+              ~2I~_A test for class ~4I~_~S ~
+              ~2I~_was passed the obsolete instance ~4I~_~S~:>"
+             (classoid-proper-name (type-error-expected-type condition))
+             (type-error-datum condition)))))
+
+(define-condition case-failure (type-error)
+  ((name :reader case-failure-name :initarg :name)
+   (possibilities :reader case-failure-possibilities :initarg :possibilities))
+  (:report
+   (lambda (condition stream)
+     (let ((*print-escape* t))
+       (format stream "~@<~S fell through ~S expression.~@[ ~
+                      ~:_Wanted one of (~/pprint-fill/).~]~:>"
+               (type-error-datum condition)
+               (case-failure-name condition)
+               (case-failure-possibilities condition))))))
+
+(define-condition compiled-program-error (program-error)
+  ((message :initarg :message :reader program-error-message)
+   (source :initarg :source :reader program-error-source))
+  (:report (lambda (condition stream)
+             (format stream "Execution of a form compiled with errors.~%~
+                             Form:~%  ~A~%~
+                             Compile-time error:~%  ~A"
+                       (program-error-source condition)
+                       (program-error-message condition)))))
+
+(define-condition interpreted-program-error
+    (program-error encapsulated-condition)
+  ;; Unlike COMPILED-PROGRAM-ERROR, we don't need to dump these, so
+  ;; storing the original condition and form is OK.
+  ((form :initarg :form :reader program-error-form))
+  (:report (lambda (condition stream)
+             (format stream "~&Evaluation of~%  ~S~%~
+                             caused error:~%  ~A~%"
+                     (program-error-form condition)
+                     (encapsulated-condition condition)))))
+
+(define-condition simple-control-error (simple-condition control-error) ())
+(define-condition simple-file-error    (simple-condition file-error)    ())
+(define-condition simple-stream-error  (simple-condition stream-error)  ())
+(define-condition simple-parse-error   (simple-condition parse-error)   ())
+
+(define-condition character-coding-error (error)
+  ((external-format :initarg :external-format :reader character-coding-error-external-format)))
+(define-condition character-encoding-error (character-coding-error)
+  ((code :initarg :code :reader character-encoding-error-code)))
+(define-condition character-decoding-error (character-coding-error)
+  ((octets :initarg :octets :reader character-decoding-error-octets)))
+(define-condition stream-encoding-error (stream-error character-encoding-error)
+  ()
+  (:report
+   (lambda (c s)
+     (let ((stream (stream-error-stream c))
+           (code (character-encoding-error-code c)))
+       (format s "~@<~S stream encoding error on ~S: ~2I~_~
+                  the character with code ~D cannot be encoded.~@:>"
+               (character-coding-error-external-format c)
+               stream
+               code)))))
+(define-condition stream-decoding-error (stream-error character-decoding-error)
+  ()
+  (:report
+   (lambda (c s)
+     (let ((stream (stream-error-stream c))
+           (octets (character-decoding-error-octets c)))
+       (format s "~@<~S stream decoding error on ~S: ~2I~_~
+                  the octet sequence ~S cannot be decoded.~@:>"
+               (character-coding-error-external-format c)
+               stream
+               octets)))))
+
+(define-condition c-string-encoding-error (character-encoding-error)
+  ()
+  (:report
+   (lambda (c s)
+     (format s "~@<~S c-string encoding error: ~2I~_~
+                  the character with code ~D cannot be encoded.~@:>"
+               (character-coding-error-external-format c)
+               (character-encoding-error-code c)))))
+
+(define-condition c-string-decoding-error (character-decoding-error)
+  ()
+  (:report
+   (lambda (c s)
+     (format s "~@<~S c-string decoding error: ~2I~_~
+                  the octet sequence ~S cannot be decoded.~@:>"
+             (character-coding-error-external-format c)
+             (character-decoding-error-octets c)))))
+
+(define-condition control-stack-exhausted (storage-condition)
+  ()
+  (:report
+    (lambda (condition stream)
+      (declare (ignore condition))
+      (format stream
+              ;; no pretty-printing, because that would use a lot of stack.
+              "Control stack exhausted (no more space for function call frames).
+This is probably due to heavily nested or infinitely recursive function
+calls, or a tail call that SBCL cannot or has not optimized away.
+
+PROCEED WITH CAUTION."))))
+
+(define-condition binding-stack-exhausted (storage-condition)
+  ()
+  (:report
+    (lambda (condition stream)
+      (declare (ignore condition))
+      (format stream
+              ;; no pretty-printing, because that would use a lot of stack.
+              "Binding stack exhausted.
+
+PROCEED WITH CAUTION."))))
+
+(define-condition alien-stack-exhausted (storage-condition)
+  ()
+  (:report
+    (lambda (condition stream)
+      (declare (ignore condition))
+      (format stream
+              ;; no pretty-printing, because that would use a lot of stack.
+              "Alien stack exhausted.
+
+PROCEED WITH CAUTION."))))
+
+(define-condition heap-exhausted-error (storage-condition)
+  ()
+  (:report
+   (lambda (condition stream)
+     (declare (ignore condition))
+     (declare (special *heap-exhausted-error-available-bytes*
+                       *heap-exhausted-error-requested-bytes*))
+     ;; See comments in interr.lisp -- there is a method to this madness.
+     (if (and (boundp '*heap-exhausted-error-available-bytes*)
+              (boundp '*heap-exhausted-error-requested-bytes*))
+         (format stream
+                 ;; no pretty-printing, because that will use a lot of heap.
+                 "Heap exhausted (no more space for allocation).
+~D bytes available, ~D requested.
+
+PROCEED WITH CAUTION."
+                 *heap-exhausted-error-available-bytes*
+                 *heap-exhausted-error-requested-bytes*)
+         (format stream
+                 "A ~S condition without bindings for heap statistics.  (If
+you did not expect to see this message, please report it."
+                 'heap-exhausted-error)))))
+
+(define-condition system-condition (condition)
+  ((address :initarg :address :reader system-condition-address :initform nil)
+   (context :initarg :context :reader system-condition-context :initform nil)))
+
+(define-condition memory-fault-error (system-condition error) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "Unhandled memory fault at #x~X."
+             (system-condition-address condition)))))
+
+(define-condition breakpoint-error (system-condition error) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "Unhandled breakpoint/trap at #x~X."
+             (system-condition-address condition)))))
+
+(define-condition interactive-interrupt (system-condition serious-condition) ()
+  (:report
+   (lambda (condition stream)
+     (format stream "Interactive interrupt at #x~X."
+             (system-condition-address condition)))))

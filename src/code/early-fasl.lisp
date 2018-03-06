@@ -44,7 +44,9 @@
 ;;; so any flag in this list may or may not be present
 ;;; in the *FEATURES* list of this particular build.
 (defglobal *features-potentially-affecting-fasl-format*
-    (append '(:sb-thread :sb-package-locks :sb-unicode :cheneygc :gencgc :msan)
+    (append '(:sb-thread :sb-package-locks :sb-unicode :cheneygc
+              :gencgc :msan :sb-safepoint :sb-safepoint-strictly
+              :sb-dynamic-core)
             #!+(or x86 x86-64) '(:int4-breakpoints :ud2-breakpoints)))
 
 ;;; Return a string representing symbols in *FEATURES-POTENTIALLY-AFFECTING-FASL-FORMAT*
@@ -132,9 +134,7 @@
 ;;;   Assembler routines are named by full Lisp symbols: they
 ;;;     have packages and that sort of native Lisp stuff associated
 ;;;     with them. We can compare them with EQ.
-(declaim (type hash-table *assembler-routines*))
-(defglobal *assembler-routines* (make-hash-table :test 'eq))
-(defglobal *assembler-objects* nil)
+(defglobal *assembler-routines* nil)
 
 
 ;;;; the FOP database

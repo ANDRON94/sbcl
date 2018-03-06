@@ -658,15 +658,32 @@
            ;; though probably extremely weird. Also the PRED should be set in
            ;; that event, but it isn't.
            ((and (eq (classoid-state class) :sealed) layout
-                 (not (classoid-subclasses class)))
-            ;; Sealed and has no subclasses.
+                 (or (not (classoid-subclasses class))
+                     (eql (hash-table-count (classoid-subclasses class))
+                          1)))
+            ;; Sealed and at most one subclass.
             ;; The crummy dual expressions for the same result are because
             ;; (BLOCK (RETURN ...)) seems to emit a forward branch in the
             ;; passing case, but AND emits a forward branch in the failing
             ;; case which I believe is the better choice.
-            (if pred
-                `(and ,pred (eq ,get-layout ',layout))
-                `(block typep (eq ,get-layout-or-return-false ',layout))))
+            (let ((other-layout (and
+                                 (classoid-subclasses class)
+                                 (dohash ((classoid layout)
+                                          (classoid-subclasses class)
+                                          :locked t)
+                                   (declare (ignore classoid))
+                                   (return layout)))))
+              (flet ((check-layout (layout-getter)
+                       (if other-layout
+                           ;; It's faster to compare two layouts than
+                           ;; doing whatever is done below
+                           `(let ((object-layout ,layout-getter))
+                              (or (eq object-layout ',layout)
+                                  (eq object-layout ',other-layout)))
+                           `(eq ,layout-getter ',layout))))
+                (if pred
+                    `(and ,pred ,(check-layout get-layout))
+                    `(block typep ,(check-layout get-layout-or-return-false))))))
 
            ((and (typep class 'structure-classoid) layout)
             ;; structure type tests; hierarchical layout depths
@@ -681,26 +698,26 @@
                    (abstract-base-p (awhen (layout-info layout)
                                       (not (dd-constructors it))))
                    (get-ancestor
-                    ;; Use DATA-VECTOR-REF directly, since that's what SVREF in
-                    ;; a SAFETY 0 lexenv will eventually be transformed to.
-                    ;; This can give a large compilation speedup, since
-                    ;; %INSTANCE-TYPEPs are frequently created during
-                    ;; GENERATE-TYPE-CHECKS, and the normal aref transformation
-                    ;; path is pretty heavy.
-                    `(locally (declare (optimize (safety 0)))
-                       (data-vector-ref (layout-inherits ,n-layout) ,depthoid)))
+                     ;; Use DATA-VECTOR-REF directly, since that's what SVREF in
+                     ;; a SAFETY 0 lexenv will eventually be transformed to.
+                     ;; This can give a large compilation speedup, since
+                     ;; %INSTANCE-TYPEPs are frequently created during
+                     ;; GENERATE-TYPE-CHECKS, and the normal aref transformation
+                     ;; path is pretty heavy.
+                     `(locally (declare (optimize (safety 0)))
+                        (data-vector-ref (layout-inherits ,n-layout) ,depthoid)))
                    (ancestor-layout-eq
-                    ;; Layouts are immediate constants in immobile space.
-                    ;; It would be far nicer if we had a pattern-matching pass
-                    ;; wherein the backend would recognize that
-                    ;; (eq (data-vector-ref ...) k) has a single instruction form,
-                    ;; but lacking that, force it into a single call
-                    ;; that a vop can translate.
-                    #!+(and immobile-space x86-64)
-                    `(sb!vm::layout-inherits-ref-eq ; only implemented on x86-64
-                      (layout-inherits ,n-layout) ,depthoid ,layout)
-                    #!-(and immobile-space x86-64)
-                    `(eq ,get-ancestor ,layout))
+                     ;; Layouts are immediate constants in immobile space.
+                     ;; It would be far nicer if we had a pattern-matching pass
+                     ;; wherein the backend would recognize that
+                     ;; (eq (data-vector-ref ...) k) has a single instruction form,
+                     ;; but lacking that, force it into a single call
+                     ;; that a vop can translate.
+                     #!+(and immobile-space x86-64)
+                     `(sb!vm::layout-inherits-ref-eq ; only implemented on x86-64
+                       (layout-inherits ,n-layout) ,depthoid ,layout)
+                     #!-(and immobile-space x86-64)
+                     `(eq ,get-ancestor ,layout))
                    (deeper-p `(> (layout-depthoid ,n-layout) ,depthoid)))
               (aver (equal pred '(%instancep object)))
               `(and ,pred
@@ -728,23 +745,22 @@
             (let* ((depthoid (layout-depthoid layout))
                    (n-inherits (gensym))
                    (guts
-                    `((when (layout-invalid ,n-layout)
-                        (setq ,n-layout (update-object-layout-or-invalid
-                                         object ',layout)))
-                      (let ((,n-inherits (layout-inherits
-                                          (truly-the layout ,n-layout))))
-                        (declare (optimize (safety 0)))
-                        (eq (if (> (vector-length ,n-inherits) ,depthoid)
-                                (data-vector-ref ,n-inherits ,depthoid)
-                                ,n-layout)
-                            ,layout)))))
+                     `((when (layout-invalid ,n-layout)
+                         (setq ,n-layout (update-object-layout-or-invalid
+                                          object ',layout)))
+                       (let ((,n-inherits (layout-inherits
+                                           (truly-the layout ,n-layout))))
+                         (declare (optimize (safety 0)))
+                         (eq (if (> (vector-length ,n-inherits) ,depthoid)
+                                 (data-vector-ref ,n-inherits ,depthoid)
+                                 ,n-layout)
+                             ,layout)))))
               (if pred
                   `(and ,pred (let ((,n-layout ,get-layout)) ,@guts))
                   `(block typep
                      (let ((,n-layout ,get-layout-or-return-false)) ,@guts)))))
 
            (t
-            (/noshow "default case -- ,PRED and CLASS-CELL-TYPEP")
             `(classoid-cell-typep ',(find-classoid-cell name :create t)
                                   object))))))))
 
@@ -763,46 +779,46 @@
 ;;; when, so we ignore policy and always do them.
 (defun %source-transform-typep (object type)
   (let ((ctype (careful-specifier-type type)))
-    (or (when (not ctype)
-          (compiler-warn "illegal type specifier for TYPEP: ~S" type)
-          (return-from %source-transform-typep (values nil t)))
-        (multiple-value-bind (constantp value) (type-singleton-p ctype)
-          (and constantp
-               `(eql ,object ',value)))
-        (let ((pred (cdr (assoc ctype *backend-type-predicates*
-                                :test #'type=))))
-          (when pred `(,pred ,object)))
-        (typecase ctype
-          (hairy-type
-           (source-transform-hairy-typep object ctype))
-          (negation-type
-           (source-transform-negation-typep object ctype))
-          (union-type
-           (source-transform-union-typep object ctype))
-          (intersection-type
-           (source-transform-intersection-typep object ctype))
-          (member-type
-           `(if (member ,object ',(member-type-members ctype)) t))
-          (args-type
-           (compiler-warn "illegal type specifier for TYPEP: ~S" type)
-           (return-from %source-transform-typep (values nil t)))
-          (t nil))
-        (typecase ctype
-          (numeric-type
-           (source-transform-numeric-typep object ctype))
-          (classoid
-           `(%instance-typep ,object ',type))
-          (array-type
-           (source-transform-array-typep object ctype))
-          (cons-type
-           (source-transform-cons-typep object ctype))
-          (character-set-type
-           (source-transform-character-set-typep object ctype))
-          #!+sb-simd-pack
-          (simd-pack-type
-           (source-transform-simd-pack-typep object ctype))
-          (t nil))
-        `(%typep ,object ',type))))
+    (if ctype
+        (or
+         (multiple-value-bind (constantp value) (type-singleton-p ctype)
+           (and constantp
+                `(eql ,object ',value)))
+         (let ((pred (cdr (assoc ctype *backend-type-predicates*
+                                 :test #'type=))))
+           (when pred `(,pred ,object)))
+         (typecase ctype
+           (hairy-type
+            (source-transform-hairy-typep object ctype))
+           (negation-type
+            (source-transform-negation-typep object ctype))
+           (union-type
+            (source-transform-union-typep object ctype))
+           (intersection-type
+            (source-transform-intersection-typep object ctype))
+           (member-type
+            `(if (member ,object ',(member-type-members ctype)) t))
+           (args-type
+            (compiler-warn "illegal type specifier for TYPEP: ~S" type)
+            (return-from %source-transform-typep (values nil t)))
+           (t nil))
+         (typecase ctype
+           (numeric-type
+            (source-transform-numeric-typep object ctype))
+           (classoid
+            `(%instance-typep ,object ',type))
+           (array-type
+            (source-transform-array-typep object ctype))
+           (cons-type
+            (source-transform-cons-typep object ctype))
+           (character-set-type
+            (source-transform-character-set-typep object ctype))
+           #!+sb-simd-pack
+           (simd-pack-type
+            (source-transform-simd-pack-typep object ctype))
+           (t nil))
+         `(%typep ,object ',type))
+        (values nil t))))
 
 (defun source-transform-typep (object type)
   (when (typep type 'type-specifier)
@@ -906,91 +922,95 @@
     (give-up-ir1-transform))
   (let* ((tval (lvar-value type))
          (tspec (ir1-transform-specifier-type tval)))
-    (if (csubtypep (lvar-type x) tspec)
-        'x
-        ;; Note: The THE forms we use to wrap the results make sure that
-        ;; specifiers like (SINGLE-FLOAT 0.0 1.0) can raise a TYPE-ERROR.
-        (cond
-          ((csubtypep tspec (specifier-type 'double-float))
-           `(the ,tval (%double-float x)))
-          ;; FIXME: #!+long-float (t ,(error "LONG-FLOAT case needed"))
-          ((csubtypep tspec (specifier-type 'float))
-           `(the ,tval (%single-float x)))
-          ((csubtypep tspec (specifier-type 'complex))
-           (multiple-value-bind (part-type result-type)
-               (cond ((and (numeric-type-p tspec)
-                           (numeric-type-format tspec))) ; specific FLOAT type
-                     ((csubtypep tspec (specifier-type '(complex float)))
-                      ;; unspecific FLOAT type
-                      'float)
-                     ((csubtypep tspec (specifier-type '(complex rational)))
-                      (values 'rational `(or ,tval rational)))
-                     (t
-                      (values t `(or ,tval rational))))
-             (let ((result-type (or result-type tval)))
-               `(cond
-                  ((not (typep x 'complex))
-                   (the ,result-type (complex (coerce x ',part-type))))
-                  ((typep x ',tval)
-                   x)
-                  (t     ; X is COMPLEX, but not of the requested type
-                   (the ,result-type
-                        (complex (coerce (realpart x) ',part-type)
-                                 (coerce (imagpart x) ',part-type))))))))
-          ;; Special case STRING and SIMPLE-STRING as they are union types
-          ;; in SBCL.
-          ((member tval '(string simple-string))
-           `(the ,tval
-                 (if (typep x ',tval)
-                     x
-                     (replace (make-array (length x) :element-type 'character) x))))
-          ((eq tval 'character)
-           `(character x))
-          ;; Special case VECTOR
-          ((eq tval 'vector)
-           `(the ,tval
-                 (if (vectorp x)
-                     x
-                     (replace (make-array (length x)) x))))
-          ;; Handle specialized element types for 1D arrays.
-          ((csubtypep tspec (specifier-type '(array * (*))))
-           ;; Can we avoid checking for dimension issues like (COERCE FOO
-           ;; '(SIMPLE-VECTOR 5)) returning a vector of length 6?
-           ;;
-           ;; CLHS actually allows this for all code with SAFETY < 3,
-           ;; but we're a conservative bunch.
-           (if (or (policy node (zerop safety)) ; no need in unsafe code
-                   (and (array-type-p tspec) ; no need when no dimensions
-                        (equal (array-type-dimensions tspec) '(*))))
-               ;; We can!
-               (multiple-value-bind (vtype etype upgraded) (simplify-vector-type tspec)
-                 (unless upgraded
-                   (give-up-ir1-transform))
-                 (let ((vtype (type-specifier vtype)))
-                   `(the ,vtype
-                         (if (typep x ',vtype)
-                             x
-                             (replace
-                              (make-array (length x)
-                                          ,@(and (not (eq etype *universal-type*))
-                                                 (not (eq etype *wild-type*))
-                                                 `(:element-type ',(type-specifier etype))))
-                              x)))))
-               ;; No, duh. Dimension checking required.
-               (give-up-ir1-transform
-                "~@<~S specifies dimensions other than (*) in safe code.~:@>"
-                tval)))
-          ((type= tspec (specifier-type 'list))
-           `(coerce-to-list x))
-          ((csubtypep tspec (specifier-type 'function))
-           (if (csubtypep (lvar-type x) (specifier-type 'symbol))
-               `(coerce-symbol-to-fun x)
-               ;; if X can later be derived as FUNCTION then we don't want
-               ;; to call COERCE-TO-FUN, because there's no smartness
-               ;; that can undo that and see that it's really (IDENTITY X).
-               (progn (delay-ir1-transform node :constraint)
-                      `(coerce-to-fun x))))
-          (t
+    ;; Note: The THE forms we use to wrap the results make sure that
+    ;; specifiers like (SINGLE-FLOAT 0.0 1.0) can raise a TYPE-ERROR.
+    (cond
+      ((eq tspec *empty-type*)
+       (compiler-warn "Can't coerce to NIL.")
+       (setf (combination-kind node) :error)
+       (give-up-ir1-transform))
+      ((csubtypep (lvar-type x) tspec)
+       'x)
+      ((csubtypep tspec (specifier-type 'double-float))
+       `(the ,tval (%double-float x)))
+      ;; FIXME: #!+long-float (t ,(error "LONG-FLOAT case needed"))
+      ((csubtypep tspec (specifier-type 'float))
+       `(the ,tval (%single-float x)))
+      ((csubtypep tspec (specifier-type 'complex))
+       (multiple-value-bind (part-type result-type)
+           (cond ((and (numeric-type-p tspec)
+                       (numeric-type-format tspec))) ; specific FLOAT type
+                 ((csubtypep tspec (specifier-type '(complex float)))
+                  ;; unspecific FLOAT type
+                  'float)
+                 ((csubtypep tspec (specifier-type '(complex rational)))
+                  (values 'rational `(or ,tval rational)))
+                 (t
+                  (values t `(or ,tval rational))))
+         (let ((result-type (or result-type tval)))
+           `(cond
+              ((not (typep x 'complex))
+               (the ,result-type (complex (coerce x ',part-type))))
+              ((typep x ',tval)
+               x)
+              (t         ; X is COMPLEX, but not of the requested type
+               (the ,result-type
+                    (complex (coerce (realpart x) ',part-type)
+                             (coerce (imagpart x) ',part-type))))))))
+      ;; Special case STRING and SIMPLE-STRING as they are union types
+      ;; in SBCL.
+      ((member tval '(string simple-string))
+       `(the ,tval
+             (if (typep x ',tval)
+                 x
+                 (replace (make-array (length x) :element-type 'character) x))))
+      ((eq tval 'character)
+       `(character x))
+      ;; Special case VECTOR
+      ((eq tval 'vector)
+       `(the ,tval
+             (if (vectorp x)
+                 x
+                 (replace (make-array (length x)) x))))
+      ;; Handle specialized element types for 1D arrays.
+      ((csubtypep tspec (specifier-type '(array * (*))))
+       ;; Can we avoid checking for dimension issues like (COERCE FOO
+       ;; '(SIMPLE-VECTOR 5)) returning a vector of length 6?
+       ;;
+       ;; CLHS actually allows this for all code with SAFETY < 3,
+       ;; but we're a conservative bunch.
+       (if (or (policy node (zerop safety)) ; no need in unsafe code
+               (and (array-type-p tspec) ; no need when no dimensions
+                    (equal (array-type-dimensions tspec) '(*))))
+           ;; We can!
+           (multiple-value-bind (vtype etype upgraded) (simplify-vector-type tspec)
+             (unless upgraded
+               (give-up-ir1-transform))
+             (let ((vtype (type-specifier vtype)))
+               `(the ,vtype
+                     (if (typep x ',vtype)
+                         x
+                         (replace
+                          (make-array (length x)
+                                      ,@(and (not (eq etype *universal-type*))
+                                             (not (eq etype *wild-type*))
+                                             `(:element-type ',(type-specifier etype))))
+                          x)))))
+           ;; No, duh. Dimension checking required.
            (give-up-ir1-transform
-            "~@<open coding coercion to ~S not implemented.~:@>"
-            tval))))))
+            "~@<~S specifies dimensions other than (*) in safe code.~:@>"
+            tval)))
+      ((type= tspec (specifier-type 'list))
+       `(coerce-to-list x))
+      ((csubtypep tspec (specifier-type 'function))
+       (if (csubtypep (lvar-type x) (specifier-type 'symbol))
+           `(coerce-symbol-to-fun x)
+           ;; if X can later be derived as FUNCTION then we don't want
+           ;; to call COERCE-TO-FUN, because there's no smartness
+           ;; that can undo that and see that it's really (IDENTITY X).
+           (progn (delay-ir1-transform node :constraint)
+                  `(coerce-to-fun x))))
+      (t
+       (give-up-ir1-transform
+        "~@<open coding coercion to ~S not implemented.~:@>"
+        tval)))))

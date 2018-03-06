@@ -85,7 +85,7 @@
     other-immediate-1-lowtag
     other-pointer-lowtag))
 
-(def!constant nil-value
+(defconstant nil-value
     (+ static-space-start n-word-bytes other-pointer-lowtag))
 
 (defconstant-eqx fixnum-lowtags
@@ -208,7 +208,7 @@
   unused01-widetag                          ;  5E       5E
   #!+sb-simd-pack
   simd-pack-widetag                         ;       65       65
-  unused02-widetag                          ;  62   69  62   69
+  filler-widetag                            ;  62   69  62   69
   unused03-widetag                          ;  66   6D  66   6D
   unused04-widetag                          ;  6A   71  6A   71
   unused05-widetag                          ;  6E   75  6E   75
@@ -292,7 +292,7 @@
 ;; often the print-name of a symbol, or was a literal in source code
 ;; and loaded from a fasl, or used in a few others situations
 ;; which warrant sharing.
-(def!constant +vector-shareable+ #x100)
+(defconstant +vector-shareable+ #x100)
 
 ;; A vector tagged as +VECTOR-SHAREABLE-NONSTD+ is logically readonly,
 ;; and *not* technically permitted by the standard to be shared.

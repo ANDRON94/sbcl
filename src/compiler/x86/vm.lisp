@@ -30,14 +30,11 @@
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
                 (defconstant ,(symbolicate name "-OFFSET") ,offset)))
-           ;; FIXME: It looks to me as though DEFREGSET should also
-           ;; define the related *FOO-REGISTER-NAMES* variable.
            (defregset (name &rest regs)
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                (defparameter ,name
+             `(defglobal ,name
                   (list ,@(mapcar (lambda (name)
                                     (symbolicate name "-OFFSET"))
-                                  regs))))))
+                                  regs)))))
 
   ;; byte registers
   ;;
@@ -123,7 +120,8 @@
 
 ;;;; SC definitions
 
-(!define-storage-classes
+(eval-when (:compile-toplevel :execute)
+(defparameter *storage-class-defs* '(
 
   ;; non-immediate constants in the constant pool
   (constant constant)
@@ -285,9 +283,8 @@
                     :alternate-scs (complex-long-stack))
 
   (catch-block stack :element-size catch-block-size)
-  (unwind-block stack :element-size unwind-block-size))
+  (unwind-block stack :element-size unwind-block-size)))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
 (defparameter *byte-sc-names*
   '(#!-sb-unicode character-reg byte-reg #!-sb-unicode character-stack))
 (defparameter *word-sc-names* '(word-reg))
@@ -302,23 +299,29 @@
 (defparameter *float-sc-names* '(single-reg))
 (defparameter *double-sc-names* '(double-reg double-stack))
 ) ; EVAL-WHEN
+(!define-storage-classes
+  . #.(mapcar (lambda (class-spec)
+                (let ((size
+                       (case (car class-spec)
+                         (#.*dword-sc-names*   :dword)
+                         (#.*word-sc-names*    :word)
+                         (#.*byte-sc-names*    :byte)
+                         (#.*float-sc-names*   :float)
+                         (#.*double-sc-names*  :double))))
+                  (append class-spec (if size (list :operand-size size)))))
+              *storage-class-defs*))
 
 ;;;; miscellaneous TNs for the various registers
 
 (macrolet ((def-misc-reg-tns (sc-name &rest reg-names)
              (collect ((forms))
-                      (dolist (reg-name reg-names)
-                        (let ((tn-name (symbolicate reg-name "-TN"))
-                              (offset-name (symbolicate reg-name "-OFFSET")))
-                          ;; FIXME: It'd be good to have the special
-                          ;; variables here be named with the *FOO*
-                          ;; convention.
-                          (forms `(defparameter ,tn-name
-                                    (make-random-tn :kind :normal
-                                                    :sc (sc-or-lose ',sc-name)
-                                                    :offset
-                                                    ,offset-name)))))
-                      `(progn ,@(forms)))))
+               (dolist (reg-name reg-names `(progn ,@(forms)))
+                 (let ((tn-name (symbolicate reg-name "-TN"))
+                       (offset-name (symbolicate reg-name "-OFFSET")))
+                   (forms `(defglobal ,tn-name
+                             (make-random-tn :kind :normal
+                                             :sc (sc-or-lose ',sc-name)
+                                             :offset ,offset-name))))))))
 
   (def-misc-reg-tns unsigned-reg eax ebx ecx edx ebp esp edi esi)
   (def-misc-reg-tns word-reg ax bx cx dx bp sp di si)
@@ -430,18 +433,15 @@
          (offset (tn-offset tn)))
     (ecase sb
       (registers
-       (let* ((sc-name (sc-name sc))
-              (name-vec (cond ((member sc-name *byte-sc-names*)
-                               +byte-register-names+)
-                              ((member sc-name *word-sc-names*)
-                               +word-register-names+)
-                              ((member sc-name *dword-sc-names*)
-                               +dword-register-names+))))
+       (let ((name-vec (case (sb!c:sc-operand-size sc)
+                         (:byte  +byte-register-names+)
+                         (:word  +word-register-names+)
+                         (:dword +dword-register-names+))))
          (or (and name-vec
                   (< -1 offset (length name-vec))
                   (svref name-vec offset))
              ;; FIXME: Shouldn't this be an ERROR?
-             (format nil "<unknown reg: off=~W, sc=~A>" offset sc-name))))
+             (format nil "<unknown reg: off=~W, sc=~A>" offset (sc-name sc)))))
       (float-registers (format nil "FR~D" offset))
       (stack (format nil "S~D" offset))
       (constant (format nil "Const~D" offset))

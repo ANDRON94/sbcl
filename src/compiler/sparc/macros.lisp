@@ -160,7 +160,7 @@
       ;; space.
 
       ;; Make sure the temp-tn is a non-descriptor register!
-      (assert (and ,temp-tn (sc-is ,temp-tn non-descriptor-reg)))
+      (aver (and ,temp-tn (sc-is ,temp-tn non-descriptor-reg)))
 
       ;; temp-tn is csp-tn rounded up to a multiple of 8 (lispobj size)
       (align-csp ,temp-tn)
@@ -288,9 +288,9 @@
   (assemble ()
     (when vop
       (note-this-location vop :internal-error))
-    (inst unimp kind)
-    (inst byte code)
-    (encode-internal-error-args values)
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (tramp-number)
+                                         (inst unimp tramp-number)))
     (emit-alignment word-shift)))
 
 (defun generate-error-code (vop error-code &rest values)

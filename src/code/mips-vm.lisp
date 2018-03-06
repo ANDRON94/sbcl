@@ -10,15 +10,15 @@
 
 ;;;; FIXUP-CODE-OBJECT
 
+(defconstant-eqx +fixup-kinds+ #(:absolute :jmp :lui :addi) #'equalp)
 (!with-bigvec-or-sap
-(defun fixup-code-object (code offset value kind &optional flavor)
+(defun fixup-code-object (code offset value kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let ((sap (code-instructions code)))
-     (ecase kind
+  (let ((sap (code-instructions code)))
+    (ecase kind
        (:absolute
         (setf (sap-ref-32 sap offset) value))
        (:jump
@@ -30,7 +30,8 @@
               (ash (1+ (ash value -15)) -1)))
        (:addi
         (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
-              (ldb (byte 16 0) value))))))))
+              (ldb (byte 16 0) value)))))
+  nil))
 
 
 #-sb-xc-host (progn
@@ -78,15 +79,11 @@
 
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
-  (/show0 "entering INTERNAL-ERROR-ARGS, CONTEXT=..")
-  (/hexstr context)
   (let* ((pc (context-pc context))
          (cause (context-bd-cause-int context))
          ;; KLUDGE: This exposure of the branch delay mechanism hurts.
-         (offset (if (logbitp 31 cause) 8 4))
-         (error-number (sap-ref-8 pc offset)))
+         (offset (if (logbitp 31 cause) 4 0))
+         (trap-number (ldb (byte 8 6) (sap-ref-32 pc offset))))
     (declare (type system-area-pointer pc))
-    (values error-number
-            (sb!kernel::decode-internal-error-args (sap+ pc (1+ offset))
-                                                   error-number))))
+    (sb!kernel::decode-internal-error-args (sap+ pc (+ offset 4)) trap-number)))
 ) ; end PROGN

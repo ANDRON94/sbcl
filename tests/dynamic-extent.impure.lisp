@@ -813,6 +813,33 @@
            a))
     (('x 'y) 'x)))
 
+(with-test (:name :bug-1738095)
+  ;; STACK analysis wasn't marking UVL or DX LVARs that are held live
+  ;; by a DX allocation as being live in blocks along the path from
+  ;; the allocation to the ENTRY node, causing problems when there is
+  ;; a block that is outside the lexical environment of the "earlier"
+  ;; DX allocation (in the case below, such a block would be the first
+  ;; (outermost) use of LIST).
+  (checked-compile '(lambda ()
+                     (let ((* (list (let ((* (list nil)))
+                                      (declare (dynamic-extent *))
+                                      (list 1)))))
+                       (declare (dynamic-extent *))))))
+
+(with-test (:name :bug-1739308)
+  ;; STACK analysis wasn't propagating DX LVARs back from ENTRY to
+  ;; allocation through non-local-entry environments (below, the CATCH
+  ;; entry point), causing problems when such is the ONLY live path
+  ;; back to the allocation.
+  (checked-compile '(lambda (x y)
+                     (let ((s
+                            (multiple-value-prog1
+                                (list x)
+                              (catch 'ct1
+                                (throw 'ct8 30)))))
+                       (declare (dynamic-extent s))
+                       (funcall (the function y) s)))))
+
 ;;; bug reported by Svein Ove Aas
 (defun svein-2005-ii-07 (x y)
   (declare (optimize (speed 3) (space 2) (safety 0) (debug 0)))

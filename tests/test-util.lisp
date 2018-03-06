@@ -16,7 +16,6 @@
            #:checked-compile-capturing-source-paths
            #:checked-compile-condition-source-paths
 
-           ;; RUNTIME
            #:runtime #:split-string #:shuffle))
 
 (in-package :test-util)
@@ -59,71 +58,76 @@
   (let ((*print-pretty* nil))
     (apply #'log-msg args)))
 
+(defun run-test (test-function name fails-on)
+  (start-test)
+  (let (#+sb-thread (threads (sb-thread:list-all-threads))
+        (*threads-to-join* nil)
+        (*threads-to-kill* nil))
+    (handler-bind ((error (lambda (error)
+                            (if (expected-failure-p fails-on)
+                                (fail-test :expected-failure name error)
+                                (fail-test :unexpected-failure name error))
+                            (return-from run-test))))
+      ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
+      (log-msg/non-pretty "Running ~S" name)
+      (funcall test-function)
+      #+sb-thread
+      (let ((any-leftover nil))
+        (dolist (thread *threads-to-join*)
+          (ignore-errors (sb-thread:join-thread thread)))
+        (dolist (thread *threads-to-kill*)
+          (ignore-errors (sb-thread:terminate-thread thread)))
+        (setf threads (union (union *threads-to-kill*
+                                    *threads-to-join*)
+                             threads))
+        #+(and sb-safepoint-strictly (not win32))
+        (dolist (thread (sb-thread:list-all-threads))
+          (when (typep thread 'sb-thread:signal-handling-thread)
+            (ignore-errors (sb-thread:join-thread thread))))
+        (dolist (thread (sb-thread:list-all-threads))
+          (unless (or (not (sb-thread:thread-alive-p thread))
+                      (eql (the sb-thread:thread thread)
+                           sb-thread:*current-thread*)
+                      (member thread threads)
+                      (sb-thread:thread-ephemeral-p thread))
+            (setf any-leftover thread)
+            #-win32
+            (ignore-errors (sb-thread:terminate-thread thread))))
+        (when any-leftover
+          (fail-test :leftover-thread name any-leftover)
+          (return-from run-test)))
+      (if (expected-failure-p fails-on)
+          (fail-test :unexpected-success name nil)
+          ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
+          (log-msg/non-pretty "Success ~S" name)))))
+
 (defmacro with-test ((&key fails-on broken-on skipped-on name)
                      &body body)
-  (let ((block-name (gensym))
-        #+sb-thread (threads (gensym "THREADS")))
-    (flet ((name-ok (x y)
-             (declare (ignore y))
-             (typecase x
-               (symbol (let ((package (symbol-package x)))
-                         (or (null package)
-                             (eql package (find-package "CL"))
-                             (eql package (find-package "KEYWORD"))
-                             (eql (mismatch "SB-" (package-name package)) 3))))
-               (integer t))))
-      (unless (tree-equal name name :test #'name-ok)
-        (error "test name must be all-keywords: ~S" name)))
-    `(progn
-       (start-test)
-       (cond
-         ((broken-p ',broken-on)
-          (fail-test :skipped-broken ',name "Test broken on this platform"))
-         ((skipped-p ',skipped-on)
-          (fail-test :skipped-disabled ',name "Test disabled for this combination of platform and features"))
-         (t
-          (let (#+sb-thread (,threads (sb-thread:list-all-threads))
-                (*threads-to-join* nil)
-                (*threads-to-kill* nil))
-            (block ,block-name
-              (handler-bind ((error (lambda (error)
-                                      (if (expected-failure-p ',fails-on)
-                                          (fail-test :expected-failure ',name error)
-                                          (fail-test :unexpected-failure ',name error))
-                                      (return-from ,block-name))))
-                (progn
-                  ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
-                  (log-msg/non-pretty "Running ~S" ',name)
-                  ,@body
-                  #+sb-thread
-                  (let ((any-leftover nil))
-                    (dolist (thread *threads-to-join*)
-                      (ignore-errors (sb-thread:join-thread thread)))
-                    (dolist (thread *threads-to-kill*)
-                      (ignore-errors (sb-thread:terminate-thread thread)))
-                    (setf ,threads (union (union *threads-to-kill*
-                                                 *threads-to-join*)
-                                          ,threads))
-                    #+(and sb-safepoint-strictly (not win32))
-                    (dolist (thread (sb-thread:list-all-threads))
-                      (when (typep thread 'sb-thread:signal-handling-thread)
-                        (ignore-errors (sb-thread:join-thread thread))))
-                    (dolist (thread (sb-thread:list-all-threads))
-                      (unless (or (not (sb-thread:thread-alive-p thread))
-                                  (eql (the sb-thread:thread thread)
-                                       sb-thread:*current-thread*)
-                                  (member thread ,threads)
-                                  (sb-thread:thread-ephemeral-p thread))
-                        (setf any-leftover thread)
-                        #-win32
-                        (ignore-errors (sb-thread:terminate-thread thread))))
-                    (when any-leftover
-                      (fail-test :leftover-thread ',name any-leftover)
-                      (return-from ,block-name)))
-                  (if (expected-failure-p ',fails-on)
-                      (fail-test :unexpected-success ',name nil)
-                      ;; Non-pretty is for cases like (with-test (:name (let ...)) ...
-                      (log-msg/non-pretty "Success ~S" ',name)))))))))))
+  (flet ((name-ok (x y)
+           (declare (ignore y))
+           (typecase x
+             (symbol (let ((package (symbol-package x)))
+                       (or (null package)
+                           (eql package (find-package "CL"))
+                           (eql package (find-package "KEYWORD"))
+                           (eql (mismatch "SB-" (package-name package)) 3))))
+             (integer t))))
+    (unless (tree-equal name name :test #'name-ok)
+      (error "test name must be all-keywords: ~S" name)))
+  (cond
+    ((broken-p broken-on)
+     `(progn
+        (start-test)
+        (fail-test :skipped-broken ',name "Test broken on this platform")))
+    ((skipped-p skipped-on)
+     `(progn
+        (start-test)
+        (fail-test :skipped-disabled ',name "Test disabled for this combination of platform and features")))
+    (t
+     `(run-test (lambda ()
+                  ,@body)
+                ',name
+                ',fails-on))))
 
 (defun report-test-status ()
   (with-standard-io-syntax
@@ -280,6 +284,9 @@
      '(:speed nil :safety nil :debug nil :compilation-speed nil :space nil))
     ((eql :default)
      '(:speed 1 :safety 1 :debug 1 :compilation-speed 1 :space 1))
+    ((eql :maximally-safe)
+     (list :filter (lambda (&key safety &allow-other-keys)
+                     (= safety 3))))
     ((eql :safe)
      (list :filter (lambda (&key speed safety &allow-other-keys)
                      (and (> safety 0) (>= safety speed)))))
@@ -469,7 +476,7 @@
     (values values (nreverse conditions))))
 
 (defun %checked-compile-and-assert-one-case
-    (form optimize function args-thunk expected test)
+    (form optimize function args-thunk expected test allow-conditions)
   (let ((args (multiple-value-list (funcall args-thunk))))
     (flet ((failed-to-signal (expected-type)
              (error "~@<Calling the result of compiling~
@@ -516,7 +523,11 @@
           (t
            (let ((expected (funcall expected)))
              (cond
-               (conditions
+               ((and conditions
+                     (not (and allow-conditions
+                               (every (lambda (condition)
+                                        (typep condition allow-conditions))
+                                      conditions))))
                 (signaled-unexpected conditions))
                ((not (funcall test values expected))
                 (returned-unexpected values expected test))))))))))
@@ -528,9 +539,9 @@
                              (list* :optimize optimize
                                     other-checked-compile-args)
                              other-checked-compile-args))))
-    (loop for (args-thunk values test) in cases
+    (loop for (args-thunk values test allow-conditions) in cases
        do (%checked-compile-and-assert-one-case
-           form optimize function args-thunk values test))))
+           form optimize function args-thunk values test allow-conditions))))
 
 (defun %checked-compile-and-assert (form checked-compile-args cases)
   (let ((optimize (getf checked-compile-args :optimize))
@@ -549,13 +560,19 @@
 ;;;
 ;;; Elements of CASES are of the form
 ;;;
-;;;   ((&rest ARGUMENT-FORMS) VALUES-FORM &optional TEST)
+;;;   ((&rest ARGUMENT-FORMS) VALUES-FORM &key TEST ALLOW-CONDITIONS)
 ;;;
 ;;; where ARGUMENT-FORMS are evaluated to produce the arguments for
 ;;; one call of the function and VALUES-FORM is evaluated to produce
-;;; the expected return values for that function call. TEST is used to
-;;; compare a list of the values returned by the function call to the
-;;; list of values obtained by calling VALUES-FORM.
+;;; the expected return values for that function call.
+;;;
+;;; TEST is used to compare a list of the values returned by the
+;;; function call to the list of values obtained by calling
+;;; VALUES-FORM.
+;;;
+;;; If supplied, the value of ALLOW-CONDITIONS is a type-specifier
+;;; indicating which conditions should be allowed (and ignored) during
+;;; the function call.
 ;;;
 ;;; If VALUES-FORM is of the form
 ;;;
@@ -578,7 +595,8 @@
                                             (optimize :quick))
                                          form &body cases)
   (flet ((make-case-form (case)
-           (destructuring-bind (args values &key (test ''equal testp))
+           (destructuring-bind (args values &key (test ''equal testp)
+                                     allow-conditions)
                case
              (let ((conditionp (typep values '(cons (eql condition) (cons t null)))))
                (when (and testp conditionp)
@@ -589,7 +607,8 @@
                       ,(if conditionp
                            `(list 'condition ,(second values))
                            `(lambda () (multiple-value-list ,values)))
-                      ,test)))))
+                      ,test
+                      ,allow-conditions)))))
     `(%checked-compile-and-assert
       ,form (list :name ,name
                   :allow-warnings ,allow-warnings
@@ -655,16 +674,19 @@
               with duration = 0
               for n = 1 then (* n 2)
               for total-runs = n then (+ total-runs n)
+              for gc-start = *gc-run-time*
               do (dotimes (i n)
                    (funcall thunk))
-                 (setf duration (- (get-internal-run-time) start))
+                 (setf duration (- (get-internal-run-time) start
+                                   (- *gc-run-time* gc-start)))
               when (> duration precision)
-              return (/ (float duration) (float total-runs)))
+              return (/ (float duration)
+                        (float total-runs)))
         into min-internal-time-units-per-call
         finally (return (/ min-internal-time-units-per-call
                            (float internal-time-units-per-second)))))
 
-(defmacro runtime (form &key (repetitions 3) (precision 10))
+(defmacro runtime (form &key (repetitions 5) (precision 30))
   `(runtime* (lambda () ,form) ,repetitions ,precision))
 
 (defun split-string (string delimiter)

@@ -152,8 +152,7 @@
 ;; Signal a type error for non-sequences.
 ;; This is for dispatching within sequence functions that have
 ;; the EXPLICIT-CHECK attribute on at least their sequence arg(s).
-(eval-when (:compile-toplevel)
-(sb!xc:defmacro seq-dispatch-checking
+(defmacro seq-dispatch-checking
     (sequence list-form vector-form &optional (other-form nil other-form-p))
   `(cond ((listp ,sequence)
           (let ((,sequence (truly-the list ,sequence)))
@@ -180,12 +179,12 @@
 ;;; a sequence. This assumes that the containing function declares its
 ;;; result to be explicitly checked,
 ;;; and that the LIST and VECTOR cases never fail to return a sequence.
-(sb!xc:defmacro seq-dispatch-checking=>seq
+(defmacro seq-dispatch-checking=>seq
     (sequence list-form vector-form other-form)
   `(seq-dispatch-checking ,sequence ,list-form ,vector-form
-                          (the sequence (values ,other-form)))))
+                          (the sequence (values ,other-form))))
 
-(sb!xc:defmacro %make-sequence-like (sequence length)
+(defmacro %make-sequence-like (sequence length)
   "Return a sequence of the same type as SEQUENCE and the given LENGTH."
   `(seq-dispatch ,sequence
      (make-list ,length)
@@ -227,9 +226,7 @@
   ;; On the other hand, I'm not sure it deserves to be a type-error,
   ;; either. -- bem, 2005-08-10
   (declare (optimize allow-non-returning-tail-call))
-  (error 'simple-program-error
-         :format-control "~S is too hairy for sequence functions."
-         :format-arguments (list type-spec)))
+  (%program-error "~S is too hairy for sequence functions." type-spec))
 
 (sb!xc:defmacro when-extended-sequence-type
     ((type-specifier type
@@ -348,7 +345,8 @@
                          (signal-index-too-large-error sequence index)
                          (car list)))
                   (declare (type index count)))
-                (progn
+                (locally
+                    (declare (optimize (sb!c::insert-array-bounds-checks 0)))
                   (when (>= index (length sequence))
                     (signal-index-too-large-error sequence index))
                   (aref sequence index))
@@ -680,38 +678,67 @@
                      :start start
                      :end (%check-generic-sequence-bounds sequence start end))))
 
-;;;; REPLACE
 
-(eval-when (:compile-toplevel :execute)
+(defmacro word-specialized-vector-tag-p (tag)
+  `(or
+    ,@(loop for saetp across sb!vm:*specialized-array-element-type-properties*
+            when (and (eq (sb!vm:saetp-n-bits saetp) sb!vm:n-word-bits)
+                      (not (eq (sb!vm:saetp-specifier saetp) t)))
+            collect `(eq ,tag ,(sb!vm:saetp-typecode saetp)))))
+
+;;;; REPLACE
+(defun vector-replace (vector1 vector2 start1 start2 end1 diff)
+  (declare ((or (eql -1) index) start1 start2 end1)
+           (optimize (sb!c::insert-array-bounds-checks 0))
+           ((integer -1 1) diff))
+  (let ((tag1 (%other-pointer-widetag vector1))
+        (tag2 (%other-pointer-widetag vector2)))
+    (macrolet ((copy (&body body)
+                 `(do ((index1 start1 (+ index1 diff))
+                       (index2 start2 (+ index2 diff)))
+                      ((= index1 end1))
+                    (declare (fixnum index1 index2))
+                    ,@body)))
+      (cond ((= tag1 tag2 sb!vm:simple-vector-widetag)
+             (copy
+              (setf (svref vector1 index1) (svref vector2 index2))))
+            ;; TODO: can do the same with small specialized arrays
+            ((and (= tag1 tag2)
+                  (word-specialized-vector-tag-p tag1))
+             (copy
+              (setf (%vector-raw-bits vector1 index1)
+                    (%vector-raw-bits vector2 index2))))
+            (t
+             (let ((getter (the function (svref %%data-vector-reffers%% tag2)))
+                   (setter (the function (svref %%data-vector-setters%% tag1))))
+               (copy
+                (funcall setter vector1 index1
+                         (funcall getter vector2 index2))))))))
+  vector1)
 
 ;;; If we are copying around in the same vector, be careful not to copy the
 ;;; same elements over repeatedly. We do this by copying backwards.
-(sb!xc:defmacro mumble-replace-from-mumble ()
-  `(if (and (eq target-sequence source-sequence) (> target-start source-start))
-       (let ((nelts (min (- target-end target-start)
-                         (- source-end source-start))))
-         (do ((target-index (+ (the fixnum target-start) (the fixnum nelts) -1)
-                            (1- target-index))
-              (source-index (+ (the fixnum source-start) (the fixnum nelts) -1)
-                            (1- source-index)))
-             ((= target-index (the fixnum (1- target-start))) target-sequence)
-           (declare (fixnum target-index source-index))
-           ;; disable bounds checking
-           (declare (optimize (safety 0)))
-           (setf (aref target-sequence target-index)
-                 (aref source-sequence source-index))))
-       (do ((target-index target-start (1+ target-index))
-            (source-index source-start (1+ source-index)))
-           ((or (= target-index (the fixnum target-end))
-                (= source-index (the fixnum source-end)))
-            target-sequence)
-         (declare (fixnum target-index source-index))
-         ;; disable bounds checking
-         (declare (optimize (safety 0)))
-         (setf (aref target-sequence target-index)
-               (aref source-sequence source-index)))))
+(defmacro vector-replace-from-vector ()
+  `(let ((nelts (min (- target-end target-start)
+                     (- source-end source-start))))
+     (with-array-data ((data1 target-sequence) (start1 target-start) (end1))
+       (declare (ignore end1))
+       (let ((end1 (the fixnum (+ start1 nelts))))
+         (if (and (eq target-sequence source-sequence)
+                  (> target-start source-start))
+             (let ((end (the fixnum (1- end1))))
+               (vector-replace data1 data1
+                               end
+                               (the fixnum (- end
+                                              (- target-start source-start)))
+                               (1- start1)
+                               -1))
+             (with-array-data ((data2 source-sequence) (start2 source-start) (end2))
+               (declare (ignore end2))
+               (vector-replace data1 data2 start1 start2 end1 1)))))
+     target-sequence))
 
-(sb!xc:defmacro list-replace-from-list ()
+(defmacro list-replace-from-list ()
   `(if (and (eq target-sequence source-sequence) (> target-start source-start))
        (let ((new-elts (subseq source-sequence source-start
                                (+ (the fixnum source-start)
@@ -737,7 +764,7 @@
          (declare (fixnum target-index source-index))
          (rplaca target-sequence-ref (car source-sequence-ref)))))
 
-(sb!xc:defmacro list-replace-from-mumble ()
+(defmacro list-replace-from-vector ()
   `(do ((target-index target-start (1+ target-index))
         (source-index source-start (1+ source-index))
         (target-sequence-ref (nthcdr target-start target-sequence)
@@ -749,7 +776,7 @@
      (declare (fixnum source-index target-index))
      (rplaca target-sequence-ref (aref source-sequence source-index))))
 
-(sb!xc:defmacro mumble-replace-from-list ()
+(defmacro vector-replace-from-list ()
   `(do ((target-index target-start (1+ target-index))
         (source-index source-start (1+ source-index))
         (source-sequence (nthcdr source-start source-sequence)
@@ -760,8 +787,6 @@
         target-sequence)
      (declare (fixnum target-index source-index))
      (setf (aref target-sequence target-index) (car source-sequence))))
-
-) ; EVAL-WHEN
 
 ;;;; The support routines for REPLACE are used by compiler transforms, so we
 ;;;; worry about dealing with END being supplied or defaulting to NIL
@@ -777,20 +802,20 @@
                                   target-end source-start source-end)
   (when (null target-end) (setq target-end (length target-sequence)))
   (when (null source-end) (setq source-end (length source-sequence)))
-  (list-replace-from-mumble))
+  (list-replace-from-vector))
 
 (defun vector-replace-from-list* (target-sequence source-sequence target-start
                                   target-end source-start source-end)
   (when (null target-end) (setq target-end (length target-sequence)))
   (when (null source-end) (setq source-end (length source-sequence)))
-  (mumble-replace-from-list))
+  (vector-replace-from-list))
 
 (defun vector-replace-from-vector* (target-sequence source-sequence
                                     target-start target-end source-start
                                     source-end)
   (when (null target-end) (setq target-end (length target-sequence)))
   (when (null source-end) (setq source-end (length source-sequence)))
-  (mumble-replace-from-mumble))
+  (vector-replace-from-vector))
 
 #!+sb-unicode
 (defun simple-character-string-replace-from-simple-character-string*
@@ -799,7 +824,7 @@
   (declare (type (simple-array character (*)) target-sequence source-sequence))
   (when (null target-end) (setq target-end (length target-sequence)))
   (when (null source-end) (setq source-end (length source-sequence)))
-  (mumble-replace-from-mumble))
+  (vector-replace-from-vector))
 
 (define-sequence-traverser replace
     (sequence1 sequence2 &rest args &key start1 end1 start2 end2)
@@ -825,11 +850,11 @@ many elements are copied."
     (seq-dispatch-checking target-sequence
       (seq-dispatch-checking source-sequence
         (return-from replace (list-replace-from-list))
-        (return-from replace (list-replace-from-mumble))
+        (return-from replace (list-replace-from-vector))
         nil)
       (seq-dispatch-checking source-sequence
-        (return-from replace (mumble-replace-from-list))
-        (return-from replace (mumble-replace-from-mumble))
+        (return-from replace (vector-replace-from-list))
+        (return-from replace (vector-replace-from-vector))
         nil)
       t)
     ;; If sequence1 is an extended-sequence, we know nothing about sequence2.
@@ -859,13 +884,6 @@ many elements are copied."
   (do ((new-list ()))
       ((endp list) new-list)
     (push (pop list) new-list)))
-
-(defmacro word-specialized-vector-tag-p (tag)
-  `(or
-    ,@(loop for saetp across sb!vm:*specialized-array-element-type-properties*
-           when (and (eq (sb!vm:saetp-n-bits saetp) sb!vm:n-word-bits)
-                     (not (eq (sb!vm:saetp-specifier saetp) t)))
-           collect `(eq ,tag ,(sb!vm:saetp-typecode saetp)))))
 
 (defun reverse-word-specialized-vector (from to end)
   (declare (vector from))
@@ -1381,9 +1399,7 @@ many elements are copied."
 
 ;;;; REDUCE
 
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro mumble-reduce (function
+(defmacro mumble-reduce (function
                                sequence
                                key
                                start
@@ -1396,7 +1412,7 @@ many elements are copied."
      (setq value (funcall ,function value
                           (apply-key ,key (,ref ,sequence index))))))
 
-(sb!xc:defmacro mumble-reduce-from-end (function
+(defmacro mumble-reduce-from-end (function
                                         sequence
                                         key
                                         start
@@ -1411,7 +1427,7 @@ many elements are copied."
                           (apply-key ,key (,ref ,sequence index))
                           value))))
 
-(sb!xc:defmacro list-reduce (function
+(defmacro list-reduce (function
                              sequence
                              key
                              start
@@ -1427,7 +1443,7 @@ many elements are copied."
                  (funcall ,function value (apply-key ,key (car sequence)))))
          ((>= count ,end) value))))
 
-(sb!xc:defmacro list-reduce-from-end (function
+(defmacro list-reduce-from-end (function
                                       sequence
                                       key
                                       start
@@ -1443,8 +1459,6 @@ many elements are copied."
           (value (if ,ivp ,initial-value (apply-key ,key (car sequence)))
                  (funcall ,function (apply-key ,key (car sequence)) value)))
          ((>= count ,end) value))))
-
-) ; EVAL-WHEN
 
 (define-sequence-traverser reduce (function sequence &rest args &key key
                                    from-end start end (initial-value nil ivp))
@@ -1482,9 +1496,7 @@ many elements are copied."
 
 ;;;; DELETE
 
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro mumble-delete (pred)
+(defmacro mumble-delete (pred)
   `(do ((index start (1+ index))
         (jndex start)
         (number-zapped 0))
@@ -1501,7 +1513,7 @@ many elements are copied."
          (incf number-zapped)
          (incf jndex))))
 
-(sb!xc:defmacro mumble-delete-from-end (pred)
+(defmacro mumble-delete-from-end (pred)
   `(do ((index (1- (the fixnum end)) (1- index)) ; Find the losers.
         (number-zapped 0)
         (losers ())
@@ -1529,19 +1541,19 @@ many elements are copied."
        (incf number-zapped)
        (push index losers))))
 
-(sb!xc:defmacro normal-mumble-delete ()
+(defmacro normal-mumble-delete ()
   `(mumble-delete
     (if test-not
         (not (funcall test-not item (apply-key key (aref sequence index))))
         (funcall test item (apply-key key (aref sequence index))))))
 
-(sb!xc:defmacro normal-mumble-delete-from-end ()
+(defmacro normal-mumble-delete-from-end ()
   `(mumble-delete-from-end
     (if test-not
         (not (funcall test-not item (apply-key key this-element)))
         (funcall test item (apply-key key this-element)))))
 
-(sb!xc:defmacro list-delete (pred)
+(defmacro list-delete (pred)
   `(let ((handle (cons nil sequence)))
      (declare (truly-dynamic-extent handle))
      (do* ((previous (nthcdr start handle))
@@ -1557,7 +1569,7 @@ many elements are copied."
              (t
               (pop previous))))))
 
-(sb!xc:defmacro list-delete-from-end (pred)
+(defmacro list-delete-from-end (pred)
   `(let* ((reverse (nreverse sequence))
           (handle (cons nil reverse)))
      (declare (truly-dynamic-extent handle))
@@ -1574,19 +1586,17 @@ many elements are copied."
              (t
               (pop previous))))))
 
-(sb!xc:defmacro normal-list-delete ()
+(defmacro normal-list-delete ()
   '(list-delete
     (if test-not
         (not (funcall test-not item (apply-key key (car current))))
         (funcall test item (apply-key key (car current))))))
 
-(sb!xc:defmacro normal-list-delete-from-end ()
+(defmacro normal-list-delete-from-end ()
   '(list-delete-from-end
     (if test-not
         (not (funcall test-not item (apply-key key (car current))))
         (funcall test item (apply-key key (car current))))))
-
-) ; EVAL-WHEN
 
 (define-sequence-traverser delete
     (item sequence &rest args &key from-end test test-not start
@@ -1609,25 +1619,21 @@ many elements are copied."
           (normal-mumble-delete)))
     (apply #'sb!sequence:delete item sequence args)))
 
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro if-mumble-delete ()
+(defmacro if-mumble-delete ()
   `(mumble-delete
     (funcall predicate (apply-key key (aref sequence index)))))
 
-(sb!xc:defmacro if-mumble-delete-from-end ()
+(defmacro if-mumble-delete-from-end ()
   `(mumble-delete-from-end
     (funcall predicate (apply-key key this-element))))
 
-(sb!xc:defmacro if-list-delete ()
+(defmacro if-list-delete ()
   '(list-delete
     (funcall predicate (apply-key key (car current)))))
 
-(sb!xc:defmacro if-list-delete-from-end ()
+(defmacro if-list-delete-from-end ()
   '(list-delete-from-end
     (funcall predicate (apply-key key (car current)))))
-
-) ; EVAL-WHEN
 
 (define-sequence-traverser delete-if
     (predicate sequence &rest args &key from-end start key end count)
@@ -1649,25 +1655,21 @@ many elements are copied."
           (if-mumble-delete)))
     (apply #'sb!sequence:delete-if predicate sequence args)))
 
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro if-not-mumble-delete ()
+(defmacro if-not-mumble-delete ()
   `(mumble-delete
     (not (funcall predicate (apply-key key (aref sequence index))))))
 
-(sb!xc:defmacro if-not-mumble-delete-from-end ()
+(defmacro if-not-mumble-delete-from-end ()
   `(mumble-delete-from-end
     (not (funcall predicate (apply-key key this-element)))))
 
-(sb!xc:defmacro if-not-list-delete ()
+(defmacro if-not-list-delete ()
   '(list-delete
     (not (funcall predicate (apply-key key (car current))))))
 
-(sb!xc:defmacro if-not-list-delete-from-end ()
+(defmacro if-not-list-delete-from-end ()
   '(list-delete-from-end
     (not (funcall predicate (apply-key key (car current))))))
-
-) ; EVAL-WHEN
 
 (define-sequence-traverser delete-if-not
     (predicate sequence &rest args &key from-end start end key count)
@@ -1691,11 +1693,9 @@ many elements are copied."
 
 ;;;; REMOVE
 
-(eval-when (:compile-toplevel :execute)
-
 ;;; MUMBLE-REMOVE-MACRO does not include (removes) each element that
 ;;; satisfies the predicate.
-(sb!xc:defmacro mumble-remove-macro (bump left begin finish right pred)
+(defmacro mumble-remove-macro (bump left begin finish right pred)
   `(do ((index ,begin (,bump index))
         (result
          (do ((index ,left (,bump index))
@@ -1719,41 +1719,41 @@ many elements are copied."
            (t (setf (aref result new-index) this-element)
               (setq new-index (,bump new-index))))))
 
-(sb!xc:defmacro mumble-remove (pred)
+(defmacro mumble-remove (pred)
   `(mumble-remove-macro 1+ 0 start end length ,pred))
 
-(sb!xc:defmacro mumble-remove-from-end (pred)
+(defmacro mumble-remove-from-end (pred)
   `(let ((sequence (copy-seq sequence)))
      (mumble-delete-from-end ,pred)))
 
-(sb!xc:defmacro normal-mumble-remove ()
+(defmacro normal-mumble-remove ()
   `(mumble-remove
     (if test-not
         (not (funcall test-not item (apply-key key this-element)))
         (funcall test item (apply-key key this-element)))))
 
-(sb!xc:defmacro normal-mumble-remove-from-end ()
+(defmacro normal-mumble-remove-from-end ()
   `(mumble-remove-from-end
     (if test-not
         (not (funcall test-not item (apply-key key this-element)))
         (funcall test item (apply-key key this-element)))))
 
-(sb!xc:defmacro if-mumble-remove ()
+(defmacro if-mumble-remove ()
   `(mumble-remove (funcall predicate (apply-key key this-element))))
 
-(sb!xc:defmacro if-mumble-remove-from-end ()
+(defmacro if-mumble-remove-from-end ()
   `(mumble-remove-from-end (funcall predicate (apply-key key this-element))))
 
-(sb!xc:defmacro if-not-mumble-remove ()
+(defmacro if-not-mumble-remove ()
   `(mumble-remove (not (funcall predicate (apply-key key this-element)))))
 
-(sb!xc:defmacro if-not-mumble-remove-from-end ()
+(defmacro if-not-mumble-remove-from-end ()
   `(mumble-remove-from-end
     (not (funcall predicate (apply-key key this-element)))))
 
 ;;; LIST-REMOVE-MACRO does not include (removes) each element that satisfies
 ;;; the predicate.
-(sb!xc:defmacro list-remove-macro (pred reverse?)
+(defmacro list-remove-macro (pred reverse?)
   `(let* ((sequence ,(if reverse?
                          '(reverse (the list sequence))
                          'sequence))
@@ -1798,41 +1798,39 @@ many elements are copied."
            (incf number-zapped)
            (setf splice (cdr (rplacd splice (list this-element))))))))
 
-(sb!xc:defmacro list-remove (pred)
+(defmacro list-remove (pred)
   `(list-remove-macro ,pred nil))
 
-(sb!xc:defmacro list-remove-from-end (pred)
+(defmacro list-remove-from-end (pred)
   `(list-remove-macro ,pred t))
 
-(sb!xc:defmacro normal-list-remove ()
+(defmacro normal-list-remove ()
   `(list-remove
     (if test-not
         (not (funcall test-not item (apply-key key this-element)))
         (funcall test item (apply-key key this-element)))))
 
-(sb!xc:defmacro normal-list-remove-from-end ()
+(defmacro normal-list-remove-from-end ()
   `(list-remove-from-end
     (if test-not
         (not (funcall test-not item (apply-key key this-element)))
         (funcall test item (apply-key key this-element)))))
 
-(sb!xc:defmacro if-list-remove ()
+(defmacro if-list-remove ()
   `(list-remove
     (funcall predicate (apply-key key this-element))))
 
-(sb!xc:defmacro if-list-remove-from-end ()
+(defmacro if-list-remove-from-end ()
   `(list-remove-from-end
     (funcall predicate (apply-key key this-element))))
 
-(sb!xc:defmacro if-not-list-remove ()
+(defmacro if-not-list-remove ()
   `(list-remove
     (not (funcall predicate (apply-key key this-element)))))
 
-(sb!xc:defmacro if-not-list-remove-from-end ()
+(defmacro if-not-list-remove-from-end ()
   `(list-remove-from-end
     (not (funcall predicate (apply-key key this-element)))))
-
-) ; EVAL-WHEN
 
 (define-sequence-traverser remove
     (item sequence &rest args &key from-end test test-not start
@@ -2208,9 +2206,7 @@ many elements are copied."
       (incf index incrementer))
     result))
 
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro subst-dispatch (pred)
+(defmacro subst-dispatch (pred)
   `(seq-dispatch-checking=>seq sequence
      (let ((end (or end length)))
        (declare (type index end))
@@ -2245,7 +2241,6 @@ many elements are copied."
        ((normal) `(apply #'sb!sequence:substitute new old sequence args))
        ((if) `(apply #'sb!sequence:substitute-if new predicate sequence args))
        ((if-not) `(apply #'sb!sequence:substitute-if-not new predicate sequence args)))))
-) ; EVAL-WHEN
 
 (define-sequence-traverser substitute
     (new old sequence &rest args &key from-end test test-not
@@ -2621,35 +2616,46 @@ many elements are copied."
 
 ;;;; COUNT-IF, COUNT-IF-NOT, and COUNT
 
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro vector-count-if (notp from-end-p predicate sequence)
+(defmacro vector-count-if (notp from-end-p predicate sequence
+                                 &key two-arg-predicate)
   (let ((next-index (if from-end-p '(1- index) '(1+ index)))
-        (pred `(funcall ,predicate (apply-key key (aref ,sequence index)))))
+        (pred (if two-arg-predicate
+                  `(funcall ,predicate ,two-arg-predicate (apply-key key (aref ,sequence index)))
+                  `(funcall ,predicate (apply-key key (aref ,sequence index))))))
     `(let ((%start ,(if from-end-p '(1- end) 'start))
            (%end ,(if from-end-p '(1- start) 'end)))
-      (do ((index %start ,next-index)
-           (count 0))
-          ((= index (the fixnum %end)) count)
-        (declare (fixnum index count))
-        (,(if notp 'unless 'when) ,pred
-          (setq count (1+ count)))))))
+       (do ((index %start ,next-index)
+            (count 0))
+           ((= index (the fixnum %end)) count)
+         (declare (fixnum index count))
+         ,(if two-arg-predicate
+              `(when (if ,pred
+                         (not ,notp)
+                         ,notp)
+                 (setq count (1+ count)))
+              `(,(if notp 'unless 'when) ,pred
+                (setq count (1+ count))))))))
 
-(sb!xc:defmacro list-count-if (notp from-end-p predicate sequence)
-  (let ((pred `(funcall ,predicate (apply-key key (pop sequence)))))
+(defmacro list-count-if (notp from-end-p predicate sequence
+                               &key two-arg-predicate)
+  (let ((pred (if two-arg-predicate
+                  `(funcall ,predicate ,two-arg-predicate (apply-key key (pop sequence)))
+                  `(funcall ,predicate (apply-key key (pop sequence))))))
     `(let ((%start ,(if from-end-p '(- length end) 'start))
            (%end ,(if from-end-p '(- length start) 'end))
            (sequence ,(if from-end-p '(reverse sequence) 'sequence)))
-      (do ((sequence (nthcdr %start ,sequence))
-           (index %start (1+ index))
-           (count 0))
-          ((or (= index (the fixnum %end)) (null sequence)) count)
-        (declare (fixnum index count))
-        (,(if notp 'unless 'when) ,pred
-          (setq count (1+ count)))))))
-
-
-) ; EVAL-WHEN
+       (do ((sequence (nthcdr %start ,sequence))
+            (index %start (1+ index))
+            (count 0))
+           ((or (= index (the fixnum %end)) (null sequence)) count)
+         (declare (fixnum index count))
+         ,(if two-arg-predicate
+              `(when (if ,pred
+                         (not ,notp)
+                         ,notp)
+                 (setq count (1+ count)))
+              `(,(if notp 'unless 'when) ,pred
+                (setq count (1+ count))))))))
 
 (define-sequence-traverser count-if
     (pred sequence &rest args &key from-end start end key)
@@ -2702,29 +2708,23 @@ many elements are copied."
   (when (and test-p test-not-p)
     ;; Use the same wording as EFFECTIVE-FIND-POSITION-TEST
     (error "can't specify both :TEST and :TEST-NOT"))
-  (let ((%test (if test-not-p
-                   (lambda (x)
-                     (not (funcall test-not item x)))
-                   (lambda (x)
-                     (funcall test item x)))))
+  (let ((test (or test-not test)))
     (seq-dispatch-checking sequence
-      (let ((end (or end length)))
-        (declare (type index end))
-        (if from-end
-            (list-count-if nil t %test sequence)
-            (list-count-if nil nil %test sequence)))
-      (let ((end (or end length)))
-        (declare (type index end))
-        (if from-end
-            (vector-count-if nil t %test sequence)
-            (vector-count-if nil nil %test sequence)))
-      (apply #'sb!sequence:count item sequence args))))
+        (let ((end (or end length)))
+          (declare (type index end))
+          (if from-end
+              (list-count-if test-not-p t test sequence :two-arg-predicate item)
+              (list-count-if test-not-p nil test sequence :two-arg-predicate item)))
+        (let ((end (or end length)))
+          (declare (type index end))
+          (if from-end
+              (vector-count-if test-not-p t test sequence :two-arg-predicate item)
+              (vector-count-if test-not-p nil test sequence :two-arg-predicate item)))
+        (apply #'sb!sequence:count item sequence args))))
 
 ;;;; MISMATCH
 
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro match-vars (&rest body)
+(defmacro match-vars (&rest body)
   `(let ((inc (if from-end -1 1))
          (start1 (if from-end (1- (the fixnum end1)) start1))
          (start2 (if from-end (1- (the fixnum end2)) start2))
@@ -2733,7 +2733,7 @@ many elements are copied."
      (declare (fixnum inc start1 start2 end1 end2))
      ,@body))
 
-(sb!xc:defmacro matchify-list ((sequence start length end) &body body)
+(defmacro matchify-list ((sequence start length end) &body body)
   (declare (ignore end)) ;; ### Should END be used below?
   `(let ((,sequence (if from-end
                         (nthcdr (- (the fixnum ,length) (the fixnum ,start) 1)
@@ -2742,11 +2742,7 @@ many elements are copied."
      (declare (type list ,sequence))
      ,@body))
 
-) ; EVAL-WHEN
-
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro if-mismatch (elt1 elt2)
+(defmacro if-mismatch (elt1 elt2)
   `(cond ((= (the fixnum index1) (the fixnum end1))
           (return (if (= (the fixnum index2) (the fixnum end2))
                       nil
@@ -2762,28 +2758,28 @@ many elements are copied."
                               (apply-key key ,elt2)))
                 (return (if from-end (1+ (the fixnum index1)) index1))))))
 
-(sb!xc:defmacro mumble-mumble-mismatch ()
+(defmacro mumble-mumble-mismatch ()
   `(do ((index1 start1 (+ index1 (the fixnum inc)))
         (index2 start2 (+ index2 (the fixnum inc))))
        (())
      (declare (fixnum index1 index2))
      (if-mismatch (aref sequence1 index1) (aref sequence2 index2))))
 
-(sb!xc:defmacro mumble-list-mismatch ()
+(defmacro mumble-list-mismatch ()
   `(do ((index1 start1 (+ index1 (the fixnum inc)))
         (index2 start2 (+ index2 (the fixnum inc))))
        (())
      (declare (fixnum index1 index2))
      (if-mismatch (aref sequence1 index1) (pop sequence2))))
 
-(sb!xc:defmacro list-mumble-mismatch ()
+(defmacro list-mumble-mismatch ()
   `(do ((index1 start1 (+ index1 (the fixnum inc)))
         (index2 start2 (+ index2 (the fixnum inc))))
        (())
      (declare (fixnum index1 index2))
      (if-mismatch (pop sequence1) (aref sequence2 index2))))
 
-(sb!xc:defmacro list-list-mismatch ()
+(defmacro list-list-mismatch ()
   `(do ((sequence1 sequence1)
         (sequence2 sequence2)
         (index1 start1 (+ index1 (the fixnum inc)))
@@ -2791,8 +2787,6 @@ many elements are copied."
        (())
      (declare (fixnum index1 index2))
      (if-mismatch (pop sequence1) (pop sequence2))))
-
-) ; EVAL-WHEN
 
 (define-sequence-traverser mismatch
     (sequence1 sequence2 &rest args &key from-end test test-not
@@ -2851,10 +2845,8 @@ many elements are copied."
 
 ;;; search comparison functions
 
-(eval-when (:compile-toplevel :execute)
-
 ;;; Compare two elements and return if they don't match.
-(sb!xc:defmacro compare-elements (elt1 elt2)
+(defmacro compare-elements (elt1 elt2)
   `(if test-not
        (if (funcall test-not (apply-key key ,elt1) (apply-key key ,elt2))
            (return nil)
@@ -2863,7 +2855,7 @@ many elements are copied."
            (return nil)
            t)))
 
-(sb!xc:defmacro search-compare-list-list (main sub)
+(defmacro search-compare-list-list (main sub)
   `(do ((main ,main (cdr main))
         (jndex start1 (1+ jndex))
         (sub (nthcdr start1 ,sub) (cdr sub)))
@@ -2872,13 +2864,13 @@ many elements are copied."
      (declare (type (integer 0) jndex))
      (compare-elements (car sub) (car main))))
 
-(sb!xc:defmacro search-compare-list-vector (main sub)
+(defmacro search-compare-list-vector (main sub)
   `(do ((main ,main (cdr main))
         (index start1 (1+ index)))
        ((or (endp main) (= index end1)) t)
      (compare-elements (aref ,sub index) (car main))))
 
-(sb!xc:defmacro search-compare-vector-list (main sub index)
+(defmacro search-compare-vector-list (main sub index)
   `(do ((sub (nthcdr start1 ,sub) (cdr sub))
         (jndex start1 (1+ jndex))
         (index ,index (1+ index)))
@@ -2886,13 +2878,13 @@ many elements are copied."
      (declare (type (integer 0) jndex))
      (compare-elements (car sub) (aref ,main index))))
 
-(sb!xc:defmacro search-compare-vector-vector (main sub index)
+(defmacro search-compare-vector-vector (main sub index)
   `(do ((index ,index (1+ index))
         (sub-index start1 (1+ sub-index)))
        ((= sub-index end1) t)
      (compare-elements (aref ,sub sub-index) (aref ,main index))))
 
-(sb!xc:defmacro search-compare (main-type main sub index)
+(defmacro search-compare (main-type main sub index)
   (if (eq main-type 'list)
       `(seq-dispatch ,sub
          (search-compare-list-list ,main ,sub)
@@ -2903,14 +2895,10 @@ many elements are copied."
          (search-compare-vector-list ,main ,sub ,index)
          (search-compare-vector-vector ,main ,sub ,index)
          (return-from search (apply #'sb!sequence:search sequence1 sequence2 args)))))
-
-) ; EVAL-WHEN
 
 ;;;; SEARCH
 
-(eval-when (:compile-toplevel :execute)
-
-(sb!xc:defmacro list-search (main sub)
+(defmacro list-search (main sub)
   `(do ((main (nthcdr start2 ,main) (cdr main))
         (index2 start2 (1+ index2))
         (terminus (- end2 (the (integer 0) (- end1 start1))))
@@ -2922,7 +2910,7 @@ many elements are copied."
              (setq last-match index2)
              (return index2)))))
 
-(sb!xc:defmacro vector-search (main sub)
+(defmacro vector-search (main sub)
   `(do ((index2 start2 (1+ index2))
         (terminus (- end2 (the (integer 0) (- end1 start1))))
         (last-match ()))
@@ -2932,8 +2920,6 @@ many elements are copied."
          (if from-end
              (setq last-match index2)
              (return index2)))))
-
-) ; EVAL-WHEN
 
 (define-sequence-traverser search
     (sequence1 sequence2 &rest args &key

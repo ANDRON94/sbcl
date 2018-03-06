@@ -19,13 +19,10 @@
             ea-p sized-ea
             make-ea ea-disp) "SB!VM")
   ;; Imports from SB-VM into this package
-  (import '(sb!vm::*byte-sc-names* sb!vm::*word-sc-names*
-            sb!vm::*dword-sc-names* sb!vm::*qword-sc-names*
-            sb!vm::frame-byte-offset
+  (import '(sb!vm::frame-byte-offset
             sb!vm::registers sb!vm::float-registers sb!vm::stack))) ; SB names
 
-;;; Note: In CMU CL, this used to be a call to SET-DISASSEM-PARAMS.
-(setf *disassem-inst-alignment-bytes* 1)
+(defconstant +disassem-inst-alignment-bytes+ 1)
 
 ;;; This type is used mostly in disassembly and represents legacy
 ;;; registers only. R8-R15 are handled separately.
@@ -147,8 +144,10 @@
   :printer #'print-reg-default-qword)
 
 (define-arg-type imm-addr
-  :prefilter (lambda (dstate)
-               (read-suffix (width-bits (inst-operand-size dstate)) dstate))
+  ;; imm-addr is used only with opcodes #xA0 through #xA3 which take a 64-bit
+  ;; address unless overridden to 32-bit by the #x67 prefix that we don't parse.
+  ;; i.e. we don't have (INST-ADDR-SIZE DSTATE), so always take it to be 64 bits.
+  :prefilter (lambda (dstate) (read-suffix 64 dstate))
   :printer #'print-label)
 
 ;;; Normally, immediate values for an operand size of :qword are of size
@@ -386,14 +385,15 @@
   (accum :type 'accum)
   (imm))
 
+(declaim (inline !regrm-inst-reg))
 (define-instruction-format (reg-reg/mem 16
                                         :default-printer
                                         `(:name :tab reg ", " reg/mem))
   (op      :field (byte 7 1))
   (width   :field (byte 1 0)    :type 'width)
   (reg/mem :fields (list (byte 2 14) (byte 3 8))
-           :type 'reg/mem :reader reg-r/m-inst-r/m-arg)
-  (reg     :field (byte 3 11)   :type 'reg)
+           :type 'reg/mem :reader regrm-inst-r/m)
+  (reg     :field (byte 3 11)   :type 'reg :reader !regrm-inst-reg)
   ;; optional fields
   (imm))
 
@@ -439,7 +439,8 @@
                                         :default-printer
                                         '(:name :tab reg/mem ", " imm))
   (reg/mem :type 'sized-reg/mem)
-  (imm     :type 'signed-imm-data/asm-routine))
+  (imm     :type 'signed-imm-data/asm-routine
+           :reader reg/mem-imm-data))
 
 ;;; Same as reg/mem, but with using the accumulator in the default printer
 (define-instruction-format
@@ -1178,56 +1179,15 @@
         (emit-sib-byte segment 0 #b100 #b101)
         (emit-absolute-fixup segment thing))))))
 
-(defun byte-reg-p (thing)
-  (and (tn-p thing)
-       (eq (sb-name (sc-sb (tn-sc thing))) 'registers)
-       (member (sc-name (tn-sc thing)) *byte-sc-names*)
-       t))
-
-(defun byte-ea-p (thing)
-  (typecase thing
-    (ea (eq (ea-size thing) :byte))
-    (tn
-     (and (member (sc-name (tn-sc thing)) *byte-sc-names*) t))
-    (t nil)))
-
-(defun word-reg-p (thing)
-  (and (tn-p thing)
-       (eq (sb-name (sc-sb (tn-sc thing))) 'registers)
-       (member (sc-name (tn-sc thing)) *word-sc-names*)
-       t))
-
-(defun word-ea-p (thing)
-  (typecase thing
-    (ea (eq (ea-size thing) :word))
-    (tn (and (member (sc-name (tn-sc thing)) *word-sc-names*) t))
-    (t nil)))
-
 (defun dword-reg-p (thing)
   (and (tn-p thing)
        (eq (sb-name (sc-sb (tn-sc thing))) 'registers)
-       (member (sc-name (tn-sc thing)) *dword-sc-names*)
-       t))
-
-(defun dword-ea-p (thing)
-  (typecase thing
-    (ea (eq (ea-size thing) :dword))
-    (tn
-     (and (member (sc-name (tn-sc thing)) *dword-sc-names*) t))
-    (t nil)))
+       (eq (sb!c:sc-operand-size (tn-sc thing)) :dword)))
 
 (defun qword-reg-p (thing)
   (and (tn-p thing)
        (eq (sb-name (sc-sb (tn-sc thing))) 'registers)
-       (member (sc-name (tn-sc thing)) *qword-sc-names*)
-       t))
-
-(defun qword-ea-p (thing)
-  (typecase thing
-    (ea (eq (ea-size thing) :qword))
-    (tn
-     (and (member (sc-name (tn-sc thing)) *qword-sc-names*) t))
-    (t nil)))
+       (eq (sb!c:sc-operand-size (tn-sc thing)) :qword)))
 
 ;;; Return true if THING is a general-purpose register TN.
 (defun register-p (thing)
@@ -1271,14 +1231,14 @@
 ;;; registers is used that can only be accessed using a REX prefix, we
 ;;; need only to test R and B, because X is only used for the index
 ;;; register of an effective address and therefore never byte-sized.
-;;; For R we can avoid to calculate the size of the TN because it is
+;;; For R we can avoid calculating the size of the TN because it is
 ;;; always OPERAND-SIZE. The size of B must be calculated here because
 ;;; B can be address-sized (if it is the base register of an effective
 ;;; address), of OPERAND-SIZE (if the instruction operates on two
 ;;; registers) or of some different size (in the instructions that
 ;;; combine arguments of different sizes: MOVZX, MOVSX, MOVSXD and
 ;;; several SSE instructions, e.g. CVTSD2SI). We don't distinguish
-;;; between general-purpose and floating point registers for this cause
+;;; between general-purpose and floating point registers for this case
 ;;; because only general-purpose registers can be byte-sized at all.
 (defun maybe-emit-rex-prefix (segment operand-size r x b)
   (declare (type (member nil :byte :word :dword :qword :do-not-set)
@@ -1312,9 +1272,9 @@
         (emit-rex-byte segment #b0100 rex-w rex-r rex-x rex-b)))))
 
 ;;; Emit a REX prefix if necessary. The operand size is determined from
-;;; THING or can be overwritten by OPERAND-SIZE. This and REG are always
+;;; THING or can be overridden by OPERAND-SIZE. This and REG are always
 ;;; passed to MAYBE-EMIT-REX-PREFIX. Additionally, if THING is an EA we
-;;; pass its index and base registers, if it is a register TN, we pass
+;;; pass its index and base registers; if it is a register TN, we pass
 ;;; only itself.
 ;;; In contrast to EMIT-EA above, neither stack TNs nor fixups need to
 ;;; be treated specially here: If THING is a stack TN, neither it nor
@@ -1345,36 +1305,8 @@
 (defun operand-size (thing)
   (typecase thing
     (tn
-     ;; FIXME: might as well be COND instead of having to use #. readmacro
-     ;; to hack up the code
-     (case (sc-name (tn-sc thing))
-       #!+sb-simd-pack
-       (#.sb!vm::*oword-sc-names*
-        :oword)
-       (#.*qword-sc-names*
-        :qword)
-       (#.*dword-sc-names*
-        :dword)
-       (#.*word-sc-names*
-        :word)
-       (#.*byte-sc-names*
-        :byte)
-       ;; added by jrd: float-registers is a separate size (?)
-       ;; The only place in the code where we are called with THING
-       ;; being a float-register is in MAYBE-EMIT-REX-PREFIX when it
-       ;; checks whether THING is a byte register. Thus our result in
-       ;; these cases could as well be :dword and :qword. I leave it as
-       ;; :float and :double which is more likely to trigger an aver
-       ;; instead of silently doing the wrong thing in case this
-       ;; situation should change. Lutz Euler, 2005-10-23.
-       (#.sb!vm::*float-sc-names*
-        :float)
-       (#.sb!vm::*double-sc-names*
-        :double)
-       (#.sb!vm::*complex-sc-names*
-        :complex)
-       (t
-        (error "can't tell the size of ~S ~S" thing (sc-name (tn-sc thing))))))
+     (or (sb!c:sc-operand-size (tn-sc thing))
+         (error "can't tell the size of ~S" thing)))
     (ea
      (ea-size thing))
     (fixup
@@ -1467,9 +1399,6 @@
                                          value))
                  (imm nil :type 'signed-imm-data/asm-routine))
             '(:name :tab reg ", " imm))
-  ;; absolute mem to/from accumulator
-  (:printer simple-dir ((op #b101000) (imm nil :type 'imm-addr))
-            `(:name :tab ,(swap-if 'dir 'accum ", " '("[" imm "]"))))
   ;; register to/from register/memory
   (:printer reg-reg/mem-dir ((op #b100010)))
   ;; immediate to register/memory
@@ -1551,6 +1480,36 @@
             (emit-absolute-fixup segment src))
            (t
             (error "bogus arguments to MOV: ~S ~S" dst src))))))
+
+(define-instruction quad (segment qword)
+  (:emitter
+   (etypecase qword
+     (integer (emit-qword segment qword))
+     (fixup   (emit-absolute-fixup segment qword t)))))
+
+;;; MOVABS is not a mnemonic according to the CPU vendors, but every (dis)assembler
+;;; in popular use chooses this mnemonic instead of MOV with an 8-byte operand.
+;;; (Even with Intel-compatible syntax, LLVM produces MOVABS).
+;;; A possible motive is that it makes round-trip disassembly + reassembly faithful
+;;; to the original encoding.  If MOVABS were rendered as MOV on account of the
+;;; operand fitting by chance in 4 bytes, then information loss would occur.
+;;; On the other hand, information loss occurs with other operands whose immediate
+;;; value could fit in 1 byte or 4 bytes, so I don't know that that's the full
+;;; reasoning. But in this disassembler anyway, an EA holds only a 32-bit integer
+;;; so it doesn't really work to shoehorn this into the MOV instruction emitter.
+(define-instruction movabs (segment dst src)
+  ;; absolute mem to/from accumulator
+  (:printer simple-dir ((op #b101000) (imm nil :type 'imm-addr))
+            `(:name :tab ,(swap-if 'dir 'accum ", " '("[" imm "]"))))
+  (:emitter
+   (multiple-value-bind (reg ea dir-bit)
+       (if (register-p dst) (values dst src 0) (values src dst 2))
+     (aver (and (accumulator-p reg) (typep ea 'word)))
+     (let ((size (operand-size reg)))
+       (maybe-emit-operand-size-prefix segment size)
+       (maybe-emit-rex-prefix segment size nil nil nil)
+       (emit-byte segment (logior (if (eq size :byte) #xA0 #xA1) dir-bit))
+       (emit-qword segment ea)))))
 
 ;;; Emit a sign-extending (if SIGNED-P is true) or zero-extending move.
 ;;; To achieve the shortest possible encoding zero extensions into a
@@ -1744,7 +1703,14 @@
    (maybe-emit-rex-for-ea segment src dst
                           :operand-size (if (dword-reg-p dst) :dword :qword))
    (emit-byte segment #b10001101)
-   (emit-ea segment src (reg-tn-encoding dst))))
+   (cond ((and (fixup-p src)
+               (eq (fixup-flavor src) :assembly-routine)
+               #!+immobile-code
+               sb!c::*code-is-immobile*)
+          (emit-mod-reg-r/m-byte segment #b00 (reg-tn-encoding dst) #b101)
+          (emit-relative-fixup segment src))
+         (t
+          (emit-ea segment src (reg-tn-encoding dst))))))
 
 (define-instruction cmpxchg (segment dst src &optional prefix)
   ;; Register/Memory with Register.
@@ -2324,7 +2290,8 @@
 
 (define-instruction call (segment where)
   (:printer near-jump ((op #xE8)))
-  (:printer reg/mem-default-qword ((op '(#b11111111 #b010))))
+  (:printer reg/mem-default-qword ((op '(#b11111111 #b010))
+                                   (reg/mem nil :printer #'print-jmp-ea)))
   (:emitter
    (typecase where
      (label
@@ -2345,7 +2312,8 @@
   ;; unconditional jumps
   (:printer short-jump ((op #b1011)))
   (:printer near-jump ((op #xE9)))
-  (:printer reg/mem-default-qword ((op '(#b11111111 #b100))))
+  (:printer reg/mem-default-qword ((op '(#b11111111 #b100))
+                                   (reg/mem nil :printer #'print-jmp-ea)))
   (:emitter
    (cond (where
           (emit-chooser

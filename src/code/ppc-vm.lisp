@@ -9,15 +9,15 @@
 
 ;;;; FIXUP-CODE-OBJECT
 
+(defconstant-eqx +fixup-kinds+ #(:absolute :b :ba :ha :l) #'equalp)
 (!with-bigvec-or-sap
-(defun fixup-code-object (code offset fixup kind &optional flavor)
+(defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let ((sap (code-instructions code)))
-     (ecase kind
+  (let ((sap (code-instructions code)))
+    (ecase kind
        (:absolute
         (setf (sap-ref-32 sap offset) fixup))
        (:b
@@ -39,7 +39,8 @@
                  (if (logbitp 15 l) (ldb (byte 16 0) (1+ h)) h))))
        (:l
         (setf (ldb (byte 16 0) (sap-ref-32 sap offset))
-              (ldb (byte 16 0) fixup))))))))
+              (ldb (byte 16 0) fixup)))))
+  nil))
 
 
 ;;;; "Sigcontext" access functions, cut & pasted from x86-vm.lisp then
@@ -101,9 +102,8 @@
          (regnum (ldb (byte 5 0) op)))
     (declare (type system-area-pointer pc))
     (cond ((= op (logior (ash 3 10) (ash 6 5)))
-           (let ((error-number (sap-ref-8 pc 4)))
-             (values error-number
-                     (sb!kernel::decode-internal-error-args (sap+ pc 5) error-number))))
+           (let ((trap-number (sap-ref-8 pc 3)))
+             (sb!kernel::decode-internal-error-args (sap+ pc 4) trap-number)))
           ((and (= (ldb (byte 6 10) op) 3) ;; twi
                 (or (= regnum #.(sc-offset-offset arg-count-sc))
                     (= (ldb (byte 5 5) op) 24))) ;; :ne

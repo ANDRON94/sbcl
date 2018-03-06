@@ -34,6 +34,8 @@
         (setq lines (nbutlast lines)))
       ;; For human-readability, kill the whitespace
       (setq lines (mapcar (lambda (x) (string-left-trim " ;" x)) lines))
+      ;; Remove safepoint traps
+      (setq lines (remove-if (lambda (x) (search "; safepoint" x)) lines))
       ;; If the last 4 lines are of the expected form
       ;;   MOV RSP, RBP / CLC / POP RBP / RET
       ;; then strip them out
@@ -52,12 +54,12 @@
 
 ;; Lack of earmuffs on this symbol allocates it in dynamic space
 (defvar foo)
-(assert (not (sb-kernel:immobile-space-obj-p 'foo)))
+#-immobile-symbols (assert (not (sb-kernel:immobile-space-obj-p 'foo)))
 ;; This compilation causes a side-effect of assigning FOO a TLS index
 ;; DO NOT REMOVE!
 (compile nil '(lambda (foo) (eval 'frob)))
 
-(with-test (:name :symeval-known-tls-index)
+(with-test (:name :symeval-known-tls-index :skipped-on :immobile-symbols)
   ;; When symbol SC is IMMEDIATE:
   ;;    498B942478210000   MOV RDX, [R12+8568]       ; tls: *PRINT-BASE*
   ;;    83FA61             CMP EDX, 97
@@ -75,9 +77,9 @@
 (defvar *blub*) ; immobile space
 (defvar blub)   ; dynamic space
 (assert (sb-kernel:immobile-space-obj-p '*blub*))
-(assert (not (sb-kernel:immobile-space-obj-p 'blub)))
+#-immobile-symbols (assert (not (sb-kernel:immobile-space-obj-p 'blub)))
 
-(with-test (:name :symeval-unknown-tls-index)
+(with-test (:name :symeval-unknown-tls-index :skipped-on :immobile-symbols)
   ;; When symbol SC is immediate:
   ;;    8B142514A24C20     MOV EDX, [#x204CA214]    ; tls_index: *BLUB*
   ;;    498B1414           MOV RDX, [R12+RDX]
@@ -105,6 +107,67 @@
                            :stream s)))
            #\newline))
          (index
-          (position "; error trap" lines :test 'search)))
-    (assert (search "OBJECT-NOT-TYPE-ERROR" (nth (1+ index) lines)))
-    (assert (search "; 'SB-ASSEM:LABEL" (nth (+ index 3) lines)))))
+          (position "OBJECT-NOT-TYPE-ERROR" lines :test 'search)))
+    (assert (search "; #<SB-KERNEL:LAYOUT for SB-ASSEM:LABEL" (nth (+ index 2) lines)))))
+
+#+immobile-code
+(with-test (:name :reference-assembly-tramp)
+  (dolist (testcase '(("FUNCALLABLE-INSTANCE-TRAMP"
+                       sb-kernel:%make-funcallable-instance)
+                      ("UNDEFINED-TRAMP"
+                       sb-kernel:make-fdefn)))
+    (let ((lines
+           (split-string
+            (with-output-to-string (stream)
+              (let ((sb-disassem:*disassem-location-column-width* 0))
+                (disassemble (cadr testcase) :stream stream)))
+            #\newline)))
+      (assert (loop for line in lines
+                    thereis (and (search "LEA" line)
+                                 (search "RIP" line) ; require RIP-relative mode
+                                 ;; and verify disassembly
+                                 (search (car testcase) line)))))))
+
+#+immobile-code
+(with-test (:name :static-unlinker)
+  (let ((sb-c::*compile-to-memory-space* :immobile))
+    (declare (muffle-conditions style-warning))
+    (flet ((disassembly-lines (name)
+             (split-string
+              (with-output-to-string (s)
+                (let ((sb-disassem:*disassem-location-column-width* 0))
+                  (disassemble name :stream s)))
+              #\newline))
+           (expect (match lines)
+             (assert (loop for line in lines
+                           thereis (search match line)))))
+      (compile 'h '(lambda (x) (1+ x)))
+      (setf (symbol-function 'g) #'h (symbol-function 'f) #'h)
+      (compile 'c '(lambda (x) (g x)))
+      (compile 'd '(lambda (x) (f (g x))))
+      ;; The FDEFN-FUN of F is same as that of G.
+      ;; Statically linking D should not patch the fdefn calls into static calls
+      ;; because it can't unambiguously be undone without storing additional data
+      ;; about where patches were performed to begin with.
+      (sb-vm::statically-link-core :callers '(c d))
+      (let ((lines (disassembly-lines 'c)))
+        (expect "#<FUNCTION H>" lines))
+      (let ((lines (disassembly-lines 'd)))
+        (expect "#<FDEFN F>" lines)
+        (expect "#<FDEFN G>" lines))
+      (handler-bind ((warning #'muffle-warning))
+        (defun g (x) (- x)))
+      (let ((lines (disassembly-lines 'c)))
+        (expect "#<FDEFN G>" lines)))))
+
+(with-test (:name :c-call
+            :broken-on (not :sb-dynamic-core))
+  (let* ((lines (split-string
+                 (with-output-to-string (s)
+                   (let ((sb-disassem:*disassem-location-column-width* 0))
+                     (disassemble 'sb-sys:deallocate-system-memory :stream s)))
+                 #\newline))
+         (c-call (find "os_deallocate" lines :test #'search)))
+    ;; Depending on #+immobile-code it's either direct or memory indirect.
+    #+immobile-code (assert (search "CALL #x" c-call))
+    #-immobile-code (assert (search "CALL [#x" c-call))))

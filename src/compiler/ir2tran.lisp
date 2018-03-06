@@ -639,10 +639,10 @@
                (vop branch node block (block-label alternative))))
           (t
            (emit-template node block template args nil info-args)
-           (vop branch-if node block (block-label consequent) flags not-p)
+           (vop branch-if if block (block-label consequent) flags not-p)
            (if (drop-thru-p if alternative)
                (register-drop-thru alternative)
-               (vop branch node block (block-label alternative)))))))
+               (vop branch if block (block-label alternative)))))))
 
 ;;; Convert an IF that isn't the DEST of a conditional template.
 (defun ir2-convert-if (node block)
@@ -979,27 +979,26 @@
 ;;;      lvar LOC.
 ;;;   -- We don't know what it is.
 (defun fun-lvar-tn (node block lvar)
-  (declare (ignore node block))
   (declare (type lvar lvar))
   (let ((2lvar (lvar-info lvar)))
-    (if (eq (ir2-lvar-kind 2lvar) :delayed)
-        (let ((name (lvar-fun-name lvar t)))
-          (aver name)
-          (values (cond ((sb!vm::static-fdefn-offset name)
-                         name)
-                        (t
-                         ;; Named call to an immobile fdefn from an immobile component
-                         ;; uses the FUN-TN only to preserve liveness of the fdefn.
-                         ;; The name becomes an info arg.
-                         (make-load-time-constant-tn :fdefinition name)))
-                   name))
-        (let* ((locs (ir2-lvar-locs 2lvar))
-               (loc (first locs))
-               (function-ptype (primitive-type-or-lose 'function)))
-          (aver (and (eq (ir2-lvar-kind 2lvar) :fixed)
-                     (= (length locs) 1)))
-          (aver (eq (tn-primitive-type loc) function-ptype))
-          (values loc nil)))))
+    (cond ((neq (ir2-lvar-kind 2lvar) :delayed)
+           (let* ((locs (ir2-lvar-locs 2lvar))
+                  (loc (first locs)))
+             (aver (and (eq (ir2-lvar-kind 2lvar) :fixed)
+                        (= (length locs) 1)))
+             (values loc nil)))
+          ((lvar-fun-name lvar t)
+           (let ((name (lvar-fun-name lvar t)))
+             (values (cond ((sb!vm::static-fdefn-offset name)
+                            name)
+                           (t
+                            ;; Named call to an immobile fdefn from an immobile component
+                            ;; uses the FUN-TN only to preserve liveness of the fdefn.
+                            ;; The name becomes an info arg.
+                            (make-load-time-constant-tn :fdefinition name)))
+                     name)))
+          (t
+           (values (lvar-tn node block lvar) nil)))))
 
 ;;; Set up the args to NODE in the current frame, and return a TN-REF
 ;;; list for the passing locations.
@@ -1033,9 +1032,11 @@
         (fun-lvar-tn node block (basic-combination-fun node))
       (cond ((not named)
              (vop* tail-call node block
-                  (fun-tn old-fp return-pc pass-refs)
-                  (nil)
-                  nargs (emit-step-p node)))
+                   (fun-tn old-fp return-pc pass-refs)
+                   (nil)
+                   nargs (emit-step-p node)
+                   #!+call-symbol
+                   (eq (tn-primitive-type fun-tn) *backend-t-primitive-type*)))
             #!-immobile-code
             ((eq fun-tn named)
              (vop* static-tail-call-named node block
@@ -1060,7 +1061,7 @@
       (let ((last nil)
             (first nil))
         (dotimes (num nargs)
-          (locs (standard-arg-location num))
+          (locs (sb!vm::standard-call-arg-location num))
           (let ((ref (reference-tn (lvar-tn node block (elt args num))
                                    nil)))
             (if last
@@ -1094,7 +1095,9 @@
           (fun-lvar-tn node block (basic-combination-fun node))
         (cond ((not named)
                (vop* call node block (fp fun-tn args) (loc-refs)
-                     arg-locs nargs nvals (emit-step-p node)))
+                     arg-locs nargs nvals (emit-step-p node)
+                     #!+call-symbol
+                     (eq (tn-primitive-type fun-tn) *backend-t-primitive-type*)))
               #!-immobile-code
               ((eq fun-tn named)
                (vop* static-call-named node block
@@ -1123,7 +1126,9 @@
           (fun-lvar-tn node block (basic-combination-fun node))
         (cond ((not named)
                (vop* multiple-call node block (fp fun-tn args) (loc-refs)
-                  arg-locs nargs (emit-step-p node)))
+                     arg-locs nargs (emit-step-p node)
+                     #!+call-symbol
+                     (eq (tn-primitive-type fun-tn) *backend-t-primitive-type*)))
               #!-immobile-code
               ((eq fun-tn named)
                (vop* static-multiple-call-named node block
@@ -1236,6 +1241,16 @@
     (when (consp fname)
       (aver (legal-fun-name-p fname))))) ;; FIXME: needless check?
 
+#!+call-symbol
+(defun remove-%coerce-callable-for-call (call)
+  (let* ((fun (basic-combination-fun call))
+         (use (lvar-uses fun)))
+    (when (and (combination-p use)
+               (eq (lvar-fun-name (combination-fun use) t)
+                   '%coerce-callable-for-call))
+      (let ((callable (car (combination-args use))))
+        (setf (basic-combination-fun call) callable)))))
+
 ;;; If the call is in a tail recursive position and the return
 ;;; convention is standard, then do a tail full call. If one or fewer
 ;;; values are desired, then use a single-value call, otherwise use a
@@ -1243,6 +1258,8 @@
 (defun ir2-convert-full-call (node block)
   (declare (type combination node) (type ir2-block block))
   (ponder-full-call node)
+  #!+call-symbol
+  (remove-%coerce-callable-for-call node)
   (cond ((node-tail-p node)
          (ir2-convert-tail-full-call node block))
         ((let ((lvar (node-lvar node)))
@@ -1287,8 +1304,6 @@
       (vop xep-allocate-frame node block start-label)
       ;; Arg verification needs to be done before the stack pointer is adjusted
       ;; so that the extra arguments are still present when the error is signalled
-      #!-precise-arg-count-error
-      (vop xep-setup-sp node block)
       (let ((verified (unless (eq (functional-kind fun) :toplevel)
                         (setf arg-count-tn (make-arg-count-location))
                         (xep-verify-arg-count node block fun arg-count-tn))))
@@ -1297,10 +1312,17 @@
        (cond ((and (optional-dispatch-p ef)
                    (optional-dispatch-more-entry ef)
                    (neq (functional-kind (optional-dispatch-more-entry ef)) :deleted))
-              ;; COPY-MORE-ARG does the job of XEP-SETUP-SP on +precise-arg-count-error
+              ;; XEP-SETUP-SP opens a window for an interrupt
+              ;; clobbering any "more args" that may be on the stack.
+              ;; As such, COPY-MORE-ARG is being given the
+              ;; responsibility for setting up the stack pointer, but
+              ;; not all backends have been updated yet.  On backends
+              ;; that have not been updated, we still need to use
+              ;; XEP-SETUP-SP here.
+              #!+(or alpha hppa mips sparc)
+              (vop xep-setup-sp node block)
               (vop copy-more-arg node block (optional-dispatch-max-args ef)
                    #!+x86-64 verified))
-             #!+precise-arg-count-error
              (t
               (vop xep-setup-sp node block))))
       (when (ir2-physenv-closure env)
@@ -1333,7 +1355,7 @@
                   (emit-move node block pass home))))
           (incf n))))
 
-    (emit-move node block (make-old-fp-passing-location t)
+    (emit-move node block (make-old-fp-passing-location)
                (ir2-physenv-old-fp env)))
 
   (values))
@@ -1391,11 +1413,24 @@
                      (entry-2env (physenv-info (lambda-physenv entry-fun))))
                  (setf (ir2-physenv-closure-save-tn 2env)
                        (ir2-physenv-closure-save-tn entry-2env)))))))
+    #!-fp-and-pc-standard-save
+    (let ((lab (gen-label)))
+      ;; KLUDGE: Technically, we should be doing this before VOP
+      ;; COUNT-ME for XEPs (above), but :SB-DYNCOUNT isn't used or
+      ;; expected to work anyway, so there's no real window to worry
+      ;; about.
+      (vop emit-label node block lab)
+      (setf (ir2-physenv-cfp-saved-pc env) lab))
 
     (emit-move node
                block
                (ir2-physenv-return-pc-pass env)
                (ir2-physenv-return-pc env))
+    #!-fp-and-pc-standard-save
+    (let ((lab (gen-label)))
+      (vop emit-label node block lab)
+      (setf (ir2-physenv-lra-saved-pc env) lab))
+
     #!+unwind-to-frame-and-call-vop
     (when (and (lambda-allow-instrumenting fun)
                (not (lambda-inline-expanded fun))
@@ -1541,17 +1576,23 @@
         (let ((env (physenv-info (node-physenv node))))
           (vop tail-call-variable node block start fun
                (ir2-physenv-old-fp env)
-               (ir2-physenv-return-pc env))))
+               (ir2-physenv-return-pc env)
+               #!+call-symbol
+               (eq (tn-primitive-type fun) *backend-t-primitive-type*))))
        ((and 2lvar
              (eq (ir2-lvar-kind 2lvar) :unknown))
         (vop* multiple-call-variable node block (start fun nil)
               ((reference-tn-list (ir2-lvar-locs 2lvar) t))
-              (emit-step-p node)))
+              (emit-step-p node)
+              #!+call-symbol
+              (eq (tn-primitive-type fun) *backend-t-primitive-type*)))
        (t
         (let ((locs (standard-result-tns lvar)))
           (vop* call-variable node block (start fun nil)
                 ((reference-tn-list locs t)) (length locs)
-                (emit-step-p node))
+                (emit-step-p node)
+                #!+call-symbol
+                (eq (tn-primitive-type fun) *backend-t-primitive-type*))
           (move-lvar-result node block locs lvar)))))))
 
 ;;; Reset the stack pointer to the start of the specified
@@ -1675,6 +1716,18 @@ not stack-allocated LVAR ~S." source-lvar)))))
                 (lvar-tn node block count)
                 nil)
                ((reference-tn-list locs t))))))))
+
+;;; If ir2-convert-full-call gets to it first REMOVE-%COERCE-CALLABLE-FOR-CALL does the job.
+#!+call-symbol
+(defoptimizer (%coerce-callable-for-call ir2-convert) ((fun) node block)
+  (let ((dest (node-dest node)))
+    (if (and (basic-combination-p dest)
+             (eq (basic-combination-kind dest) :full)
+             (let ((dest-fun (basic-combination-fun dest)))
+               (or (eq dest-fun fun) ;; already removed
+                   (eq (lvar-uses dest-fun) node))))
+        (setf (basic-combination-fun dest) fun)
+        (ir2-convert-full-call node block))))
 
 ;;;; special binding
 
@@ -1719,28 +1772,27 @@ not stack-allocated LVAR ~S." source-lvar)))))
    (with-unique-names (bind unbind)
      (once-only ((n-save-bs '(%primitive current-binding-pointer)))
        `(unwind-protect
-             (progn
-               (labels ((,unbind (vars)
-                          (declare (optimize (speed 2) (debug 0)))
-                          (let ((unbound-marker (%primitive make-unbound-marker)))
-                            (dolist (var vars)
-                              ;; CLHS says "bound and then made to have no value" -- user
-                              ;; should not be able to tell the difference between that and this.
-                              (about-to-modify-symbol-value var 'progv)
-                              (%primitive dynbind unbound-marker var))))
-                        (,bind (vars vals)
-                          (declare (optimize (speed 2) (debug 0)
-                                             (insert-debug-catch 0)))
-                          (cond ((null vars))
-                                ((null vals) (,unbind vars))
-                                (t
-                                 (let ((val (car vals))
-                                       (var (car vars)))
-                                   (about-to-modify-symbol-value var 'progv val t)
-                                   (%primitive dynbind val var))
-                                 (,bind (cdr vars) (cdr vals))))))
-                 (,bind ,vars ,vals))
-               nil
+             (labels ((,unbind (vars)
+                        (declare (optimize (speed 2) (debug 0)))
+                        (let ((unbound-marker (%primitive make-unbound-marker)))
+                          (dolist (var vars)
+                            ;; CLHS says "bound and then made to have no value" -- user
+                            ;; should not be able to tell the difference between that and this.
+                            (about-to-modify-symbol-value var 'progv)
+                            (%primitive dynbind unbound-marker var))))
+                      (,bind (vars vals)
+                        (declare (optimize (speed 2) (debug 0)
+                                           (insert-debug-catch 0))
+                                 (list vars vals))
+                        (cond ((null vars))
+                              ((null vals) (,unbind vars))
+                              (t
+                               (let ((val (car vals))
+                                     (var (car vars)))
+                                 (about-to-modify-symbol-value var 'progv val t)
+                                 (%primitive dynbind val var))
+                               (,bind (cdr vars) (cdr vals))))))
+               (,bind ,vars ,vals)
                ,@body)
           ;; Technically ANSI CL doesn't allow declarations at the
           ;; start of the cleanup form. SBCL happens to allow for

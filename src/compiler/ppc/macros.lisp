@@ -304,9 +304,9 @@
   (assemble ()
     (when vop
       (note-this-location vop :internal-error))
-    (inst unimp kind)
-    (inst byte code)
-    (encode-internal-error-args values)
+    (emit-internal-error kind code values
+                         :trap-emitter (lambda (tramp-number)
+                                         (inst unimp tramp-number)))
     (emit-alignment word-shift)))
 
 (defun generate-error-code (vop error-code &rest values)
@@ -356,4 +356,4 @@
 
 #!+sb-safepoint
 (defun emit-safepoint ()
-  (inst lwz zero-tn null-tn (- (+ 4096 4 other-pointer-lowtag))))
+  (inst lwz zero-tn null-tn (- (+ gc-safepoint-trap-offset n-word-bytes other-pointer-lowtag))))

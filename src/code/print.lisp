@@ -82,7 +82,8 @@ variable: an unreadable object representing the error is printed instead.")
         (*read-eval* t)
         (*read-suppress* nil)
         (*readtable* *standard-readtable*)
-        (*suppress-print-errors* nil))
+        (*suppress-print-errors* nil)
+        (*print-vector-length* nil))
     (funcall function)))
 
 ;;;; routines to print objects
@@ -823,35 +824,49 @@ variable: an unreadable object representing the error is printed instead.")
 
 (defmethod print-object ((vector vector) stream)
   (let ((readably *print-readably*))
-    (cond ((stringp vector)
-           (cond ((and readably (not (typep vector '(vector character))))
-                  (output-unreadable-array-readably vector stream))
-                 ((or *print-escape* readably)
-                  (write-char #\" stream)
-                  (quote-string vector stream)
-                  (write-char #\" stream))
-                 (t
-                  (write-string vector stream))))
-          ((not (or *print-array* readably))
-           (output-terse-array vector stream))
-          ((bit-vector-p vector)
-           (write-string "#*" stream)
-           (dovector (bit vector)
-             ;; (Don't use OUTPUT-OBJECT here, since this code
-             ;; has to work for all possible *PRINT-BASE* values.)
-             (write-char (if (zerop bit) #\0 #\1) stream)))
-          ((or (not readably) (array-readably-printable-p vector))
-           (descend-into (stream)
-             (write-string "#(" stream)
-             (dotimes (i (length vector))
-               (unless (zerop i)
-                 (write-char #\space stream))
-               (punt-print-if-too-long i stream)
-               (output-object (aref vector i) stream))
-             (write-string ")" stream)))
+    (flet ((cut-length ()
+             (when (and (not readably)
+                        *print-vector-length*
+                        (> (length vector) *print-vector-length*))
+               (print-unreadable-object (vector stream :type t :identity t)
+                 (format stream "~A..."
+                         (make-array *print-vector-length*
+                                     :element-type (array-element-type vector)
+                                     :displaced-to vector)))
+               t)))
+      (cond ((stringp vector)
+             (cond ((and readably (not (typep vector '(vector character))))
+                    (output-unreadable-array-readably vector stream))
+                   ((and *print-escape*
+                         (cut-length)))
+                   ((or *print-escape* readably)
+                    (write-char #\" stream)
+                    (quote-string vector stream)
+                    (write-char #\" stream))
+                   (t
+                    (write-string vector stream))))
+            ((not (or *print-array* readably))
+             (output-terse-array vector stream))
+            ((bit-vector-p vector)
+             (cond ((cut-length))
+                   (t
+                    (write-string "#*" stream)
+                    (dovector (bit vector)
+                      ;; (Don't use OUTPUT-OBJECT here, since this code
+                      ;; has to work for all possible *PRINT-BASE* values.)
+                      (write-char (if (zerop bit) #\0 #\1) stream)))))
+            ((or (not readably) (array-readably-printable-p vector))
+             (descend-into (stream)
+               (write-string "#(" stream)
+               (dotimes (i (length vector))
+                 (unless (zerop i)
+                   (write-char #\space stream))
+                 (punt-print-if-too-long i stream)
+                 (output-object (aref vector i) stream))
+               (write-string ")" stream)))
 
-          (t
-           (output-unreadable-array-readably vector stream)))))
+            (t
+             (output-unreadable-array-readably vector stream))))))
 
 ;;; This function outputs a string quoting characters sufficiently
 ;;; so that someone can read it in again. Basically, put a slash in
@@ -1170,9 +1185,6 @@ variable: an unreadable object representing the error is printed instead.")
 
 (defun flonum-to-string (x &optional width fdigits scale fmin)
   (declare (type float x))
-  ;; FIXME: I think only FORMAT-DOLLARS calls FLONUM-TO-STRING with
-  ;; possibly-negative X.
-  (setf x (abs x))
   (multiple-value-bind (e string)
       (if fdigits
           (flonum-to-digits x (min (- (+ fdigits (or scale 0)))
@@ -1647,16 +1659,18 @@ variable: an unreadable object representing the error is printed instead.")
                 (values "#.(~S #X~16,'0X #X~16,'0X)"
                         '%make-simd-pack-ub64 #'%simd-pack-ub64s)))
            (multiple-value-call
-            #'format stream format maker (funcall extractor pack))))
+               #'format stream format maker (funcall extractor pack))))
+        (*print-readably*
+         (print-not-readable-error pack stream))
         (t
          (print-unreadable-object (pack stream)
            (flet ((all-ones-p (value start end &aux (mask (- (ash 1 end) (ash 1 start))))
-                      (= (logand value mask) mask))
+                    (= (logand value mask) mask))
                   (split-num (value start)
-                      (loop
-                         for i from 0 to 3
-                         and v = (ash value (- start)) then (ash v -8)
-                         collect (logand v #xFF))))
+                    (loop
+                       for i from 0 to 3
+                       and v = (ash value (- start)) then (ash v -8)
+                       collect (logand v #xFF))))
              (multiple-value-bind (low high)
                  (%simd-pack-ub64s pack)
                (etypecase pack

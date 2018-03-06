@@ -21,18 +21,8 @@
 (defun int-sse-p (tn)
   (sc-is tn int-sse-reg int-sse-stack int-sse-immediate))
 
-;; On the target we want stubs for the interpreter.
-;; On the host we want not to call these.
-#-sb-xc-host
-(progn
-  (defun %simd-pack-low (x)
-    (declare (type simd-pack x))
-    (%simd-pack-low x))
-  (defun %simd-pack-high (x)
-    (declare (type simd-pack x))
-    (%simd-pack-high x)))
 #+sb-xc-host
-(progn
+(progn ; the host compiler will complain about absence of these
   (defun %simd-pack-low (x) (error "Called %SIMD-PACK-LOW ~S" x))
   (defun %simd-pack-high (x) (error "Called %SIMD-PACK-HIGH ~S" x)))
 
@@ -97,23 +87,20 @@
   (:node-var node)
   (:note "SSE to pointer coercion")
   (:generator 13
-     (with-fixed-allocation (y
-                             simd-pack-widetag
-                             simd-pack-size
-                             node)
+     (fixed-alloc y simd-pack-widetag simd-pack-size node)
        ;; see *simd-pack-element-types*
-       (storew (fixnumize
-                (sc-case x
-                  (single-sse-reg 1)
-                  (double-sse-reg 2)
-                  (int-sse-reg 0)
-                  (t 0)))
-           y simd-pack-tag-slot other-pointer-lowtag)
-       (let ((ea (make-ea-for-object-slot
-                  y simd-pack-lo-value-slot other-pointer-lowtag)))
-         (if (float-sse-p x)
-             (inst movaps ea x)
-             (inst movdqa ea x))))))
+     (storew (fixnumize
+              (sc-case x
+                (single-sse-reg 1)
+                (double-sse-reg 2)
+                (int-sse-reg 0)
+                (t 0)))
+         y simd-pack-tag-slot other-pointer-lowtag)
+     (let ((ea (make-ea-for-object-slot
+                y simd-pack-lo-value-slot other-pointer-lowtag)))
+       (if (float-sse-p x)
+           (inst movaps ea x)
+           (inst movdqa ea x)))))
 (define-move-vop move-from-sse :move
   (int-sse-reg single-sse-reg double-sse-reg) (descriptor-reg))
 
@@ -193,22 +180,11 @@
   (:result-types t)
   (:node-var node)
   (:generator 13
-    (with-fixed-allocation (dst
-                            simd-pack-widetag
-                            simd-pack-size
-                            node)
+    (fixed-alloc dst simd-pack-widetag simd-pack-size node)
       ;; see *simd-pack-element-types*
-      (storew tag
-          dst simd-pack-tag-slot other-pointer-lowtag)
-      (storew lo
-          dst simd-pack-lo-value-slot other-pointer-lowtag)
-      (storew hi
-          dst simd-pack-hi-value-slot other-pointer-lowtag))))
-
-(defun %make-simd-pack (tag low high)
-  (declare (type fixnum tag)
-           (type (unsigned-byte 64) low high))
-  (%make-simd-pack tag low high))
+    (storew tag dst simd-pack-tag-slot other-pointer-lowtag)
+    (storew lo dst simd-pack-lo-value-slot other-pointer-lowtag)
+    (storew hi dst simd-pack-hi-value-slot other-pointer-lowtag)))
 
 (define-vop (%make-simd-pack-ub64)
   (:translate %make-simd-pack-ub64)
@@ -223,10 +199,6 @@
     (inst movd dst lo)
     (inst movd tmp hi)
     (inst punpcklqdq dst tmp)))
-
-(defun %make-simd-pack-ub64 (low high)
-  (declare (type (unsigned-byte 64) low high))
-  (%make-simd-pack-ub64 low high))
 
 #-sb-xc-host
 (declaim (inline %make-simd-pack-ub32))
@@ -267,10 +239,6 @@
     (move tmp hi)
     (inst unpcklpd dst tmp)))
 
-(defun %make-simd-pack-double (low high)
-  (declare (type double-float low high))
-  (%make-simd-pack-double low high))
-
 (define-vop (%make-simd-pack-single)
   (:translate %make-simd-pack-single)
   (:policy :fast-safe)
@@ -288,13 +256,6 @@
     (move tmp y)
     (inst unpcklps tmp w)
     (inst unpcklps dst tmp)))
-
-(defun %make-simd-pack-single (x y z w)
-  (declare (type single-float x y z w))
-  (%make-simd-pack-single x y z w))
-
-(defun %simd-pack-tag (pack)
-  (%simd-pack-tag pack))
 
 (define-vop (%simd-pack-single-item)
   (:args (x :scs (int-sse-reg double-sse-reg single-sse-reg)

@@ -61,7 +61,7 @@
                           'bignum :other))
 
     (setf (svref infos closure-widetag)
-          (make-room-info 0 'closure :closure))
+          (make-room-info short-header-max-words 'closure :closure))
 
     (dotimes (i (length *specialized-array-element-type-properties*))
       (let ((saetp (aref *specialized-array-element-type-properties* i)))
@@ -78,7 +78,7 @@
           (make-room-info 0 'instance :instance))
 
     (setf (svref infos funcallable-instance-widetag)
-          (make-room-info 0 'funcallable-instance :closure))
+          (make-room-info short-header-max-words 'funcallable-instance :closure))
 
     (let ((cons-info (make-room-info 0 'cons :list)))
       ;; A cons consists of two words, both of which may be either a
@@ -192,12 +192,63 @@
             (round-to-dualword (+ (* vector-data-offset n-word-bytes)
                                   n-data-octets)))))
 
+(defun code-component-size (x) ; in bytes
+  (declare (code-component x))
+  (round-to-dualword
+   (+ (* (logand (get-header-data x) short-header-max-words) n-word-bytes)
+      (%code-code-size x))))
+
+(defun primitive-object-size (object)
+  "Return number of bytes of heap or stack directly consumed by OBJECT"
+  (if #+64-bit (= (logand (get-lisp-obj-address object) 3) 3)
+      #-64-bit (oddp (get-lisp-obj-address object))
+      (let ((words
+              (typecase object
+                (cons 2)
+                (instance (1+ (%instance-length object)))
+                (function
+                 (when (= (fun-subtype object) simple-fun-widetag)
+                   (return-from primitive-object-size
+                     (primitive-object-size (fun-code-header object))))
+                 (1+ (get-closure-length object)))
+                ;; NIL is larger than a symbol. I don't care to think about
+                ;; why these fudge factors are right, but they make the result
+                ;; equal to what MAP-ALLOCATED-OBJECTS reports.
+                (null (+ symbol-size 1 #+64-bit 1))
+                ;; Anything else is an OTHER pointer.
+                ;; Use a sizing function when we have one,
+                ;; otherwise the general case is correct.
+                (t
+                 (let ((room-info
+                         (aref *room-info* (%other-pointer-widetag object))))
+                   (typecase object
+                     (array
+                      (cond ((array-header-p object)
+                             (+ array-dimensions-offset (array-rank object)))
+                            ((simple-array-nil-p object) 2)
+                            (t
+                             (return-from primitive-object-size
+                               (nth-value 2 (reconstitute-vector
+                                             object room-info))))))
+                     (code-component
+                      (return-from primitive-object-size (code-component-size object)))
+                     (t
+                      ;; Other things (symbol, fdefn, value-cell, etc)
+                      ;; don't have a sizer, so use GET-HEADER-DATA
+                      (1+ (logand (get-header-data object)
+                                  (logand (get-header-data object)
+                                          (room-info-mask room-info)))))))))))
+        (* (logandc2 (1+ words) 1)      ; round-to-even
+           n-word-bytes))
+      0))
+
 ;;; Given the address (untagged, aligned, and interpreted as a FIXNUM)
 ;;; of a lisp object, return the object, its "type code" (either
 ;;; LIST-POINTER-LOWTAG or a header widetag), and the number of octets
 ;;; required for its storage (including padding and alignment).  Note
 ;;; that this function is designed to NOT CONS, even if called
 ;;; out-of-line.
+;;; FIXME: size calculation should be via PRIMITIVE-OBJECT-SIZE, not reinvented
 (defun reconstitute-object (address)
   (let* ((object-sap (int-sap (get-lisp-obj-address address)))
          (header (sap-ref-word object-sap 0))
@@ -214,7 +265,10 @@
           ;; a non-nil, non-ROOM-INFO object as INFO.
         ((specialized-array-element-type-properties-p info)
          (reconstitute-vector (tagged-object other-pointer-lowtag) info))
-
+        ((= widetag sb-vm:filler-widetag)
+         (values nil
+                 sb-vm:filler-widetag
+                 (boxed-size (logand header-value short-header-max-words))))
         ((null info)
          (error "Unrecognized widetag #x~2,'0X in reconstitute-object"
                 widetag))
@@ -250,10 +304,7 @@
            (let ((c (tagged-object other-pointer-lowtag)))
              (values c
                      code-header-widetag
-                     (round-to-dualword
-                      (+ (* (logand header-value short-header-max-words)
-                            n-word-bytes)
-                         (%code-code-size (truly-the code-component c)))))))))))))
+                     (code-component-size c))))))))))
 
 ;;; Iterate over all the objects in the contiguous block of memory
 ;;; with the low address at START and the high address just before
@@ -269,8 +320,9 @@
      (multiple-value-bind (obj typecode size) (reconstitute-object start)
       ;; SIZE is almost surely a fixnum. Non-fixnum would mean at least
       ;; a 512MB object if 32-bit words, and is inconceivable if 64-bit.
-      (aver (not (logtest (the word size) lowtag-mask)))
-      (funcall fun obj typecode size)
+       (aver (not (logtest (the word size) lowtag-mask)))
+       (unless (= typecode sb-vm:filler-widetag)
+         (funcall fun obj typecode size))
              ;; This special little dance is to add a number of octets
              ;; (and it had best be a number evenly divisible by our
              ;; allocation granularity) to an unboxed, aligned address
@@ -321,7 +373,7 @@
     (define-alien-variable "fixedobj_pages" (* (struct immobile-page))))
   (declaim (inline find-page-index))
   (define-alien-routine ("ext_find_page_index" find-page-index)
-    long (index signed))
+    long (index unsigned))
   (define-alien-variable "last_free_page" sb-kernel::page-index-t)
   (define-alien-variable "page_table" (* (struct page))))
 
@@ -379,7 +431,9 @@ We could try a few things to mitigate this:
 ;;; bytes, including any header and padding. As a special case, if exactly one
 ;;; space named :ALL is requested, then map over the known spaces.
 (defun map-allocated-objects (fun &rest spaces)
-  (declare (type function fun))
+  (declare (type function fun)
+           ;; KLUDGE: rest-arg and self calls do not play nice and it'll get consed
+           (optimize (sb-c::recognize-self-calls 0)))
   (when (and (= (length spaces) 1) (eq (first spaces) :all))
     (return-from map-allocated-objects
      (map-allocated-objects fun
@@ -693,9 +747,11 @@ We could try a few things to mitigate this:
                             sorted))
            (bytes-width (decimal-with-grouped-digits-width total-bytes))
            (objects-width (decimal-with-grouped-digits-width total-objects))
+           (totals-label (format nil "~:(~A~) instance total" space))
            (types-width (reduce #'max interesting
-                                :key (lambda (x) (length (symbol-name (classoid-name (first x)))))
-                                :initial-value 0))
+                                :key (lambda (x)
+                                       (length (symbol-name (classoid-name (first x)))))
+                                :initial-value (length totals-label)))
            (printed-bytes 0)
            (printed-objects 0))
       (declare (unsigned-byte printed-bytes printed-objects))
@@ -710,12 +766,12 @@ We could try a few things to mitigate this:
              (incf printed-bytes bytes)
              (incf printed-objects objects)
              (type-usage type objects bytes))
+        (terpri)
         (let ((residual-objects (- total-objects printed-objects))
               (residual-bytes (- total-bytes printed-bytes)))
           (unless (zerop residual-objects)
-            (type-usage "Other types" residual-bytes residual-objects)))
-        (type-usage (format nil "~:(~A~) instance total" space)
-                    total-bytes total-objects))))
+            (type-usage "Other types" residual-objects residual-bytes)))
+        (type-usage totals-label total-objects total-bytes))))
   (values))
 
 ;;;; PRINT-ALLOCATED-OBJECTS
@@ -1053,3 +1109,15 @@ We could try a few things to mitigate this:
       (format t "~&Used-bytes=~D Pages=~D Waste=~D (~F%)~%"
               n-code-bytes n-pages waste
               (* 100 (/ waste tot))))))
+
+#+gencgc
+(defun generation-of (object)
+  (let* ((addr (get-lisp-obj-address object))
+         (page (find-page-index addr)))
+    (cond ((>= page 0) (slot (deref page-table page) 'gen))
+          #+immobile-space
+          ((immobile-space-addr-p addr)
+           ;; SIMPLE-FUNs don't contain a generation byte
+           (when (simple-fun-p object)
+             (setq addr (get-lisp-obj-address (fun-code-header object))))
+           (logand #xF (sap-ref-8 (int-sap (logandc2 addr lowtag-mask)) 3))))))

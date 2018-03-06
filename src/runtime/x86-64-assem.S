@@ -39,10 +39,14 @@
 
 #ifdef POSITION_INDEPENDENT_ASM
 #define PIC_CALL(x) x@PLT
-#define PIC_VAR(x) x(%rip)
+#define PIC_VAR(x,dest) mov GNAME(x)@GOTPCREL(%rip), dest ; mov (dest), dest
 #else
 #define PIC_CALL(x) x
-#define PIC_VAR(x) x
+#ifdef LISP_FEATURE_DARWIN
+#define PIC_VAR(x,dest) mov GNAME(x)(%rip), dest
+#else
+#define PIC_VAR(x,dest) mov GNAME(x), dest
+#endif
 #endif
 
 /* Get the right type of alignment. Linux, FreeBSD and OpenBSD
@@ -69,7 +73,6 @@
 #if !defined(LISP_FEATURE_WIN32) && !defined(LISP_FEATURE_DARWIN)
 #define TYPE(name) .type name,@function
 #define SIZE(name) .size name,.-name
-#define DOLLAR(name) $(name)
 #else
 #define TYPE(name)
 #define SIZE(name)
@@ -91,20 +94,6 @@
 #define TRAP int3
 #endif
 
-/*
- * More Apple assembler hacks
- */
-
-#if defined(LISP_FEATURE_DARWIN)
-/* global symbol x86-64 sym(%rip) hack:*/
-#define GSYM(name) name(%rip)
-#else
-#define GSYM(name) $name
-#endif
-
-        
-	.text
-        .globl  GNAME(all_threads)
         
 	.text	
 	.globl  GNAME(call_into_lisp_first_time)
@@ -115,6 +104,7 @@
  * anyway */
 	
 	.align	align_16byte,0x90
+	.cfi_startproc
 GNAME(call_into_lisp_first_time):
 	push	%rbp		# Save old frame pointer.
 	mov	%rsp,%rbp	# Establish new frame.
@@ -122,11 +112,7 @@ GNAME(call_into_lisp_first_time):
         movq	__msan_param_tls@GOTTPOFF(%rip), %rax
         movq	%rax, (SYMBOL_VALUE_OFFSET+MSAN_PARAM_TLS)
 #endif
-#if defined(LISP_FEATURE_DARWIN)
-	movq    GSYM(GNAME(all_threads)),%rax
-#else
-        movq    PIC_VAR(GNAME(all_threads)),%rax
-#endif
+	PIC_VAR	(all_threads, %rax)
 	mov     THREAD_CONTROL_STACK_END_OFFSET(%rax) ,%rsp
 	jmp     Lstack
 
@@ -157,60 +143,49 @@ Lstack:
 	push	%r15
 	mov	%rax,%r15
 #endif
+	.cfi_def_cfa rbp, 16
+	.cfi_offset  rbp, -16
 	/* FIXME x86 saves FPU state here */
 	push	%rbx  	# these regs are callee-saved according to C
 	push	%r12	# so must be preserved and restored when 
 	push	%r13    # the lisp function returns
 	push	%r14    #
 	push	%r15    #
-
-	mov	%rsp,%rbx	# remember current stack
-	push	%rbx		# Save entry stack on (maybe) new stack.
-
 	push	%rdi	# args from C
 	push	%rsi	#
 	push	%rdx	#
 #ifdef LISP_FEATURE_SB_THREAD
-# ifdef SUPPORT_FOMIT_FRAME_POINTER
-	mov	(%rbp),%rcx
-	sub	$32,%rsp
-	call	GNAME(carry_frame_pointer)
-	add	$32,%rsp
-	mov	%rax,(%rbp)
-# endif
 #ifdef LISP_FEATURE_GCC_TLS
-	movq	%fs:0, %rax
-	movq	GNAME(current_thread)@TPOFF(%rax), %r12
+	movq	GNAME(current_thread)@GOTTPOFF(%rip), %r12
+	movq	%fs:(%r12), %r12
 #else
-#ifdef LISP_FEATURE_DARWIN
-	mov	GSYM(GNAME(specials)),%rdi
-#else
-	mov	PIC_VAR(specials),%rdi
-#endif
+	PIC_VAR (specials, %rdi)
 	call    PIC_CALL(GNAME(pthread_getspecific))
 	mov	%rax,%r12
 #endif
+#elif defined(LISP_FEATURE_SB_SAFEPOINT)
+        /* We need this to find the CSP trap page.  This does no harm,
+	 * as the compiler doesn't use R12 on non-threaded builds. */
+        PIC_VAR	(all_threads,%r12)
 #endif
 	pop	%rcx	# num args
 	pop	%rbx	# arg vector
 	pop	%rax	# function ptr/lexenv
 
+	# Why do we care what goes in unused argument-passing regs?
+	# These just seem like wasted instructions.
 	xor	%rdx,%rdx	# clear any descriptor registers 
 	xor	%rdi,%rdi	# that we can't be sure we'll 
 	xor	%rsi,%rsi	# initialise properly.  XX do r8-r15 too?
-	cmp	$0,%rcx
-        # It's tempting to think 'cmov' for these assignments, but don't:
-        # cmov does a memory cycle whether or not it moves, succumbing to
-        # a classic buffer overrun bug if argv[] is "badly" placed.
-	je	Ldone
-	mov	0(%rbx),%rdx	# arg0
-	cmp	$1,%rcx
-	je	Ldone
-	mov	8(%rbx),%rdi	# arg1
 	cmp	$2,%rcx
-	je	Ldone
+	je	Ltwo
+	cmp	$1,%rcx
+	je	Lone
+	jl	Lzero
 	mov	16(%rbx),%rsi	# arg2
-Ldone:
+Ltwo:	mov	8(%rbx),%rdi	# arg1
+Lone:	mov	0(%rbx),%rdx	# arg0
+Lzero:
 	shl	$(N_FIXNUM_TAG_BITS),%rcx	# (fixnumize num-args)
 	/* Registers rax, rcx, rdx, rdi, and rsi are now live. */
 	xor	%rbx,%rbx	# available
@@ -219,7 +194,11 @@ Ldone:
 	push	%rbp            # Dummy for return address
 	push	%rbp		# fp in save location S1
 	mov	%rsp,%rbp	# The current sp marks start of new frame.
-
+	# Inform unwinder that the new frame has not been entered yet.
+	# The CFA is what it was (old RBP+16) before the preceding mov.
+	# This sequence encodes DW_CFA_def_cfa_expression
+	# DW_OP_breg6 (rbp): 0 / DW_OP_deref / DW_OP_lit16 / DW_OP_plus
+	.cfi_escape 0x0f, 5, 0x76, 0, 6, 0x40, 0x22
 Lcall:
 	call	*CLOSURE_FUN_OFFSET(%rax)
 	
@@ -228,9 +207,6 @@ Lcall:
 	jnc	LsingleValue	
 	mov	%rbx, %rsp
 LsingleValue:	
-
-/* Restore the stack, in case there was a stack change. */
-	pop	%rsp		# c-sp
 
 /* Restore C regs */
 	pop	%r15
@@ -250,6 +226,7 @@ LsingleValue:
 	leave
 #endif
 	ret
+	.cfi_endproc
 	SIZE(GNAME(call_into_lisp))
 
 #ifdef LISP_FEATURE_SB_THREAD
@@ -318,8 +295,8 @@ GNAME(fun_end_breakpoint_guts):
 	mov	%rsp,%rbx	# Setup ebx - the ofp.
 	sub	$8,%rsp		# Allocate one stack slot for the return value
 	mov	$(1 << N_FIXNUM_TAG_BITS),%rcx		# Setup ecx for one return value.
-	mov	GSYM(NIL),%rdi	# default second value
-	mov	GSYM(NIL),%rsi	# default third value
+	mov	$(NIL),%rdi	# default second value
+	mov	$(NIL),%rsi	# default third value
 multiple_value_return:
 	
 	.globl  GNAME(fun_end_breakpoint_trap)
@@ -341,6 +318,34 @@ GNAME(do_pending_interrupt):
 	.byte 	trap_PendingInterrupt
 	ret
 	SIZE(GNAME(do_pending_interrupt))
+
+#ifdef LISP_FEATURE_SB_SAFEPOINT
+	.globl 	GNAME(handle_global_safepoint_violation)
+	TYPE(GNAME(handle_global_safepoint_violation))
+	.align	align_16byte,0x90
+GNAME(handle_global_safepoint_violation):
+	TRAP
+	.byte 	trap_GlobalSafepoint
+	ret
+	SIZE(GNAME(handle_global_safepoint_violation))
+
+	.globl 	GNAME(handle_csp_safepoint_violation)
+	TYPE(GNAME(handle_csp_safepoint_violation))
+	.align	align_16byte,0x90
+GNAME(handle_csp_safepoint_violation):
+	TRAP
+	.byte 	trap_CspSafepoint
+	ret
+	SIZE(GNAME(handle_csp_safepoint_violation))
+#endif /* SB-SAFEPOINT */
+
+	.globl 	GNAME(memory_fault_emulation_trap)
+	TYPE(GNAME(memory_fault_emulation_trap))
+	.align	align_16byte,0x90
+GNAME(memory_fault_emulation_trap):
+	TRAP
+	.byte 	trap_MemoryFaultEmulation
+	SIZE(GNAME(memory_fault_emulation_trap))
 
 	.globl	GNAME(post_signal_tramp)
 	TYPE(GNAME(post_signal_tramp))
@@ -391,11 +396,7 @@ GNAME(arch_scrub_control_stack):
 	 * guard page upper bound in R8, and our hard guard
 	 * page upper bound in R9. */
 	lea	-8(%rsp), %rax
-#ifdef LISP_FEATURE_DARWIN
-	mov	GSYM(GNAME(os_vm_page_size)),%r9
-#else
-	mov	PIC_VAR(os_vm_page_size),%r9
-#endif
+	PIC_VAR(os_vm_page_size, %r9)
 	lea	(%rsi,%r9), %r8
 	lea	(%rdx,%r9), %r9
 

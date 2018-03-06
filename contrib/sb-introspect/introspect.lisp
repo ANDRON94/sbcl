@@ -825,29 +825,24 @@ Experimental: interface subject to change."
                          (let* ((index (sb-vm::find-page-index addr))
                                 (flags (sb-alien:slot page 'sb-vm::flags))
                                 .
-                                ;; The unused fields WP-CLR and PINS are
-                                ;; to make it easier for the human to count.
+                                ;; The unused WP-CLR is for ease of counting
                                 #+big-endian
-                                ((allocated (ldb (byte 3 5) flags))
-                                 (wp        (logbitp 4 flags))
-                                 (wp-clr    (logbitp 3 flags))
-                                 (dontmove  (logbitp 2 flags))
-                                 (pins      (logbitp 1 flags))
-                                 (large     (logbitp 0 flags)))
+                                ((type      (ldb (byte 5 3) flags))
+                                 (wp        (logbitp 2 flags))
+                                 (wp-clr    (logbitp 1 flags))
+                                 (dontmove  (logbitp 0 flags)))
                                 #+little-endian
-                                ((allocated (ldb (byte 3 0) flags))
-                                 (wp        (logbitp 3 flags))
-                                 (wp-clr    (logbitp 4 flags))
-                                 (dontmove  (logbitp 5 flags))
-                                 (pins      (logbitp 6 flags))
-                                 (large     (logbitp 7 flags))))
-                           (declare (ignore wp-clr pins))
+                                ((type      (ldb (byte 5 0) flags))
+                                 (wp        (logbitp 5 flags))
+                                 (wp-clr    (logbitp 6 flags))
+                                 (dontmove  (logbitp 7 flags))))
+                           (declare (ignore wp-clr))
                            (list :space space
                                  :generation (sb-alien:slot page 'sb-vm::gen)
                                  :write-protected wp
-                                 :boxed (logbitp 0 allocated)
+                                 :boxed (logbitp 0 type)
                                  :pinned dontmove
-                                 :large large
+                                 :large (logbitp 4 type)
                                  :page index)))
                        (list :space space))
                    #-gencgc
@@ -1017,3 +1012,14 @@ Experimental: interface subject to change."
             (warn "~&MAP-ROOT: Unknown widetag ~S: ~S~%"
                   (sb-kernel:widetag-of object) object)))))))
   object)
+
+(defun object-size (object)
+  (+ (sb-vm::primitive-object-size object)
+     (typecase object
+       (sb-mop:funcallable-standard-object
+        (sb-vm::primitive-object-size
+         (sb-pcl::standard-funcallable-instance-clos-slots object)))
+       (standard-object
+        (sb-vm::primitive-object-size
+         (sb-pcl::standard-instance-slots object)))
+       (t 0))))

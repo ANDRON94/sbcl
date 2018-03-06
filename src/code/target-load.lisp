@@ -237,27 +237,18 @@
   (declare (fixnum box-num code-length))
   (declare (simple-vector stack) (type index ptr))
   (let* ((debug-info-index (+ ptr box-num))
-         (toplevel-p (svref stack (1+ debug-info-index)))
-         (code (sb!c:allocate-code-object (not toplevel-p) box-num code-length)))
-    (declare (ignorable toplevel-p))
+         (immobile-p (svref stack (1+ debug-info-index)))
+         (code (sb!c:allocate-code-object immobile-p box-num code-length)))
     (setf (%code-debug-info code) (svref stack debug-info-index))
     (loop for i of-type index from sb!vm:code-constants-offset
           for j of-type index from ptr below debug-info-index
           do (setf (code-header-ref code i) (svref stack j)))
-    (without-gcing
-      ;; FIXME: can this be WITH-PINNED-OBJECTS? Probably.
-      ;; We must pin the range of bytes containing instructions,
-      ;; but we also must prevent scavenging the code object until
-      ;; the embedded simple-funs have been installed,
-      ;; otherwise GC could assert that the word referenced by
-      ;; a fun offset does not have the right widetag.
-      ;; This is achieved by not writing the 'nfuns' value
-      ;; until after the loop which stores the offsets.
+    (with-pinned-objects (code)
       (read-n-bytes (%fasl-input-stream fasl-input)
                     (code-instructions code) 0 code-length)
-      (loop for i from (1- nfuns) downto 0
-            do (sb!c::new-simple-fun code i (read-varint-arg fasl-input)
-                                     nfuns)))
+      (sb!c::set-code-entrypoints
+       code (loop repeat nfuns collect (read-varint-arg fasl-input)))
+      (sb!c::apply-fasl-fixups stack code))
     code))
 
 ;;;; linkage fixups
@@ -265,11 +256,30 @@
 ;;; how we learn about assembler routines at startup
 (defvar *!initial-assembler-routines*)
 
+(defun get-asm-routine (name &aux (code *assembler-routines*))
+  (awhen (gethash (the symbol name) (car (%code-debug-info code)))
+    (sap-int (sap+ (code-instructions code) (car it)))))
+
 (defun !loader-cold-init ()
-  (dovector (routine *!initial-assembler-routines*)
-    (destructuring-bind (name code offset) routine
-      (setf (gethash name *assembler-routines*)
-            (sap-int (sap+ (code-instructions code) offset))))))
+  (let* ((code *assembler-routines*)
+         (size (%code-code-size code))
+         (vector (the simple-vector *!initial-assembler-routines*))
+         (count (length vector))
+         (ht (make-hash-table :test 'eq)))
+    ;; code-debug-info stores the name->addr hashtable, but readonly
+    ;; space can't point to dynamic space. indirect through a static cons
+    (setf (%code-debug-info code)
+          (rplaca (let ((ptr (sap-int sb!vm:*static-space-free-pointer*)))
+                    (setf sb!vm:*static-space-free-pointer*
+                          (int-sap (+ ptr (* sb!vm:n-word-bytes 2))))
+                    (%make-lisp-obj (logior ptr sb!vm:list-pointer-lowtag)))
+                  ht))
+    (dotimes (i count)
+      (destructuring-bind (name . offset) (svref vector i)
+        (let ((next-offset (if (< (1+ i) count) (cdr (svref vector (1+ i))) size)))
+          (aver (> next-offset offset))
+          ;; store inclusive bounds on PC offset range
+          (setf (gethash name ht) (cons offset (1- next-offset))))))))
 
 (defun !warm-load (file)
   (restart-case (let ((sb!c::*source-namestring*

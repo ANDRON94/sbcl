@@ -255,7 +255,8 @@ os_init(char *argv[], char *envp[])
      * Since randomization is currently implemented only on x86 kernels,
      * don't do this trick on other platforms.
      */
-#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+#if (defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)) \
+     && (!defined(DISABLE_ASLR) || DISABLE_ASLR)
     if ((major_version == 2
          /* Some old kernels will apparently lose unsupported personality flags
           * on exec() */
@@ -299,9 +300,6 @@ os_init(char *argv[], char *envp[])
              * way we might as well continue, and hope that the random
              * memory maps are ok this time around.
              */
-            fprintf(stderr, "WARNING:\
-\nCouldn't re-execute SBCL with proper personality flags (/proc isn't mounted? setuid?)\
-\nTrying to continue anyway.\n");
         } else if (getenv("SBCL_IS_RESTARTING")) {
             /* We restarted due to previously enabled ASLR.  Now,
              * reenable it for fork()'ed children. */
@@ -327,7 +325,14 @@ os_init(char *argv[], char *envp[])
  * information loss, we have to make sure it allocates all its ram in the
  * 0-2Gb region.  */
 
-static void * under_2gb_free_pointer=DYNAMIC_1_SPACE_END;
+static void * under_2gb_free_pointer;
+os_set_cheneygc_spaces(uword_t space0_start, uword_t space1_start)
+{
+    uword_t max;
+    max = (space1_start > space0_start) ? space1_start : space0_start;
+    under_2gb_free_pointer = max + dynamic_space_size;
+}
+
 #endif
 
 os_vm_address_t
@@ -467,12 +472,7 @@ os_install_interrupt_handlers(void)
 char *
 os_get_runtime_executable_path(int external)
 {
-    /* XXX: If this code is compiled with MSAN, all is well.
-       But if this code is compiled without MSAN, there is a false positive
-       in copied_string() unless we zero-initialize path[].
-       Basically if you want sanitization, the right thing is to compile
-       *all* the source code with the sanitizer, not just some of it. */
-    char path[PATH_MAX + 1] = {0};
+    char path[PATH_MAX + 1];
     int size;
 
     size = readlink("/proc/self/exe", path, sizeof(path)-1);

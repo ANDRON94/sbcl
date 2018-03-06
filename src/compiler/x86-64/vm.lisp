@@ -37,14 +37,13 @@
                     ;; (in the same file) depends on compile-time evaluation
                     ;; of the DEFCONSTANT. -- AL 20010224
                 (defconstant ,(symbolicate name "-OFFSET") ,offset)))
-           ;; FIXME: It looks to me as though DEFREGSET should also
-           ;; define the related *FOO-REGISTER-NAMES* variable.
            (defregset (name &rest regs)
-             `(eval-when (:compile-toplevel :load-toplevel :execute)
-                (defparameter ,name
+             ;; FIXME: this would be DEFCONSTANT-EQX were it not
+             ;; for all the style-warnings about earmuffs on a constant.
+             `(defglobal ,name
                   (list ,@(mapcar (lambda (name)
                                     (symbolicate name "-OFFSET"))
-                                  regs))))))
+                                  regs)))))
 
   ;; byte registers
   ;;
@@ -199,8 +198,8 @@
 
 ;;;; SC definitions
 
-(!define-storage-classes
-
+(eval-when (:compile-toplevel :execute)
+(defparameter *storage-class-defs* '(
   ;; non-immediate constants in the constant pool
   (constant constant)
 
@@ -379,9 +378,8 @@
                   :alternate-scs (single-sse-stack))
 
   (catch-block stack :element-size catch-block-size)
-  (unwind-block stack :element-size unwind-block-size))
+  (unwind-block stack :element-size unwind-block-size)))
 
-(eval-when (:compile-toplevel :load-toplevel :execute)
 (defparameter *byte-sc-names*
   '(#!-sb-unicode character-reg byte-reg #!-sb-unicode character-stack))
 (defparameter *word-sc-names* '(word-reg))
@@ -399,26 +397,36 @@
 (defparameter *complex-sc-names* '(complex-single-reg complex-single-stack
                                    complex-double-reg complex-double-stack))
 #!+sb-simd-pack
+;;; FIXME: there is no SSE-STACK storage class
 (defparameter *oword-sc-names* '(sse-reg int-sse-reg single-sse-reg double-sse-reg
                                  sse-stack int-sse-stack single-sse-stack double-sse-stack))
 ) ; EVAL-WHEN
+(!define-storage-classes
+  . #.(mapcar (lambda (class-spec)
+                (let ((size
+                       (case (car class-spec)
+                         (#.*oword-sc-names*   :oword)
+                         (#.*qword-sc-names*   :qword)
+                         (#.*dword-sc-names*   :dword)
+                         (#.*word-sc-names*    :word)
+                         (#.*byte-sc-names*    :byte)
+                         (#.*float-sc-names*   :float)
+                         (#.*double-sc-names*  :double)
+                         (#.*complex-sc-names* :complex))))
+                  (append class-spec (if size (list :operand-size size)))))
+              *storage-class-defs*))
 
 ;;;; miscellaneous TNs for the various registers
 
 (macrolet ((def-misc-reg-tns (sc-name &rest reg-names)
              (collect ((forms))
-                      (dolist (reg-name reg-names)
-                        (let ((tn-name (symbolicate reg-name "-TN"))
-                              (offset-name (symbolicate reg-name "-OFFSET")))
-                          ;; FIXME: It'd be good to have the special
-                          ;; variables here be named with the *FOO*
-                          ;; convention.
-                          (forms `(defglobal ,tn-name
-                                    (make-random-tn :kind :normal
-                                                    :sc (sc-or-lose ',sc-name)
-                                                    :offset
-                                                    ,offset-name)))))
-                      `(progn ,@(forms)))))
+               (dolist (reg-name reg-names `(progn ,@(forms)))
+                 (let ((tn-name (symbolicate reg-name "-TN"))
+                       (offset-name (symbolicate reg-name "-OFFSET")))
+                   (forms `(defglobal ,tn-name
+                               (make-random-tn :kind :normal
+                                               :sc (sc-or-lose ',sc-name)
+                                               :offset ,offset-name))))))))
 
   (def-misc-reg-tns unsigned-reg rax rbx rcx rdx rbp rsp rdi rsi
                     r8 r9 r10 r11 r12 r13 r14 r15)
@@ -439,7 +447,14 @@
                          (:byte 'byte-reg)
                          (:word 'word-reg)
                          (:dword 'dword-reg)
-                         (:qword 'unsigned-reg)))
+                         (:qword 'unsigned-reg)
+                         ;; PC inside immobile code can fit into 32 bits
+                         (:immobile-code-pc
+                          (cond #!+immobile-code
+                                (sb!c::*code-is-immobile*
+                                 'dword-reg)
+                                (t
+                                 'unsigned-reg)))))
                   :offset (tn-offset tn)))
 
 ;; A register that's never used by the code generator, and can therefore
@@ -448,14 +463,17 @@
 (defglobal temp-reg-tn r11-tn)
 
 ;;; TNs for registers used to pass arguments
-(defparameter *register-arg-tns*
+;;; This can't be a DEFCONSTANT-EQX, for a similar reason to above, but worse.
+;;; Among the problems, RECEIVE-UNKNOWN-VALUES uses (FIRST *REGISTER-ARG-TNS*)
+;;; and so the compiler knows that the object is constant and wants to dump it
+;;; as such; it has no name, so it's not even reasonable to expect it to
+;;; use the corresponding object in RDX-TN.
+(defglobal *register-arg-tns*
   (mapcar (lambda (register-arg-name)
             (symbol-value (symbolicate register-arg-name "-TN")))
           *register-arg-names*))
 
-(defglobal thread-base-tn
-  (make-random-tn :kind :normal :sc (sc-or-lose 'unsigned-reg)
-                  :offset r12-offset))
+(defglobal thread-base-tn r12-tn)
 
 ;;; If value can be represented as an immediate constant, then return
 ;;; the appropriate SC number, otherwise return NIL.
@@ -563,22 +581,18 @@
          (offset (tn-offset tn)))
     (ecase sb
       (registers
-       (let* ((sc-name (sc-name sc))
-              (index (ash offset -1))
-              (name-vec (cond ((member sc-name *byte-sc-names*)
-                               +byte-register-names+)
-                              ((member sc-name *word-sc-names*)
-                               +word-register-names+)
-                              ((member sc-name *dword-sc-names*)
-                               +dword-register-names+)
-                              ((member sc-name *qword-sc-names*)
-                               +qword-register-names+))))
+       (let ((index (ash offset -1))
+             (name-vec (case (sb!c:sc-operand-size sc)
+                         (:byte  +byte-register-names+)
+                         (:word  +word-register-names+)
+                         (:dword +dword-register-names+)
+                         (:qword +qword-register-names+))))
          (or (and name-vec
                   (evenp offset)
                   (< -1 index (length name-vec))
                   (svref name-vec index))
              ;; FIXME: Shouldn't this be an ERROR?
-             (format nil "<unknown reg: off=~W, sc=~A>" offset sc-name))))
+             (format nil "<unknown reg: off=~W, sc=~A>" offset (sc-name sc)))))
       (float-registers (format nil "FLOAT~D" offset))
       (stack (format nil "S~D" offset))
       (constant (format nil "Const~D" offset))

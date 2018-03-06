@@ -30,6 +30,7 @@
 #include "os.h"
 #include "arch.h"
 #include "interr.h"
+#include "immobile-space.h"
 #if defined(LISP_FEATURE_OS_PROVIDES_DLOPEN) && !defined(LISP_FEATURE_WIN32)
 # include <dlfcn.h>
 #endif
@@ -194,7 +195,7 @@ void os_link_runtime()
     for (j = 0 ; j < n ; ++j)
     {
         lispobj item = symbols->data[j];
-        datap = lowtag_of(item) == LIST_POINTER_LOWTAG;
+        datap = listp(item);
         symbol_name = datap ? CONS(item)->car : item;
         namechars = (void*)(intptr_t)(VECTOR(symbol_name)->data);
 #ifdef MEMORY_SANITIZER
@@ -261,8 +262,10 @@ gc_managed_addr_p(lispobj ad)
             ad < (DYNAMIC_SPACE_START + dynamic_space_size))
         || immobile_space_p(ad)
 #else
-        || (DYNAMIC_0_SPACE_START <= ad && ad < DYNAMIC_0_SPACE_END)
-        || (DYNAMIC_1_SPACE_START <= ad && ad < DYNAMIC_1_SPACE_END)
+        || (DYNAMIC_0_SPACE_START <= ad &&
+            ad < DYNAMIC_0_SPACE_START + dynamic_space_size)
+        || (DYNAMIC_1_SPACE_START <= ad &&
+            ad < DYNAMIC_1_SPACE_START + dynamic_space_size)
 #endif
         )
         return 1;

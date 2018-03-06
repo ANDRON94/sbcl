@@ -389,7 +389,7 @@
 ;; executed.
 #!+sb-show
 (defvar *show-fops-p* nil)
-(defvar *fasl-source-info*)
+
 ;;;
 ;;; a helper function for LOAD-AS-FASL
 ;;;
@@ -408,15 +408,12 @@
   ;;
   (declare (ignorable print))
   (let ((stream (%fasl-input-stream fasl-input))
-        *fasl-source-info*
-        #!+sb-show (trace *show-fops-p*))
+        (trace #!+sb-show *show-fops-p*))
     (unless (check-fasl-header stream)
       (return-from load-fasl-group))
     (catch 'fasl-group-end
      (setf (svref (%fasl-input-table fasl-input) 0) 0)
-     (macrolet ((tracing (&body forms)
-                  #!+sb-show `(when trace ,@forms)
-                  #!-sb-show (progn forms nil)))
+     (macrolet ((tracing (&body forms) `(when trace ,@forms)))
       (loop
        (let* ((byte (the (unsigned-byte 8) (read-byte stream)))
               (function (svref **fop-funs** byte))
@@ -427,8 +424,7 @@
                   (1- (file-position stream))
                   (svref (%fasl-input-stack fasl-input) 0) ; stack pointer
                   (svref (%fasl-input-table fasl-input) 0) ; table pointer
-                  byte (and (functionp function)
-                            (nth-value 2 (function-lambda-expression function)))))
+                  byte (and (functionp function) (%fun-name function))))
          ;; Actually execute the fop.
          (let ((result
                  (cond ((not (functionp function))

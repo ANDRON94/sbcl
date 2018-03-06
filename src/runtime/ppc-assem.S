@@ -286,11 +286,8 @@ x:
 #endif
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
-/* OAOOM because we don't have the C headers here. */
-# define THREAD_CSP_PAGE_SIZE 4096
-
 /* the CSP page sits right before the thread */
-# define THREAD_SAVED_CSP_OFFSET (-THREAD_CSP_PAGE_SIZE)
+# define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
 #endif
 
 	.text
@@ -514,7 +511,12 @@ lra:
 
 #ifdef LISP_FEATURE_SB_SAFEPOINT
 	/* OK to run GC without stopping this thread from this point on. */
+#  ifdef LISP_FEATURE_SB_THREAD
 	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
+#  else
+	load(reg_CFUNC,CSYMBOL(all_threads))
+	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_CFUNC)
+#  endif
 #endif
 
 	mr reg_NL3,reg_NARGS
@@ -562,7 +564,12 @@ lra:
 
 # ifdef LISP_FEATURE_SB_SAFEPOINT
 	/* No longer OK to run GC except at safepoints. */
+#  ifdef LISP_FEATURE_SB_THREAD
 	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
+#  else
+	load(reg_BSP,CSYMBOL(all_threads))
+	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_BSP)
+#  endif
 # endif
 
 	/* Atomic ... */
@@ -600,12 +607,13 @@ lra:
 	add reg_LIP,reg_CODE,reg_LIP
 	la reg_LIP,-OTHER_POINTER_LOWTAG(reg_LIP)
 
+        /* Debugger expects LR to be valid when we come out of PA */
+	mtlr reg_LIP
+
 	/* No longer atomic */
 	subi reg_ALLOC, reg_ALLOC, flag_PseudoAtomic
 	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
 	twnei reg_NL3, 0
-
-	mtlr reg_LIP
 	
 	/* Reset the lisp stack. */
 	mr reg_CSP,reg_CFP

@@ -12,12 +12,6 @@
 
 (in-package "SB!IMPL")
 
-;;; ** weak_hash_entry_alivep_fun[] in gc-common must
-;;;    coincide with this ordering of table kinds
-(defconstant-eqx weak-hash-table-kinds
-    #(nil :key :value :key-and-value :key-or-value)
-  #'equalp)
-
 ;;; HASH-TABLE is implemented as a STRUCTURE-OBJECT.
 (sb!xc:defstruct (hash-table (:copier nil)
                              (:constructor %make-hash-table
@@ -28,11 +22,10 @@
                                 rehash-threshold
                                 rehash-trigger
                                 table
-                                %weakness
                                 index-vector
                                 next-vector
                                 hash-vector
-                                synchronized-p)))
+                                flags)))
   ;; The type of hash table this is. Only used for printing and as
   ;; part of the exported interface.
   (test nil :type symbol :read-only t)
@@ -61,9 +54,9 @@
   ;; This slot is used to link weak hash tables during GC. When the GC
   ;; isn't running it is always NIL.
   (next-weak-hash-table nil :type null)
-  ;; Non-NIL if this is some kind of weak hash table. For details see
-  ;; the docstring of MAKE-HASH-TABLE.
-  (%weakness nil :type (integer 0 4) :read-only t)
+  ;; flags: WEAKNESS-KIND | FINALIZERSP | SYNCHRONIZEDP | WEAKP
+  ;; WEAKNESS-KIND is 2 bits, the rest are 1 bit each
+  (flags 0 :type (unsigned-byte 5) :read-only t)
   ;; Index into the Next vector chaining together free slots in the KV
   ;; vector.
   (next-free-kv 0 :type index)
@@ -87,8 +80,8 @@
   ;; Used for locking GETHASH/(SETF GETHASH)/REMHASH
   (lock (sb!thread:make-mutex :name "hash-table lock")
         :type sb!thread:mutex :read-only t)
-  ;; Has user requested synchronization?
-  (synchronized-p nil :type (member nil t) :read-only t)
+  ;; List of values culled out during GC of weak hash table.
+  (culled-values nil :type list)
   ;; For detecting concurrent accesses.
   #!+sb-hash-table-debug
   (signal-concurrent-access t :type (member nil t))

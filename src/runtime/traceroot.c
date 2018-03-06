@@ -9,6 +9,7 @@
 #include "genesis/cons.h"
 #include "genesis/constants.h"
 #include "genesis/gc-tables.h"
+#include "genesis/hash-table.h"
 #include "genesis/instance.h"
 #include "genesis/layout.h"
 #include "genesis/package.h"
@@ -72,7 +73,7 @@ static int gen_of(lispobj obj) {
     return -1;
 }
 
-const char* classify_obj(lispobj ptr)
+static const char* classify_obj(lispobj ptr)
 {
     extern lispobj* instance_classoid_name(lispobj*);
 
@@ -120,8 +121,7 @@ static void add_to_layer(lispobj* obj, int wordindex,
 /// otherwise return obj directly.
 static lispobj canonical_obj(lispobj obj)
 {
-    if (lowtag_of(obj) == FUN_POINTER_LOWTAG &&
-        widetag_of(*native_pointer(obj)) == SIMPLE_FUN_WIDETAG)
+    if (functionp(obj) && widetag_of(*native_pointer(obj)) == SIMPLE_FUN_WIDETAG)
         return make_lispobj(fun_code_header(obj-FUN_POINTER_LOWTAG),
                             OTHER_POINTER_LOWTAG);
     return obj;
@@ -222,7 +222,7 @@ static inline int interestingp(lispobj ptr, struct hopscotch_table* targets)
 /* Try to find the call frame that contains 'addr', which is the address
  * in which a conservative root was seen.
  * Return the program counter associated with that frame. */
-static char* deduce_thread_pc(struct thread* th, void** addr)
+static char* NO_SANITIZE_MEMORY deduce_thread_pc(struct thread* th, void** addr)
 {
     uword_t* fp = __builtin_frame_address(0);
     char* return_pc = 0;
@@ -251,8 +251,8 @@ static void compare_pointer(void *addr) {
 
 /* Figure out which thread's control stack contains 'pointer'
  * and the PC within the active function in the referencing frame  */
-static struct thread* deduce_thread(void (*context_scanner)(),
-                                    uword_t pointer, char** pc)
+static struct thread* NO_SANITIZE_MEMORY
+deduce_thread(void (*context_scanner)(), uword_t pointer, char** pc)
 {
     struct thread *th;
 
@@ -384,7 +384,7 @@ static lispobj examine_stacks(struct hopscotch_table* targets,
     return 0;
 }
 
-void free_graph(struct layer* layer)
+static void free_graph(struct layer* layer)
 {
     while (layer) {
         free(layer->nodes);
@@ -394,7 +394,7 @@ void free_graph(struct layer* layer)
     }
 }
 
-struct node* find_node(struct layer* layer, lispobj ptr)
+static struct node* find_node(struct layer* layer, lispobj ptr)
 {
     int i;
     for(i=layer->count-1; i>=0; --i)
@@ -429,7 +429,7 @@ static inline lispobj decode_pointer(uint32_t encoding)
         return encoding; // Literal pointer
 }
 
-struct simple_fun* simple_fun_from_pc(char* pc)
+static struct simple_fun* simple_fun_from_pc(char* pc)
 {
     struct code* code = (struct code*)component_ptr_from_pc((lispobj*)pc);
     if (!code) return 0;
@@ -450,11 +450,14 @@ static void maybe_show_object_name(lispobj obj, FILE* stream)
     if (lowtag_of(obj)==OTHER_POINTER_LOWTAG)
         switch(widetag_of(*native_pointer(obj))) {
         case SYMBOL_WIDETAG:
-            package = SYMBOL(obj)->package;
-            package_name = ((struct package*)native_pointer(package))->_name;
             putc(',', stream);
-            safely_show_lstring(native_pointer(package_name), 0, stream);
-            fputs("::", stream);
+            if ((package = SYMBOL(obj)->package) == NIL) {
+                fprintf(stream, "#:");
+            } else {
+                package_name = ((struct package*)native_pointer(package))->_name;
+                safely_show_lstring(native_pointer(package_name), 0, stream);
+                fputs("::", stream);
+            }
             safely_show_lstring(native_pointer(SYMBOL(obj)->name), 0, stream);
             break;
         }
@@ -634,19 +637,17 @@ static void trace1(lispobj object,
             fprintf(file, "(g%d,", gen_of(ptr));
         fputs(classify_obj(ptr), file);
         maybe_show_object_name(ptr, file);
-        fprintf(file, ")%p[%d]->", (void*)ptr, next.wordindex);
+        fprintf(file, ")#x%"OBJ_FMTX"[%d]->", ptr, next.wordindex);
         target = native_pointer(ptr)[next.wordindex];
         // Special-case a few combinations of <type,wordindex>
         switch (next.wordindex) {
         case 0:
-            if (lowtag_of(ptr) == INSTANCE_POINTER_LOWTAG  ||
-                lowtag_of(ptr) == FUN_POINTER_LOWTAG)
+            if (instancep(ptr) || functionp(ptr))
                 target = instance_layout(native_pointer(ptr));
             break;
 #if FUN_SELF_FIXNUM_TAGGED
         case 1:
-            if (lowtag_of(ptr) == FUN_POINTER_LOWTAG &&
-                widetag_of(*native_pointer(ptr)) == CLOSURE_WIDETAG)
+            if (functionp(ptr) && widetag_of(*native_pointer(ptr)) == CLOSURE_WIDETAG)
                 target -= FUN_RAW_ADDR_OFFSET;
             break;
 #endif
@@ -668,7 +669,7 @@ static void trace1(lispobj object,
             gc_assert(object == target);
         }
     }
-    fprintf(file, "%p.\n", (void*)target);
+    fprintf(file, "#x%"OBJ_FMTX".\n", target);
     fflush(file);
 }
 
@@ -750,6 +751,27 @@ static uword_t build_refs(lispobj* where, lispobj* end,
         case FDEFN_WIDETAG:
             check_ptr(fdefn_callee_lispobj((struct fdefn*)where));
             scan_limit = 3;
+            break;
+        case SIMPLE_VECTOR_WIDETAG:
+            // For weak hash-table vectors, a <k,v> pair may participate in
+            // a path from the root only if it does not involve whichever
+            // object is definitely weak. This fails on weak key-OR-value
+            // tables since we can't decide whether to allow the entry.
+            if (is_vector_subtype(*where, VectorValidHashing)) {
+                lispobj lhash_table = where[2];
+                gc_assert(instancep(lhash_table));
+                struct hash_table* hash_table =
+                  (struct hash_table *)native_pointer(lhash_table);
+                int weakness = hashtable_weakness(hash_table);
+                if (hashtable_weakp(hash_table) &&
+                    (weakness == 1 || weakness == 2)) { // 1=key, 2=value
+                    // Skip the first 4 words which are:
+                    //  header, length, vector->table backpointer, rehash-p
+                    int start = (weakness == 1) ? 5 : 4;
+                    for(i=start; i<scan_limit; i+=2) check_ptr(where[i]);
+                    continue;
+                }
+            }
             break;
         default:
             if (!(other_immediate_lowtag_p(widetag) && lowtag_for_widetag[widetag>>2]))
@@ -888,9 +910,7 @@ void gc_prove_liveness(void(*context_scanner)(),
 {
     int n_watched = 0, n_live = 0, n_bad = 0;
     lispobj list;
-    for ( list = objects ;
-          list != NIL && lowtag_of(list) == LIST_POINTER_LOWTAG ;
-          list = CONS(list)->cdr ) {
+    for (list = objects ; list != NIL && listp(list) ; list = CONS(list)->cdr) {
         ++n_watched;
         lispobj car = CONS(list)->car;
         if ((lowtag_of(car) != OTHER_POINTER_LOWTAG ||
@@ -900,7 +920,7 @@ void gc_prove_liveness(void(*context_scanner)(),
             n_live += ((struct weak_pointer*)native_pointer(car))->value
                 != UNBOUND_MARKER_WIDETAG;
     }
-    if (lowtag_of(list) != LIST_POINTER_LOWTAG || n_bad) {
+    if (!listp(list) || n_bad) {
         fprintf(stderr, "; Bad value in liveness tracker\n");
         return;
     }

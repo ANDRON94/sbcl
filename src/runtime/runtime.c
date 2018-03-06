@@ -124,7 +124,7 @@ copied_string(char *string)
     return strcpy(successful_malloc(1+strlen(string)), string);
 }
 
-char *
+static char *
 copied_existing_filename_or_null(char *filename)
 {
     struct stat filename_stat;
@@ -136,7 +136,7 @@ copied_existing_filename_or_null(char *filename)
 }
 
 #ifndef LISP_FEATURE_WIN32
-char *
+static char *
 copied_realpath(const char *pathname)
 {
     char *messy, *tidy;
@@ -168,7 +168,7 @@ copied_realpath(const char *pathname)
 
 /* miscellaneous chattiness */
 
-void
+static void
 print_help()
 {
     puts(
@@ -203,13 +203,13 @@ should be installed along with SBCL, and is also available from the\n\
 website <http://www.sbcl.org/>.\n");
 }
 
-void
+static void
 print_version()
 {
     printf("SBCL %s\n", SBCL_VERSION_STRING);
 }
 
-void
+static void
 print_banner()
 {
     printf(
@@ -234,7 +234,7 @@ and resources this platform demands.\n\
 /* Look for a core file to load, first in the directory named by the
  * SBCL_HOME environment variable, then in a hardcoded default
  * location.  Returns a malloced copy of the core filename. */
-char *
+static char *
 search_for_core ()
 {
     char *env_sbcl_home = getenv("SBCL_HOME");
@@ -263,13 +263,13 @@ search_for_core ()
 /* Try to find the path to an executable from argv[0], this is only
  * used when os_get_runtime_executable_path() returns NULL */
 #ifdef LISP_FEATURE_WIN32
-char *
+static char *
 search_for_executable(const char *argv0)
 {
     return NULL;
 }
 #else /* LISP_FEATURE_WIN32 */
-char *
+static char *
 search_for_executable(const char *argv0)
 {
     char *search, *start, *end, *buf;
@@ -318,7 +318,7 @@ search_for_executable(const char *argv0)
 }
 #endif /* LISP_FEATURE_WIN32 */
 
-size_t
+static size_t
 parse_size_arg(char *arg, char *arg_name)
 {
   char *tail, *power_name;
@@ -364,14 +364,12 @@ parse_size_arg(char *arg, char *arg_name)
 char **posix_argv;
 char *core_string;
 
-struct runtime_options *runtime_options;
-
 char *saved_runtime_path = NULL;
 #if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
 void pthreads_win32_init();
 #endif
 
-void print_locale_variable(const char *name)
+static void print_locale_variable(const char *name)
 {
   char *value = getenv(name);
 
@@ -380,7 +378,7 @@ void print_locale_variable(const char *name)
   }
 }
 
-void setup_locale()
+static void setup_locale()
 {
   if(setlocale(LC_ALL, "") == NULL) {
 #ifndef LISP_FEATURE_WIN32
@@ -414,7 +412,7 @@ void setup_locale()
 #endif
   }
 }
-void print_environment(int argc, char *argv[])
+static void print_environment(int argc, char *argv[])
 {
     int n = 0;
     printf("; Commandline arguments:\n");
@@ -458,6 +456,8 @@ main(int argc, char *argv[], char *envp[])
     boolean debug_environment_p = 0;
 
     lispobj initial_function;
+    int merge_core_pages = -1;
+    struct memsize_options memsize_options = {0, 0, 0};
 
 #if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
     os_preinit();
@@ -466,8 +466,6 @@ main(int argc, char *argv[], char *envp[])
 
     interrupt_init();
     block_blockable_signals(0);
-
-    runtime_options = NULL;
 
     /* Save the argv[0] derived runtime path in case
      * os_get_runtime_executable_path(1) isn't able to get an
@@ -480,7 +478,8 @@ main(int argc, char *argv[], char *envp[])
     runtime_path = os_get_runtime_executable_path(0);
     if (runtime_path || saved_runtime_path) {
         os_vm_offset_t offset = search_for_embedded_core(
-            runtime_path ? runtime_path : saved_runtime_path);
+            runtime_path ? runtime_path : saved_runtime_path,
+            &memsize_options);
         if (offset != -1) {
             embedded_core_offset = offset;
             core = (runtime_path ? runtime_path :
@@ -494,14 +493,12 @@ main(int argc, char *argv[], char *envp[])
 
     /* Parse our part of the command line (aka "runtime options"),
      * stripping out those options that we handle. */
-    if (runtime_options != NULL) {
-        dynamic_space_size = runtime_options->dynamic_space_size;
-        thread_control_stack_size = runtime_options->thread_control_stack_size;
+    if (memsize_options.present_in_core) {
+        dynamic_space_size = memsize_options.dynamic_space_size;
+        thread_control_stack_size = memsize_options.thread_control_stack_size;
         sbcl_argv = argv;
     } else {
         int argi = 1;
-
-        runtime_options = successful_malloc(sizeof(struct runtime_options));
 
         while (argi < argc) {
             char *arg = argv[argi];
@@ -585,9 +582,6 @@ main(int argc, char *argv[], char *envp[])
             } else if (0 == strcmp(arg, "--no-merge-core-pages")) {
                 ++argi;
                 merge_core_pages = 0;
-            } else if (0 == strcmp(arg, "--default-merge-core-pages")) {
-                ++argi;
-                merge_core_pages = -1;
             } else {
                 /* This option was unrecognized as a runtime option,
                  * so it must be a toplevel option or a user option,
@@ -630,10 +624,6 @@ main(int argc, char *argv[], char *envp[])
     dynamic_space_size &= ~(sword_t)(GENCGC_CARD_BYTES-1);
 #endif
     thread_control_stack_size &= ~(sword_t)(CONTROL_STACK_ALIGNMENT_BYTES-1);
-
-    /* Preserve the runtime options for possible future core saving */
-    runtime_options->dynamic_space_size = dynamic_space_size;
-    runtime_options->thread_control_stack_size = thread_control_stack_size;
 
     /* KLUDGE: os_vm_page_size is set by os_init(), and on some
      * systems (e.g. Alpha) arch_init() needs need os_vm_page_size, so
@@ -697,7 +687,7 @@ main(int argc, char *argv[], char *envp[])
          * before we reach this block, so that there is no observable
          * difference between "embedded" and "bare" images given to
          * --core. */
-        os_vm_offset_t offset = search_for_embedded_core(core);
+        os_vm_offset_t offset = search_for_embedded_core(core, 0);
         if (offset != -1)
             embedded_core_offset = offset;
     }
@@ -706,9 +696,10 @@ main(int argc, char *argv[], char *envp[])
 
     /* Doing this immediately after the core has been located
      * and before any random malloc() calls occur improves the chance
-     * of mapping dynamic space at our preferred addres (if movable).
+     * of mapping dynamic space at our preferred address (if movable).
      * If not movable, it was already mapped in allocate_spaces(). */
-    initial_function = load_core_file(core, embedded_core_offset);
+    initial_function = load_core_file(core, embedded_core_offset,
+                                      merge_core_pages);
     if (initial_function == NIL) {
         lose("couldn't find initial function\n");
     }
@@ -730,8 +721,6 @@ main(int argc, char *argv[], char *envp[])
     return_from_lisp_stub = (void *) ((char *)*((unsigned long *)
                  ((char *)initial_function + -1)) + 23);
 #endif
-
-    gc_initialize_pointers();
 
     arch_install_interrupt_handlers();
 #ifndef LISP_FEATURE_WIN32

@@ -74,6 +74,14 @@ do {                                                                   \
 #define FUN_RAW_ADDR_OFFSET (offsetof(struct simple_fun, code) - FUN_POINTER_LOWTAG)
 #endif
 
+// For x86[-64], a simple-fun or closure's "self" slot is a fixum
+// On other backends, it is a lisp ointer.
+#if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
+#define FUN_SELF_FIXNUM_TAGGED 1
+#else
+#define FUN_SELF_FIXNUM_TAGGED 0
+#endif
+
 static inline unsigned short
 #ifdef LISP_FEATURE_64_BIT
 code_n_funs(struct code* code) { return ((code)->header >> 32) & 0x7FFF; }
@@ -118,11 +126,11 @@ code_n_funs(struct code* code) { return fixnum_value((code)->n_entries) & 0x3FFF
 /* values for the *_alloc_* parameters, also see the commentary for
  * struct page in gencgc-internal.h. These constants are used in gc-common,
  * so they can't easily be made gencgc-only */
-#define FREE_PAGE_FLAG 0
-#define BOXED_PAGE_FLAG 1
-#define UNBOXED_PAGE_FLAG 2
-#define OPEN_REGION_PAGE_FLAG 4
-#define CODE_PAGE_FLAG        (BOXED_PAGE_FLAG|UNBOXED_PAGE_FLAG)
+#define FREE_PAGE_FLAG        0
+#define BOXED_PAGE_FLAG       1
+#define UNBOXED_PAGE_FLAG     2
+#define OPEN_REGION_PAGE_FLAG 8
+#define CODE_PAGE_TYPE        (BOXED_PAGE_FLAG|UNBOXED_PAGE_FLAG)
 
 extern sword_t (*sizetab[256])(lispobj *where);
 #define OBJECT_SIZE(header,where) \

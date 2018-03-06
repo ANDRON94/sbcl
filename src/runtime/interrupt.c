@@ -622,6 +622,19 @@ check_interrupt_context_or_lose(os_context_t *context)
     int gc_pending = (read_TLS(GC_PENDING,thread) == T);
     int pseudo_atomic_interrupted = get_pseudo_atomic_interrupted(thread);
     int in_race_p = in_leaving_without_gcing_race_p(thread);
+    int safepoint_active = 0;
+#if defined(LISP_FEATURE_SB_SAFEPOINT)
+    /* Don't try to take the gc state lock if there's a chance that
+     * we're already holding it (thread_register_gc_trigger() is
+     * called from PA, gc_stop_the_world() and gc_start_the_world()
+     * are called from WITHOUT-GCING, all other takers of the lock
+     * have deferrables blocked). */
+    if (!(interrupt_pending || pseudo_atomic_interrupted || gc_inhibit)) {
+        WITH_GC_STATE_LOCK {
+            safepoint_active = gc_cycle_active();
+        }
+    }
+#endif
     /* In the time window between leaving the *INTERRUPTS-ENABLED* NIL
      * section and trapping, a SIG_STOP_FOR_GC would see the next
      * check fail, for this reason sig_stop_for_gc handler does not
@@ -631,14 +644,14 @@ check_interrupt_context_or_lose(os_context_t *context)
             lose("Stray deferred interrupt.\n");
     }
     if (gc_pending)
-        if (!(pseudo_atomic_interrupted || gc_inhibit || in_race_p))
+        if (!(pseudo_atomic_interrupted || gc_inhibit || in_race_p || safepoint_active))
             lose("GC_PENDING, but why?\n");
 #if defined(LISP_FEATURE_SB_THREAD)
     {
         int stop_for_gc_pending =
             (read_TLS(STOP_FOR_GC_PENDING,thread) != NIL);
         if (stop_for_gc_pending)
-            if (!(pseudo_atomic_interrupted || gc_inhibit || in_race_p))
+            if (!(pseudo_atomic_interrupted || gc_inhibit || in_race_p || safepoint_active))
                 lose("STOP_FOR_GC_PENDING, but why?\n");
         if (pseudo_atomic_interrupted)
             if (!(gc_pending || stop_for_gc_pending || interrupt_deferred_p))
@@ -692,8 +705,7 @@ build_fake_control_stack_frames(struct thread *th,os_context_t *context)
         == access_control_frame_pointer(th)) {
         /* There is a small window during call where the callee's
          * frame isn't built yet. */
-        if (lowtag_of(*os_context_register_addr(context, reg_CODE))
-            == FUN_POINTER_LOWTAG) {
+        if (functionp(*os_context_register_addr(context, reg_CODE))) {
             /* We have called, but not built the new frame, so
              * build it for them. */
             access_control_frame_pointer(th)[0] =
@@ -981,16 +993,19 @@ interrupt_handle_pending(os_context_t *context)
     if (read_TLS(GC_INHIBIT,thread)==NIL) {
         void *original_pending_handler = data->pending_handler;
 
-#ifdef LISP_FEATURE_SB_SAFEPOINT
+#if defined(LISP_FEATURE_SB_SAFEPOINT) && defined(LISP_FEATURE_SB_THREAD)
         /* handles the STOP_FOR_GC_PENDING case, plus THRUPTIONS */
         if (read_TLS(STOP_FOR_GC_PENDING,thread) != NIL
 # ifdef LISP_FEATURE_SB_THRUPTION
              || (read_TLS(THRUPTION_PENDING,thread) != NIL
                  && read_TLS(INTERRUPTS_ENABLED, thread) != NIL)
 # endif
-            )
+            ) {
             /* We ought to take this chance to do a pitstop now. */
+            fake_foreign_function_call(context);
             thread_in_lisp_raised(context);
+            undo_fake_foreign_function_call(context);
+        }
 #elif defined(LISP_FEATURE_SB_THREAD)
         if (read_TLS(STOP_FOR_GC_PENDING,thread) != NIL) {
             /* STOP_FOR_GC_PENDING and GC_PENDING are cleared by
@@ -1000,8 +1015,8 @@ interrupt_handle_pending(os_context_t *context)
         } else
 #endif
          /* Test for T and not for != NIL since the value :IN-PROGRESS
-          * is used in SUB-GC as part of the mechanism to supress
-          * recursive gcs.*/
+          * used to be used in SUB-GC as part of the mechanism to
+          * supress recursive gcs.*/
         if (read_TLS(GC_PENDING,thread) == T) {
 
             /* Two reasons for doing this. First, if there is a
@@ -1136,7 +1151,7 @@ interrupt_handle_now(int signal, siginfo_t *info, os_context_t *context)
          * support decides to pass on it. */
         lose("no handler for signal %d in interrupt_handle_now(..)\n", signal);
 
-    } else if (lowtag_of(handler.lisp) == FUN_POINTER_LOWTAG) {
+    } else if (functionp(handler.lisp)) {
         /* Once we've decided what to do about contexts in a
          * return-elsewhere world (the original context will no longer
          * be available; should we copy it or was nobody using it anyway?)
@@ -1318,7 +1333,6 @@ low_level_interrupt_handle_now(int signal, siginfo_t *info,
     check_blockables_blocked_or_lose(0);
     check_interrupts_enabled_or_lose(context);
     (*interrupt_low_level_handlers[signal])(signal, info, context);
-    /* No Darwin context fixage needed, caller does that. */
 }
 
 static void
@@ -1401,7 +1415,7 @@ sig_stop_for_gc_handler(int signal, siginfo_t *info, os_context_t *context)
 
     /* While waiting for gc to finish occupy ourselves with zeroing
      * the unused portion of the control stack to reduce conservatism.
-     * On hypothetic platforms with threads and exact gc it is
+     * On the platforms with threads and exact gc it is
      * actually a must. */
     scrub_control_stack();
 
@@ -1694,11 +1708,6 @@ void reset_control_stack_guard_page(void)
     }
 }
 
-void lower_control_stack_guard_page(void)
-{
-    lower_thread_control_stack_guard_page(arch_os_get_current_thread());
-}
-
 boolean
 handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
 {
@@ -1706,6 +1715,7 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
 
     if(addr >= CONTROL_STACK_HARD_GUARD_PAGE(th) &&
        addr < CONTROL_STACK_HARD_GUARD_PAGE(th) + os_vm_page_size) {
+        fake_foreign_function_call(context);
         lose("Control stack exhausted, fault: %p, PC: %p",
              addr, *os_context_pc_addr(context));
     }
@@ -1715,9 +1725,14 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
          * protection so the error handler has some headroom, protect the
          * previous page so that we can catch returns from the guard page
          * and restore it. */
+        if (lose_on_corruption_p || gc_active_p) {
+            fake_foreign_function_call(context);
+            lose("Control stack exhausted, fault: %p, PC: %p",
+                 addr, *os_context_pc_addr(context));
+        }
         if (th->control_stack_guard_page_protected == NIL)
             lose("control_stack_guard_page_protected NIL");
-        lower_control_stack_guard_page();
+        lower_thread_control_stack_guard_page(th);
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
         /* For the unfortunate case, when the control stack is
          * exhausted in a signal handler. */
@@ -1746,6 +1761,12 @@ handle_guard_page_triggered(os_context_t *context,os_vm_address_t addr)
             addr < BINDING_STACK_GUARD_PAGE(th) + os_vm_page_size) {
         protect_binding_stack_guard_page(0, NULL);
         protect_binding_stack_return_guard_page(1, NULL);
+
+        if (lose_on_corruption_p) {
+            fake_foreign_function_call(context);
+            lose("Binding stack exhausted");
+        }
+
         fprintf(stderr, "INFO: Binding stack guard page unprotected\n");
 
         /* For the unfortunate case, when the binding stack is
@@ -2133,18 +2154,10 @@ siginfo_code(siginfo_t *info)
 {
     return info->si_code;
 }
-os_vm_address_t current_memory_fault_address;
 
 void
 lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
 {
-   /* FIXME: This is lossy: if we get another memory fault (eg. from
-    * another thread) before lisp has read this, we lose the information.
-    * However, since this is mostly informative, we'll live with that for
-    * now -- some address is better then no address in this case.
-    */
-    current_memory_fault_address = addr;
-
     /* If we lose on corruption, provide LDB with debugging information. */
     fake_foreign_function_call(context);
 
@@ -2159,17 +2172,67 @@ lisp_memory_fault_error(os_context_t *context, os_vm_address_t addr)
 #endif
                                       );
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
+#  if !(defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64))
+#    error memory fault emulation needs validating for this architecture
+#  endif
+    /* We're on the altstack, and don't want to run Lisp code here, so
+     * we need to return from this signal handler.  But when we get to
+     * Lisp we'd like to have a signal context (with correct values in
+     * it) to present to the debugger, along with knowledge of what
+     * the faulting address was.  To get a signal context on the main
+     * stack, we arrange to return to a trap instruction.  To get the
+     * correct program counter in the context, we save it on the stack
+     * here and restore it to the context in the trap handler.  To
+     * pass the fault address, we save it on the stack here and pick
+     * it up in the trap handler.  And the stack pointer manipulation
+     * works as long as the on-stack side only pops items in its trap
+     * handler. */
+    extern void memory_fault_emulation_trap(void);
     undo_fake_foreign_function_call(context);
-    unblock_signals_in_context_and_maybe_warn(context);
-    arrange_return_to_lisp_function(context,
-                                    StaticSymbolFunction(MEMORY_FAULT_ERROR));
-#else
-    unblock_gc_signals(0, 0);
-    funcall0(StaticSymbolFunction(MEMORY_FAULT_ERROR));
-    undo_fake_foreign_function_call(context);
-#endif
+    void **sp = (void **)*os_context_sp_addr(context);
+    *--sp = (void *)*os_context_pc_addr(context);
+    *--sp = addr;
+#  ifdef LISP_FEATURE_X86
+    /* KLUDGE: x86-linux sp_addr doesn't affect the CPU on return */
+    *((void **)os_context_register_addr(context, reg_ESP)) = sp;
+#  else
+    *((void **)os_context_sp_addr(context)) = sp;
+#  endif
+    *os_context_pc_addr(context) =
+        (os_context_register_t)memory_fault_emulation_trap;
+    /* We exit here, letting the signal handler return, picking up at
+     * memory_fault_emulation_trap (in target-assem.S), which will
+     * trap, and the handler calls the function below, where we
+     * restore our state to parallel what a non-x86oid would have, and
+     * then run the common code for handling the error in Lisp. */
 }
+
+void
+handle_memory_fault_emulation_trap(os_context_t *context)
+{
+    void **sp = (void **)*os_context_sp_addr(context);
+    void *addr = *sp++;
+    *os_context_pc_addr(context) = (os_context_register_t)*sp++;
+#  ifdef LISP_FEATURE_X86
+    /* KLUDGE: x86-linux sp_addr doesn't affect the CPU on return */
+    *((void **)os_context_register_addr(context, reg_ESP)) = sp;
+#  else
+    *os_context_sp_addr(context) = (os_context_register_t)sp;
+#  endif
+    fake_foreign_function_call(context);
+#endif /* C_STACK_IS_CONTROL_STACK */
+    /* On x86oids, we're in handle_memory_fault_emulation_trap().
+     * On real computers, we're still in lisp_memory_fault_error(). */
+#ifndef LISP_FEATURE_SB_SAFEPOINT
+    unblock_gc_signals(0, 0);
 #endif
+    DX_ALLOC_SAP(context_sap, context);
+    DX_ALLOC_SAP(fault_address_sap, addr);
+    funcall2(StaticSymbolFunction(MEMORY_FAULT_ERROR),
+             context_sap, fault_address_sap);
+    undo_fake_foreign_function_call(context);
+}
+#endif /* !LISP_FEATURE_WIN32 */
 
 static void
 unhandled_trap_error(os_context_t *context)
@@ -2193,6 +2256,9 @@ unhandled_trap_error(os_context_t *context)
 void
 handle_trap(os_context_t *context, int trap)
 {
+    if (trap >= trap_Error) {
+        trap = trap_Error;
+    }
     switch(trap) {
 #if !(defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD))
     case trap_PendingInterrupt:
@@ -2244,6 +2310,11 @@ handle_trap(os_context_t *context, int trap)
     case trap_Allocation:
         arch_handle_allocation_trap(context);
         arch_skip_instruction(context);
+        break;
+#endif
+#if defined(LISP_FEATURE_C_STACK_IS_CONTROL_STACK) && !defined(LISP_FEATURE_WIN32)
+    case trap_MemoryFaultEmulation:
+        handle_memory_fault_emulation_trap(context);
         break;
 #endif
     case trap_Halt:

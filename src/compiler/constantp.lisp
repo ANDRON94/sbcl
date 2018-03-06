@@ -19,7 +19,10 @@
     (return-from %constantp
       (constant-quasiquote-form-p (cadr form) environment envp)))
   (let ((form (if envp
-                  (%macroexpand form environment)
+                  (handler-case
+                      (%macroexpand form environment)
+                    (error ()
+                      (return-from %constantp)))
                   form)))
     (typecase form
       ;; This INFO test catches KEYWORDs as well as explicitly
@@ -180,25 +183,11 @@
 (!defconstantp the (type form)
    ;; We can't call TYPEP because the form might be (THE (FUNCTION (t) t) #<fn>)
    ;; which is valid for declaration but not for discrimination.
-   ;; Instead use %%TYPEP in non-strict mode. FIXME:
-   ;; (1) CAREFUL-SPECIFIER-TYPE should never fail. See lp#1395910.
-   ;; (2) CONTAINS-UNKNOWN-TYPE-P should grovel into ARRAY-TYPE-ELEMENT-TYPE
-   ;; so that (C-U-T-P (SPECIFIER-TYPE '(OR (VECTOR BAD) FUNCTION))) => T
-   ;; and then we can parse, check for unknowns, and get rid of HANDLER-CASE.
+   ;; CTYPEP handles unknown types and SATISFIES with non-foldable functions.
    :test (and (constantp* form)
-              (handler-case
-                  ;; in case the type-spec is malformed!
-                  (let ((parsed (careful-specifier-type type)))
-                    ;; xc can't rely on a "non-strict" mode of TYPEP.
-                    (and parsed
-                         #+sb-xc-host
-                         (typep (constant-form-value* form)
-                                (let ((*unparse-fun-type-simplify* t))
-                                  (declare (special *unparse-fun-type-simplify*))
-                                  (type-specifier parsed)))
-                         #-sb-xc-host
-                         (%%typep (constant-form-value* form) parsed nil)))
-                (error () nil)))
+              (let ((parsed (careful-specifier-type type)))
+                (and parsed
+                     (ctypep (constant-form-value* form) parsed))))
    :eval (constant-form-value* form))
 
 (!defconstantp unwind-protect (&whole subforms protected-form &body cleanup-forms)
@@ -214,7 +203,8 @@
    ;;   ...ANYTHING...)
    ;;
    ;; Right now RETURN-FROM kills the constantness unequivocally.
-   :test (every #'constantp* forms)
+   :test (and (symbolp name)
+              (every #'constantp* forms))
    :eval (constant-form-value* (car (last forms))))
 
 (!defconstantp multiple-value-prog1 (&whole subforms first-form &body forms)
@@ -224,13 +214,27 @@
 (!defconstantp progv (symbols values &body forms)
    :test (and (constantp* symbols)
               (constantp* values)
-              (let* ((symbol-values (constant-form-value* symbols))
-                     (*special-constant-variables*
-                      (append symbol-values *special-constant-variables*)))
-                (progv
-                    symbol-values
-                    (constant-form-value* values)
-                  (every #'constantp* forms))))
+              (let* ((symbols (constant-form-value* symbols))
+                     (values (constant-form-value* values)))
+                (and (proper-list-p values)
+                     (proper-list-p symbols)
+                     (>= (length values)
+                         (length symbols))
+                     (loop for symbol in symbols
+                           for value in values
+                           always (and (symbolp symbol)
+                                       (not (constantp symbol))
+                                       (memq (info :variable :kind symbol)
+                                             '(:unknown :special))
+                                       (multiple-value-bind (type declaredp)
+                                           (info :variable :type symbol)
+                                         (or (not declaredp)
+                                             (ctypep value type)))))
+                     (let ((*special-constant-variables*
+                             (append symbols *special-constant-variables*)))
+                       (progv symbols values
+                         (and forms
+                              (every #'constantp* forms)))))))
    :eval (progv
              (constant-form-value* symbols)
              (constant-form-value* values)

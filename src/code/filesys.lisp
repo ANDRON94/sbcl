@@ -150,53 +150,82 @@
           (t
            (make-pattern (pattern))))))
 
+(declaim (ftype (sfunction ((or (eql :wild) simple-string pattern) character)
+                           simple-string)
+                unparse-physical-piece))
 (defun unparse-physical-piece (thing escape-char)
-  (etypecase thing
-    ((member :wild) "*")
-    (simple-string
-     (let* ((srclen (length thing))
-            (dstlen srclen))
-       (dotimes (i srclen)
-         (let ((char (schar thing i)))
-           (case char
-             ((#\* #\? #\[)
-              (incf dstlen))
-             (t (when (char= char escape-char)
-                  (incf dstlen))))))
-       (let ((result (make-string dstlen))
-             (dst 0))
-         (dotimes (src srclen)
-           (let ((char (schar thing src)))
-             (case char
-               ((#\* #\? #\[)
-                (setf (schar result dst) escape-char)
-                (incf dst))
-               (t (when (char= char escape-char)
-                    (setf (schar result dst) escape-char)
-                    (incf dst))))
-             (setf (schar result dst) char)
-             (incf dst)))
-         result)))
-    (pattern
-     (with-simple-output-to-string (s)
-       (dolist (piece (pattern-pieces thing))
-         (etypecase piece
-           (simple-string
-            (write-string piece s))
-           (symbol
-            (ecase piece
-              (:multi-char-wild
-               (write-string "*" s))
-              (:single-char-wild
-               (write-string "?" s))))
-           (cons
-            (case (car piece)
-              (:character-set
-               (write-string "[" s)
-               (write-string (cdr piece) s)
-               (write-string "]" s))
-              (t
-               (error "invalid pattern piece: ~S" piece))))))))))
+  (let ((length 0)
+        (complicated nil))
+    (declare (type index length))
+    (labels ((inspect-fragment (fragment)
+               (etypecase fragment
+                 ((eql :wild)
+                  (incf length)
+                  t)
+                 (simple-string
+                  (incf length (length fragment))
+                  (Loop with complicated = nil
+                        for char across (the simple-string fragment)
+                        when (or (char= char #\*) (char= char #\?)
+                                 (char= char #\[) (char= char escape-char))
+                        do (setf complicated t)
+                           (incf length)
+                        finally (return complicated)))
+                 (pattern
+                  (mapcar (lambda (piece)
+                            (etypecase piece
+                              (simple-string
+                               (inspect-fragment piece))
+                              ((member :multi-char-wild :single-char-wild)
+                               (incf length 1)
+                               t)
+                              ((cons (eql :character-set))
+                               (incf length (+ 2 (length (cdr piece))))
+                               t)))
+                          (pattern-pieces fragment))))))
+      (setf complicated (inspect-fragment thing)))
+    (unless complicated
+      (return-from unparse-physical-piece thing))
+    (let ((result (make-string length))
+          (index 0))
+      (declare (type (simple-array character 1) result)
+               (type index index))
+      (labels ((output-character (character)
+                 (setf (aref result index) character)
+                 (incf index))
+               (output-string (string)
+                 (declare (type (simple-array character 1) string))
+                 (setf (subseq result index) string)
+                 (incf index (length string)))
+               (unparse-fragment (fragment)
+                 (etypecase fragment
+                   ((eql :wild)
+                    (output-character #\*))
+                   (simple-string
+                    (loop for char across (the simple-string fragment)
+                          when (or (char= char #\*) (char= char #\?)
+                                   (char= char #\[) (char= char escape-char))
+                          do (output-character escape-char)
+                          do (output-character char)))
+                   (pattern
+                    (mapc (lambda (piece piece-complicated)
+                            (etypecase piece
+                              (simple-string
+                               (if piece-complicated
+                                   (unparse-fragment piece)
+                                   (output-string piece)))
+                              ((eql :multi-char-wild)
+                               (output-character #\*))
+                              ((eql :single-char-wild)
+                               (output-character #\?))
+                              ((cons (eql :character-set))
+                               (output-character #\[)
+                               (output-string (cdr piece))
+                               (output-character #\]))))
+                          (pattern-pieces fragment) complicated)))))
+        (declare (inline output-character output-string))
+        (unparse-fragment thing))
+      result)))
 
 (defun make-matcher (piece)
   (cond ((eq piece :wild)
@@ -214,17 +243,15 @@
 (defun extract-name-type-and-version (namestr start end escape-char)
   (declare (type simple-string namestr)
            (type index start end))
-  (let* ((last-dot (position #\. namestr :start (1+ start) :end end
-                             :from-end t)))
-    (cond
-      (last-dot
-       (values (maybe-make-pattern namestr start last-dot escape-char)
-               (maybe-make-pattern namestr (1+ last-dot) end escape-char)
-               :newest))
-      (t
-       (values (maybe-make-pattern namestr start end escape-char)
-               nil
-               :newest)))))
+  (let ((last-dot (position #\. namestr :start (1+ start) :end end
+                            :from-end t)))
+    (if last-dot
+        (values (maybe-make-pattern namestr start last-dot escape-char)
+                (maybe-make-pattern namestr (1+ last-dot) end escape-char)
+                :newest)
+        (values (maybe-make-pattern namestr start end escape-char)
+                nil
+                :newest))))
 
 (/show0 "filesys.lisp 200")
 
@@ -288,136 +315,136 @@
                     (pathname pathspec)
                     (sane-default-pathname-defaults)))))
     (when (wild-pathname-p pathname)
-      (error 'simple-file-error
-             :pathname pathname
-             :format-control "~@<can't find the ~A of wild pathname ~A~
-                              (physicalized from ~A).~:>"
-             :format-arguments (list query-for pathname pathspec)))
-    (macrolet ((fail (note-format pathname errno)
-                 ;; Do this as a macro to avoid evaluating format
-                 ;; calls when ERROP is NIL
-                 `(if errorp
-                      (simple-file-perror ,note-format ,pathname ,errno)
-                      (return-from query-file-system nil))))
-      (let ((filename (native-namestring pathname :as-file t)))
-        #!+win32
-        (case query-for
-          ((:existence :truename)
-           (multiple-value-bind (file kind)
-               (sb!win32::native-probe-file-name filename)
-             (when (and (not file) kind)
-               (setf file filename))
-             ;; The following OR was an AND, but that breaks files like NUL,
-             ;; for which GetLongPathName succeeds yet GetFileAttributesEx
-             ;; fails to return the file kind. --DFL
-             (if (or file kind)
-                 (values
-                  (parse-native-namestring
-                   file
-                   (pathname-host pathname)
-                   (sane-default-pathname-defaults)
-                   :as-directory (eq :directory kind)))
-                 (fail (format nil "Failed to find the ~A of ~~A" query-for) filename
-                       (sb!win32:get-last-error)))))
-          (:write-date
-           (or (sb!win32::native-file-write-date filename)
-               (fail (format nil "Failed to find the ~A of ~~A" query-for) filename
-                       (sb!win32:get-last-error)))))
-        #!-win32
-        (multiple-value-bind (existsp errno ino mode nlink uid gid rdev size
-                                      atime mtime)
-            (sb!unix:unix-stat filename)
-          (declare (ignore ino nlink gid rdev size atime))
-          (labels ((parse (filename &key (as-directory
-                                          (eql (logand mode
-                                                       sb!unix:s-ifmt)
-                                               sb!unix:s-ifdir)))
-                     (values
-                      (parse-native-namestring
-                       filename
-                       (pathname-host pathname)
-                       (sane-default-pathname-defaults)
-                       :as-directory as-directory)))
-                   (resolve-problematic-symlink (&optional realpath-failed)
-                     ;; SBCL has for many years had a policy that a pathname
-                     ;; that names an existing, dangling or self-referential
-                     ;; symlink denotes the symlink itself.  stat(2) fails
-                     ;; and sets errno to ENOENT or ELOOP respectively, but
-                     ;; we must distinguish cases where the symlink exists
-                     ;; from ones where there's a loop in the apparent
-                     ;; containing directory.
-                     ;; Also handles symlinks in /proc/pid/fd/ to
-                     ;; pipes or sockets on Linux
-                     (multiple-value-bind (linkp ignore ino mode nlink uid gid rdev
-                                           size atime mtime)
-                         (sb!unix:unix-lstat filename)
-                       (declare (ignore ignore ino mode nlink gid rdev size atime))
-                       (when (and (or (= errno sb!unix:enoent)
-                                      (= errno sb!unix:eloop)
-                                      realpath-failed)
-                                  linkp)
-                         (return-from query-file-system
-                           (case query-for
-                             (:existence
-                              ;; We do this reparse so as to return a
-                              ;; normalized pathname.
-                              (parse filename :as-directory nil))
-                             (:truename
-                              ;; So here's a trick: since lstat succeded,
-                              ;; FILENAME exists, so its directory exists and
-                              ;; only the non-directory part is loopy.  So
-                              ;; let's resolve FILENAME's directory part with
-                              ;; realpath(3), in order to get a canonical
-                              ;; absolute name for the directory, and then
-                              ;; return a pathname having PATHNAME's name,
-                              ;; type, and version, but the rest from the
-                              ;; truename of the directory.  Since we turned
-                              ;; PATHNAME into FILENAME "as a file", FILENAME
-                              ;; does not end in a slash, and so we get the
-                              ;; directory part of FILENAME by reparsing
-                              ;; FILENAME and masking off its name, type, and
-                              ;; version bits.  But note not to call ourselves
-                              ;; recursively, because we don't want to
-                              ;; re-merge against *DEFAULT-PATHNAME-DEFAULTS*,
-                              ;; since PATHNAME may be a relative pathname.
-                              (merge-pathnames
-                               (parse
-                                (multiple-value-bind (realpath errno)
-                                    (sb!unix:unix-realpath
-                                     (native-namestring
-                                      (make-pathname
-                                       :name :unspecific
-                                       :type :unspecific
-                                       :version :unspecific
-                                       :defaults (parse filename
-                                                        :as-directory nil))))
-                                  (or realpath
-                                      (fail "couldn't resolve ~A" filename errno)))
-                                :as-directory t)
-                               (if (directory-pathname-p pathname)
-                                   (parse (car (last (pathname-directory pathname)))
-                                          :as-directory nil)
-                                   pathname)))
-                             (:author (sb!unix:uid-username uid))
-                             (:write-date (+ unix-to-universal-time mtime))))))
-                     ;; If we're still here, the file doesn't exist; error.
-                     (fail
-                      (format nil "Failed to find the ~A of ~~A" query-for)
-                      pathspec errno)))
-            (if existsp
-                (case query-for
-                  (:existence (parse filename))
-                  (:truename
-                   ;; Note: in case the file is stat'able, POSIX
-                   ;; realpath(3) gets us a canonical absolute
-                   ;; filename, even if the post-merge PATHNAME
-                   ;; is not absolute
-                   (parse (or (sb!unix:unix-realpath filename)
-                              (resolve-problematic-symlink t))))
-                  (:author (sb!unix:uid-username uid))
-                  (:write-date (+ unix-to-universal-time mtime)))
-                (resolve-problematic-symlink))))))))
+      (simple-file-perror
+       "Can't find the ~*~A~2:* of wild pathname ~A~* (physicalized from ~A)."
+       pathname nil query-for pathspec))
+    (%query-file-system pathname query-for errorp)))
 
+#!+win32
+(defun %query-file-system (pathname query-for errorp)
+  (let ((filename (native-namestring pathname :as-file t)))
+    (case query-for
+      ((:existence :truename)
+       (multiple-value-bind (file kind)
+           (sb!win32::native-probe-file-name filename)
+         (when (and (not file) kind)
+           (setf file filename))
+         ;; The following OR was an AND, but that breaks files like NUL,
+         ;; for which GetLongPathName succeeds yet GetFileAttributesEx
+         ;; fails to return the file kind. --DFL
+         (cond
+           ((or file kind)
+            (values (parse-native-namestring
+                     file
+                     (pathname-host pathname)
+                     (sane-default-pathname-defaults)
+                     :as-directory (eq :directory kind))))
+           (errorp
+            (simple-file-perror
+             "Failed to find the ~*~A~2:* of ~A"
+             filename (sb!win32:get-last-error) query-for)))))
+      (:write-date
+       (cond
+         ((sb!win32::native-file-write-date filename))
+         (errorp
+          (simple-file-perror
+           "Failed to find the ~*~A~2:* of ~A"
+           filename (sb!win32:get-last-error) query-for)))))))
+
+#!-win32
+(defun %query-file-system (pathname query-for errorp)
+  (labels ((parse (filename &key as-directory)
+             (values (parse-native-namestring
+                      filename
+                      (pathname-host pathname)
+                      (sane-default-pathname-defaults)
+                      :as-directory as-directory)))
+           (directory-part-realpath (filename)
+             ;; So here's a trick: since lstat succeeded, FILENAME
+             ;; exists, so its directory exists and only the
+             ;; non-directory part is loopy.  So let's resolve
+             ;; FILENAME's directory part with realpath(3), in order
+             ;; to get a canonical absolute name for the directory,
+             ;; and then return a pathname having PATHNAME's name,
+             ;; type, and version, but the rest from the truename of
+             ;; the directory.  Since we turned PATHNAME into FILENAME
+             ;; "as a file", FILENAME does not end in a slash, and so
+             ;; we get the directory part of FILENAME by reparsing
+             ;; FILENAME and masking off its name, type, and version
+             ;; bits.  But note not to call ourselves recursively,
+             ;; because we don't want to re-merge against
+             ;; *DEFAULT-PATHNAME-DEFAULTS*, since PATHNAME may be a
+             ;; relative pathname.
+             (multiple-value-bind (realpath errno)
+                 (sb!unix:unix-realpath
+                  (native-namestring
+                   (make-pathname
+                    :name :unspecific
+                    :type :unspecific
+                    :version :unspecific
+                    :defaults (parse filename))))
+               (cond
+                 (realpath
+                  (parse realpath :as-directory t))
+                 (errorp
+                  (simple-file-perror "couldn't resolve ~A" filename errno)))))
+           (resolve-problematic-symlink (filename errno realpath-failed)
+             ;; SBCL has for many years had a policy that a pathname
+             ;; that names an existing, dangling or self-referential
+             ;; symlink denotes the symlink itself.  stat(2) fails
+             ;; and sets errno to ENOENT or ELOOP respectively, but
+             ;; we must distinguish cases where the symlink exists
+             ;; from ones where there's a loop in the apparent
+             ;; containing directory.
+             ;; Also handles symlinks in /proc/pid/fd/ to
+             ;; pipes or sockets on Linux
+             (multiple-value-bind (linkp ignore ino mode nlink uid gid rdev
+                                         size atime mtime)
+                 (sb!unix:unix-lstat filename)
+               (declare (ignore ignore ino mode nlink gid rdev size atime))
+               (cond
+                 ((and (or (= errno sb!unix:enoent)
+                           (= errno sb!unix:eloop)
+                           realpath-failed)
+                       linkp)
+                  (case query-for
+                    (:existence
+                     ;; We do this reparse so as to return a
+                     ;; normalized pathname.
+                     (parse filename))
+                    (:truename
+                     (let ((realpath (directory-part-realpath filename)))
+                       (when realpath
+                         (merge-pathnames
+                          realpath
+                          (if (directory-pathname-p pathname)
+                              (parse (car (last (pathname-directory pathname))))
+                              pathname)))))
+                    (:author (sb!unix:uid-username uid))
+                    (:write-date (+ unix-to-universal-time mtime))))
+                 ;; The file doesn't exist; maybe error.
+                 (errorp
+                  (simple-file-perror "Failed to find the ~*~A~2:* of ~A"
+                                      pathname errno query-for))))))
+    (binding* ((filename (native-namestring pathname :as-file t))
+               ((existsp errno nil mode nil uid nil nil nil nil mtime)
+                (sb!unix:unix-stat filename)))
+      (if existsp
+          (case query-for
+            (:existence
+             (parse filename :as-directory (eql (logand mode sb!unix:s-ifmt)
+                                                sb!unix:s-ifdir)))
+            (:truename
+             ;; Note: in case the file is stat'able, POSIX
+             ;; realpath(3) gets us a canonical absolute filename,
+             ;; even if the post-merge PATHNAME is not absolute
+             (parse (or (sb!unix:unix-realpath filename)
+                        (resolve-problematic-symlink filename errno t))
+                    :as-directory (eql (logand mode sb!unix:s-ifmt)
+                                       sb!unix:s-ifdir)))
+            (:author (sb!unix:uid-username uid))
+            (:write-date (+ unix-to-universal-time mtime)))
+          (resolve-problematic-symlink filename errno nil)))))
 
 (defun probe-file (pathspec)
   "Return the truename of PATHSPEC if the truename can be found,
@@ -509,13 +536,25 @@ per standard Unix unlink() behaviour."
   t)
 
 (defun directorize-pathname (pathname)
-  (if (or (pathname-name pathname)
-          (pathname-type pathname))
-      (make-pathname :directory (append (pathname-directory pathname)
-                                        (list (file-namestring pathname)))
-                     :host (pathname-host pathname)
-                     :device (pathname-device pathname))
+  (cond
+    ((wild-pathname-p pathname)
+     (simple-file-perror
+      "Cannot compute directory pathname for wild pathname ~S"
       pathname))
+    ((let* ((name (pathname-name pathname))
+            (namep (pathname-component-present-p name))
+            (type (pathname-type pathname))
+            (typep (pathname-component-present-p type)))
+       (when (or namep typep)
+         (let ((from-file (format nil "~:[~*~;~A~]~:[~*~;.~A~]"
+                                  namep name typep type)))
+           (make-pathname
+            :host (pathname-host pathname)
+            :device (pathname-device pathname)
+            :directory (append (pathname-directory pathname)
+                               (list from-file)))))))
+    (t
+     pathname)))
 
 (defun delete-directory (pathspec &key recursive)
   "Deletes the directory designated by PATHSPEC (a pathname designator).
@@ -537,44 +576,44 @@ Both
 delete the \"foo\" subdirectory of \"/tmp\", or signal an error if it does not
 exist or if is a file or a symbolic link."
   (declare (type pathname-designator pathspec))
-  (let ((physical (directorize-pathname
-                   (physicalize-pathname
-                    (merge-pathnames
-                     pathspec (sane-default-pathname-defaults))))))
-    (labels ((recurse-merged (dir)
-               (lambda (sub)
-                 (recurse (merge-pathnames sub dir))))
-             (delete-merged (dir)
-               (lambda (file)
-                 (delete-file (merge-pathnames file dir))))
-             (recurse (dir)
-               (map-directory (recurse-merged dir) dir
-                              :files nil
-                              :directories t
-                              :classify-symlinks nil)
-               (map-directory (delete-merged dir) dir
-                              :files t
-                              :directories nil
-                              :classify-symlinks nil)
-               (delete-dir dir))
-             (delete-dir (dir)
-               (let ((namestring (native-namestring dir :as-file t)))
-                 (multiple-value-bind (res errno)
-                     #!+win32
-                     (or (sb!win32::native-delete-directory namestring)
-                         (values nil (sb!win32:get-last-error)))
-                     #!-win32
-                     (values
-                      (not (minusp (alien-funcall
-                                    (extern-alien "rmdir"
-                                                  (function int c-string))
-                                    namestring)))
-                      (get-errno))
-                     (if res
-                         dir
-                         (simple-file-perror
-                          "Could not delete directory ~A"
-                          namestring errno))))))
+  (labels ((recurse-merged (dir)
+             (lambda (sub)
+               (recurse (merge-pathnames sub dir))))
+           (delete-merged (dir)
+             (lambda (file)
+               (delete-file (merge-pathnames file dir))))
+           (recurse (dir)
+             (map-directory (recurse-merged dir) dir
+                            :files nil
+                            :directories t
+                            :classify-symlinks nil)
+             (map-directory (delete-merged dir) dir
+                            :files t
+                            :directories nil
+                            :classify-symlinks nil)
+             (delete-dir dir))
+           (delete-dir (dir)
+             (let ((namestring (native-namestring dir :as-file t)))
+               (multiple-value-bind (res errno)
+                 #!+win32
+                 (or (sb!win32::native-delete-directory namestring)
+                     (values nil (sb!win32:get-last-error)))
+                 #!-win32
+                 (values
+                  (not (minusp (alien-funcall
+                                (extern-alien "rmdir"
+                                              (function int c-string))
+                                namestring)))
+                  (get-errno))
+                 (if res
+                     dir
+                     (simple-file-perror
+                      "Could not delete directory ~A"
+                      namestring errno))))))
+    (let ((physical (directorize-pathname
+                     (physicalize-pathname
+                      (merge-pathnames
+                       pathspec (sane-default-pathname-defaults))))))
       (if recursive
           (recurse physical)
           (delete-dir physical)))))
@@ -658,8 +697,8 @@ matching filenames."
                                    ;; operation causes an error.  It's not clear
                                    ;; what the right thing to do is, though.  --
                                    ;; CSR, 2003-10-13
-                                   (query-file-system pathname :truename nil)
-                                   (query-file-system pathname :existence nil))))
+                                   (%query-file-system pathname :truename nil)
+                                   (%query-file-system pathname :existence nil))))
                  (when truename
                    (setf (gethash (namestring truename) truenames)
                          truename))))
@@ -694,15 +733,14 @@ matching filenames."
                    (do-physical-pathnames pathname))))
       (declare (truly-dynamic-extent #'record))
       (do-pathnames (merge-pathnames pathspec)))
-    (mapcar #'cdr
-            ;; Sorting isn't required by the ANSI spec, but sorting into some
-            ;; canonical order seems good just on the grounds that the
-            ;; implementation should have repeatable behavior when possible.
-            (sort (loop for namestring being each hash-key in truenames
-                        using (hash-value truename)
-                        collect (cons namestring truename))
-                  #'string<
-                  :key #'car))))
+    ;; Sorting isn't required by the ANSI spec, but sorting into some
+    ;; canonical order seems good just on the grounds that the
+    ;; implementation should have repeatable behavior when possible.
+    (let ((result (sort (loop for namestring being each hash-key in truenames
+                              using (hash-value truename)
+                              collect (cons namestring truename))
+                        #'string< :key #'car)))
+      (map-into result #'cdr result))))
 
 (defun canonicalize-pathname (pathname)
   ;; We're really only interested in :UNSPECIFIC -> NIL, :BACK and :UP,
@@ -832,7 +870,7 @@ Experimental: interface subject to change."
   (let* ((fun (%coerce-callable-to-fun function))
          (as-files (eq :as-files directories))
          (physical (physicalize-pathname directory))
-         (realname (query-file-system physical :existence nil))
+         (realname (%query-file-system physical :existence nil))
          (canonical (if realname
                         (parse-native-namestring realname
                                                  (pathname-host physical)
@@ -867,7 +905,7 @@ Experimental: interface subject to change."
                                       (parse-native-namestring
                                        name nil physical :as-directory nil)
                                       physical))
-                            (truename (query-file-system tmpname :truename nil)))
+                            (truename (%query-file-system tmpname :truename nil)))
                        (if (or (not truename)
                                (or (pathname-name truename) (pathname-type truename)))
                            (when files
@@ -902,7 +940,7 @@ Experimental: interface subject to change."
                                             :name nil
                                             :type nil
                                             :version nil))
-             (starting-point (or (probe-file starting-point)
+             (starting-point (or (%query-file-system starting-point :truename nil)
                                  starting-point)))
     (case mode
       (:wild-inferiors
@@ -1061,8 +1099,8 @@ Experimental: interface subject to change."
          (cond
            ((eq one :wild) two)
            ((eq two :wild) one)
-           ((or (null one) (eq one :unspecific)) two)
-           ((or (null two) (eq two :unspecific)) one)
+           ((not (pathname-component-present-p one)) two)
+           ((not (pathname-component-present-p two)) one)
            ((eql one two) one)
            (t nil)))
        (intersect-name/type (one two)
@@ -1071,8 +1109,8 @@ Experimental: interface subject to change."
          (cond
            ((eq one :wild) two)
            ((eq two :wild) one)
-           ((or (null one) (eq one :unspecific)) two)
-           ((or (null two) (eq two :unspecific)) one)
+           ((not (pathname-component-present-p one)) two)
+           ((not (pathname-component-present-p two)) one)
            ((string= one two) one)
            (t (return-from pathname-intersections nil))))
        (intersect-directory (one two)
@@ -1081,8 +1119,8 @@ Experimental: interface subject to change."
          (cond
            ((eq one :wild) two)
            ((eq two :wild) one)
-           ((or (null one) (eq one :unspecific)) two)
-           ((or (null two) (eq two :unspecific)) one)
+           ((not (pathname-component-present-p one)) two)
+           ((not (pathname-component-present-p two)) one)
            (t (aver (eq (car one) (car two)))
               (mapcar
                (lambda (x) (cons (car one) x))

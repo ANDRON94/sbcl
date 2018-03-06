@@ -92,6 +92,7 @@
 (defvar *code-segment*)
 ;; FIXME: this is a kludge due to the absence of a 'vop' argument
 ;; to ALLOCATION-TRAMP in the x86-64 backend.
+#!+immobile-code
 (defvar *code-is-immobile*)
 #!+sb-dyncount (defvar *collect-dynamic-statistics*)
 (defvar *component-being-compiled*)
@@ -105,6 +106,7 @@
 (defvar *current-path*)
 (defvar *current-component*)
 (defvar *delayed-ir1-transforms*)
+#!+sb-dyncount
 (defvar *dynamic-counts-tn*)
 (defvar *elsewhere*)
 (defvar *elsewhere-label*)
@@ -153,9 +155,6 @@ the stack without triggering overflow protection.")
 (defmacro with-world-lock (() &body body)
   `(sb!thread:with-recursive-lock (**world-lock**)
      ,@body))
-
-(declaim (type fixnum *compiler-sset-counter*))
-(defvar *compiler-sset-counter* 0)
 
 ;;; unique ID for the next object created (to let us track object
 ;;; identity even across GC, useful for understanding weird compiler
@@ -308,6 +307,10 @@ the stack without triggering overflow protection.")
 ;;; Set this to NIL to inhibit assembly-level optimization. (For
 ;;; compiler debugging, rather than policy control.)
 (defvar *assembly-optimize* t)
+
+;;; Bound during eval-when :compile-time evaluation.
+(defvar *compile-time-eval* nil)
+(declaim (always-bound *compile-time-eval*))
 
 (in-package "SB!ALIEN")
 

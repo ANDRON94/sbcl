@@ -150,8 +150,8 @@
       (let ((form root)
             (current (rest rpath)))
         (loop
-         (when (sb!int:comma-p form)
-           (setf form (sb!int:comma-expr form)))
+         (when (comma-p form)
+           (setf form (comma-expr form)))
          (when (atom form)
             (aver (null current))
             (return))
@@ -172,15 +172,50 @@
                (values '(unable to locate source)
                        '((some strange place)))))))))
 
+(defun map-tree (function tree)
+  (let (seen)
+    (labels ((recurse (tree)
+               (cond ((atom tree)
+                      (funcall function tree))
+                     ((getf seen tree))
+                     (t
+                      (let ((cons (setf (getf seen tree) (list 0))))
+                        (setf (car cons)
+                              (recurse (car tree))
+                              (cdr cons)
+                              (recurse (cdr tree)))
+                        cons)))))
+      (recurse tree))))
+
+(defun hide-ir-nodes (form)
+  (map-tree
+   (lambda (x)
+     (typecase x
+       (functional
+        (let ((name (functional-debug-name x)))
+          `(function
+            ,(if (typep name '(cons (member xep tl-xep)))
+                 (cadr name)
+                 name))))
+       (global-var
+        (let ((name (leaf-source-name x)))
+          (if (eq (global-var-kind x) :global-function)
+              `(function ,name)
+              name)))
+       (t
+        x)))
+   form))
+
 ;;; Convert a source form to a string, suitably formatted for use in
 ;;; compiler warnings.
 (defun stringify-form (form &optional (pretty t))
-  (with-standard-io-syntax
-    (with-compiler-io-syntax
+  (let ((form (hide-ir-nodes form)))
+    (with-standard-io-syntax
+      (with-compiler-io-syntax
         (let ((*print-pretty* pretty))
           (if pretty
               (format nil "~<~@;  ~S~:>" (list form))
-              (prin1-to-string form))))))
+              (prin1-to-string form)))))))
 
 ;;; Return a COMPILER-ERROR-CONTEXT structure describing the current
 ;;; error context, or NIL if we can't figure anything out. ARGS is a

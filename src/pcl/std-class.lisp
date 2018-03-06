@@ -334,7 +334,7 @@
      (apply #'ensure-class name :metaclass metaclass-name
             :direct-superclasses supers
             :direct-slots slots
-            :definition-source source-location
+            'source source-location
             'safe-p safe-p
             other))))
 
@@ -450,11 +450,8 @@
                   (mapcar (lambda (pl) (make-direct-slotd class pl))
                           direct-slots))
             (slot-value class 'direct-slots)))
-  (if direct-default-initargs-p
-      (setf (plist-value class 'direct-default-initargs)
-            direct-default-initargs)
-      (setq direct-default-initargs
-            (plist-value class 'direct-default-initargs)))
+  (when direct-default-initargs-p
+    (setf (plist-value class 'direct-default-initargs) direct-default-initargs))
   (setf (plist-value class 'class-slot-cells)
         (let ((old-class-slot-cells (plist-value class 'class-slot-cells))
               (safe (safe-p class))
@@ -1306,7 +1303,7 @@
                              :slot-name slot-name
                              :object-class class
                              :method-class-function #'reader-method-class
-                             :definition-source source-location)))
+                             'source source-location)))
 
 (defmethod writer-method-class ((class slot-class) direct-slot &rest initargs)
   (declare (ignore direct-slot initargs))
@@ -1323,7 +1320,7 @@
                              :slot-name slot-name
                              :object-class class
                              :method-class-function #'writer-method-class
-                             :definition-source source-location)))
+                             'source source-location)))
 
 (defmethod add-boundp-method ((class slot-class) generic-function slot-name slot-documentation source-location)
   (add-method generic-function
@@ -1335,7 +1332,7 @@
                              (make-boundp-method-function class slot-name)
                              (or slot-documentation "automatically generated boundp method")
                              :slot-name slot-name
-                             :definition-source source-location)))
+                             'source source-location)))
 
 (defmethod remove-reader-method ((class slot-class) generic-function)
   (let ((method (get-method generic-function () (list class) nil)))

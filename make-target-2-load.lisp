@@ -11,10 +11,10 @@
 ;;; random bootstrap stuff on per-package basis.
 (defun !unintern-init-only-stuff (&aux result)
   (dolist (package (list-all-packages))
-    (sb-int:binding* ((s (find-symbol "!UNINTERN-SYMBOLS" package)
-                         :exit-if-null)
-                      (list (funcall s))
-                      (package (car list)))
+    (sb-int:awhen (find-symbol "!REMOVE-BOOTSTRAP-SYMBOLS" package)
+      (funcall sb-int:it)))
+  (dolist (list sb-impl::*!removable-symbols*)
+    (let ((package (find-package (car list))))
       (dolist (symbol (cdr list))
         (fmakunbound symbol)
         (unintern symbol package))))
@@ -114,7 +114,7 @@
   ;; The disassembler is the major culprit for retention of these.
   (sb-vm::map-allocated-objects
    (lambda (obj type size)
-     (declare (ignore size))
+     (declare (ignore type size))
      (when (typep obj 'sb-c::debug-source)
        (unless (sb-c::debug-source-namestring obj)
          (setf (sb-c::debug-source-form obj) nil))))
@@ -199,10 +199,42 @@
 (progn
   (load "src/code/shaketree")
   (sb-impl::shake-packages
-   (lambda (symbol)
+   ;; Retain all symbols satisfying this predicate
+   #+sb-devel
+   (lambda (symbol accessibility)
+     (declare (ignore accessibility))
      ;; Retain all symbols satisfying this predicate
      (or (sb-kernel:symbol-info symbol)
-         (and (boundp symbol) (not (keywordp symbol))))))
+         (and (boundp symbol) (not (keywordp symbol)))))
+   #-sb-devel
+   (lambda (symbol accessibility)
+     (case (symbol-package symbol)
+      (#.(find-package "SB-VM")
+       (or (eq accessibility :external)
+           ;; overapproximate what we need for contribs and tests
+           (member symbol '(sb-vm::map-referencing-objects
+                            sb-vm::map-stack-references
+                            sb-vm::primitive-object-size))
+           (search "-OFFSET" (string symbol))
+           (search "-TN" (string symbol))))
+      ((#.(find-package "SB-C")
+        #.(find-package "SB-ASSEM")
+        #.(find-package "SB-DISASSEM")
+        #.(find-package "SB-FASL")
+        #.(find-package "SB-IMPL")
+        #.(find-package "SB-KERNEL"))
+       ;; Assume all and only external symbols must be retained
+       (eq accessibility :external))
+      (#.(find-package "SB-BIGNUM")
+       ;; There are 2 important external symbols for sb-gmp.
+       ;; Other externals can disappear.
+       (member symbol '(sb-bignum:%allocate-bignum
+                        sb-bignum:make-small-bignum)))
+      (t
+       ;; By default, retain any symbol with any attachments
+       (or (sb-kernel:symbol-info symbol)
+           (and (boundp symbol) (not (keywordp symbol)))))))
+   :verbose t :print nil)
   (unintern 'sb-impl::shake-packages 'sb-impl))
 
 ;;; Use historical (stupid) behavior for storing pathname namestrings
@@ -210,7 +242,6 @@
 (setq sb-c::*name-context-file-path-selector* 'truename)
 
 ;;; Lock internal packages
-#+sb-package-locks
 (dolist (p (list-all-packages))
   (unless (member p (mapcar #'find-package '("KEYWORD" "CL-USER")))
     (sb-ext:lock-package p)))

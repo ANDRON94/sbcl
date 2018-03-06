@@ -99,22 +99,20 @@
 (progn
   #!-gencgc
   (progn
-    (defconstant dynamic-0-space-start #x4f000000)
-    (defconstant dynamic-0-space-end   #x66fff000)
-    (defconstant dynamic-1-space-start #x67000000)
-    (defconstant dynamic-1-space-end   #x7efff000)))
+    (defparameter dynamic-0-space-start #x4f000000)
+    (defparameter dynamic-0-space-end   #x66fff000)))
 
 ;;;; other miscellaneous constants
 
 (defenum (:start 8)
   halt-trap
   pending-interrupt-trap
-  error-trap
   cerror-trap
   breakpoint-trap
   fun-end-breakpoint-trap
   single-step-around-trap
-  single-step-before-trap)
+  single-step-before-trap
+  error-trap)
 
 ;;;; Static symbols.
 

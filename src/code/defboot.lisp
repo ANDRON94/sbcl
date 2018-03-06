@@ -217,8 +217,7 @@ evaluated as a PROGN."
       `(progn
          (eval-when (:compile-toplevel)
            (sb!c:%compiler-defun ',name ,inline-thing t))
-         (%defun ',name ,named-lambda (sb!c:source-location)
-                 ,@(and inline-thing (list inline-thing)))
+         (%defun ',name ,named-lambda ,@(and inline-thing (list inline-thing)))
          ;; This warning, if produced, comes after the DEFUN happens.
          ;; When compiling, there's no real difference, but when interpreting,
          ;; if there is a handler for style-warning that nonlocally exits,
@@ -230,14 +229,13 @@ evaluated as a PROGN."
                ',name))))))
 
 #-sb-xc-host
-(defun %defun (name def source-location &optional inline-lambda)
+(defun %defun (name def &optional inline-lambda)
   (declare (type function def))
   ;; should've been checked by DEFMACRO DEFUN
   (aver (legal-fun-name-p name))
   (sb!c:%compiler-defun name inline-lambda nil)
   (when (fboundp name)
-    (warn 'redefinition-with-defun
-          :name name :new-function def :new-location source-location))
+    (warn 'redefinition-with-defun :name name :new-function def))
   (setf (fdefinition name) def)
   ;; %COMPILER-DEFUN doesn't do this except at compile-time, when it
   ;; also checks package locks. By doing this here we let (SETF
@@ -585,15 +583,22 @@ evaluated as a PROGN."
              (make-apply-and-return (clause-data)
                (destructuring-bind (name tag keywords lambda-list body) clause-data
                  (declare (ignore name keywords))
-                 `(,tag (return-from ,block-tag
-                          ,(cond ((null lambda-list)
-                                  `(progn ,@body))
-                                 ((and (null (cdr lambda-list))
-                                       (not (member (car lambda-list)
-                                                    '(&optional &key &aux))))
-                                  `(funcall (lambda ,lambda-list ,@body) ,temp-var))
-                                 (t
-                                  `(apply (lambda ,lambda-list ,@body) ,temp-var))))))))
+                 (multiple-value-bind (body declarations) (parse-body body nil)
+                   `(,tag (return-from ,block-tag
+                            ,(cond ((null lambda-list)
+                                    `(locally ,@declarations ,@body))
+                                   ((and (null (cdr lambda-list))
+                                         (not (member (car lambda-list)
+                                                      '(&optional &key &aux))))
+                                    `(funcall (lambda ,lambda-list
+                                                ,@declarations
+                                                (progn ,@body))
+                                              ,temp-var))
+                                   (t
+                                    `(apply (lambda ,lambda-list
+                                              ,@declarations
+                                              (progn ,@body))
+                                            ,temp-var)))))))))
       (let ((clauses-data (mapcar #'parse-clause clauses)))
         `(block ,block-tag
            (let ((,temp-var nil))
@@ -798,22 +803,23 @@ specification."
                      ,@(remove no-error-clause cases)))))))
         (let* ((local-funs nil)
                (annotated-cases
-                (mapcar (lambda (case)
-                          (with-current-source-form (case)
-                            (with-unique-names (tag fun)
-                              (destructuring-bind (type ll &body body) case
-                                (unless (and (listp ll)
-                                             (symbolp (car ll))
-                                             (null (cdr ll)))
-                                  (error "Malformed HANDLER-CASE lambda-list. Should be either () or (symbol), not ~s."
-                                         ll))
-
-                                (push `(,fun ,ll ,@body) local-funs)
-                                (list tag type ll fun)))))
-                        cases)))
+                 (mapcar (lambda (case)
+                           (with-current-source-form (case)
+                             (with-unique-names (tag fun)
+                               (destructuring-bind (type ll &body body) case
+                                 (unless (and (listp ll)
+                                              (symbolp (car ll))
+                                              (null (cdr ll)))
+                                   (error "Malformed HANDLER-CASE lambda-list. Should be either () or (symbol), not ~s."
+                                          ll))
+                                 (multiple-value-bind (body declarations)
+                                     (parse-body body nil)
+                                   (push `(,fun ,ll ,@declarations (progn ,@body)) local-funs))
+                                 (list tag type ll fun)))))
+                         cases)))
           (with-unique-names (block cell form-fun)
             `(dx-flet ((,form-fun ()
-                         #!-x86 ,form
+                         #!-x86 (progn ,form) ;; no declarations are accepted
                          ;; Need to catch FP errors here!
                          #!+x86 (multiple-value-prog1 ,form (float-wait)))
                        ,@(reverse local-funs))

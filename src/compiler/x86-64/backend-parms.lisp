@@ -18,6 +18,8 @@
 ;;;; compiler constants
 
 (defconstant +backend-fasl-file-implementation+ :x86-64)
+(defconstant-eqx +fixup-kinds+ #(:absolute :relative :absolute64)
+  #'equalp)
 
 ;;; KLUDGE: It would seem natural to set this by asking our C runtime
 ;;; code for it, but mostly we need it for GENESIS, which doesn't in
@@ -43,4 +45,4 @@
 ;;; This must be a multiple of the OS page size.
 (defconstant gencgc-release-granularity +backend-page-bytes+)
 ;;; The card size for immobile/low space
-#!+immobile-space (def!constant immobile-card-bytes 4096)
+#!+immobile-space (defconstant immobile-card-bytes 4096)

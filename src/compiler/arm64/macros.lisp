@@ -90,7 +90,7 @@
   "Jump to the lisp lip LIP."
   `(let ((function ,function)
          (lip ,lip))
-     (assert (sc-is lip interior-reg))
+     (aver (sc-is lip interior-reg))
      (inst add lip function
            (- (ash simple-fun-code-offset word-shift)
               fun-pointer-lowtag))
@@ -103,7 +103,7 @@
      ;; Indicate a single-valued return by clearing all of the status
      ;; flags, or a multiple-valued return by setting all of the status
      ;; flags.
-     (assert (sc-is lip interior-reg))
+     (aver (sc-is lip interior-reg))
      ,@(ecase return-style
          (:single-value '((inst msr :nzcv zr-tn)))
          (:multiple-values '((inst orr tmp-tn zr-tn #xf0000000)
@@ -309,9 +309,17 @@
 
 ;;;; PSEUDO-ATOMIC
 
+#!+sb-safepoint
+(defun emit-safepoint ()
+  (inst ldr zr-tn (@ null-tn
+                     (- (+ gc-safepoint-trap-offset n-word-bytes
+                           other-pointer-lowtag)))))
 
 ;;; handy macro for making sequences look atomic
 (defmacro pseudo-atomic ((flag-tn) &body forms)
+  #!+sb-safepoint-strictly
+  `(progn ,@forms (emit-safepoint))
+  #!-sb-safepoint-strictly
   `(progn
      (without-scheduling ()
        #!-sb-thread
@@ -339,7 +347,9 @@
        (let ((not-interrputed (gen-label)))
          (inst cbz ,flag-tn not-interrputed)
          (inst brk pending-interrupt-trap)
-         (emit-label not-interrputed)))))
+         (emit-label not-interrputed))
+       #!+sb-safepoint
+       (emit-safepoint))))
 
 ;;;; memory accessor vop generators
 

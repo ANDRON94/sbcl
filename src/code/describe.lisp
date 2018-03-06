@@ -349,7 +349,6 @@
       (let ((exports nil))
         (do-external-symbols (ext object)
           (push ext exports))
-        #+sb-package-locks
         (let ((implemented (humanize (package-implemented-by-list object)))
               (implements (humanize (package-implements-list object)))
               (this (list (package-name object))))
@@ -532,7 +531,7 @@
   (let ((*print-circle* nil)
         (*print-level* 24)
         (*print-length* 24))
-    (format stream "~@:_Lambda-list: ~:A" lambda-list)))
+    (format stream "~@:_Lambda-list: ~:S" lambda-list)))
 
 (defun describe-argument-precedence-order (argument-list stream)
   (let ((*print-circle* nil)

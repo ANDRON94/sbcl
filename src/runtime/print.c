@@ -28,6 +28,7 @@
 #include "thread.h"              /* genesis/primitive-objects.h needs this */
 #include <errno.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 /* FSHOW and odxprint provide debugging output for low-level information
  * (signal handling, exceptions, safepoints) which is hard to debug by
@@ -79,10 +80,6 @@ dyndebug_init()
     if (n != DYNDEBUG_NFLAGS)
         fprintf(stderr, "Bug in dyndebug_init\n");
 
-#if defined(LISP_FEATURE_GENCGC)
-    gencgc_verbose = dyndebug_config.dyndebug_gencgc_verbose;
-#endif
-
     char *featurelist = getenv("SBCL_DYNDEBUG");
     if (featurelist) {
         int err = 0;
@@ -120,6 +117,11 @@ dyndebug_init()
             }
         }
     }
+#if defined(LISP_FEATURE_GENCGC)
+    if (dyndebug_config.dyndebug_gencgc_verbose) {
+        gencgc_verbose = 1;
+    }
+#endif
 
 #undef dyndebug_init1
 #undef DYNDEBUG_NFLAGS
@@ -290,12 +292,15 @@ static void print_unknown(lispobj obj)
   printf("unknown object: %p", (void *)obj);
 }
 
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_64_BIT)
-# define OBJ_FMTd "lld"
-#elif defined(LISP_FEATURE_64_BIT)
-# define OBJ_FMTd "ld"
-#else
+/* Except for Alpha, we define sword_t as intptr_t, and 32-bit Darwin
+ * defines intptr_t as long, so the printf conversion is "ld", not "d".
+ * Alpha (32-on-64) defines sword_t as s32, so we need just "d". */
+#ifdef LISP_FEATURE_ALPHA
 # define OBJ_FMTd "d"
+#elif defined(PRIdPTR)
+# define OBJ_FMTd PRIdPTR
+#else
+# error "Your inttypes.h is lame"
 #endif
 
 static void brief_fixnum(lispobj obj)
@@ -378,7 +383,7 @@ static void brief_list(lispobj obj)
         printf("NIL");
     else {
         putchar('(');
-        while (lowtag_of(obj) == LIST_POINTER_LOWTAG) {
+        while (listp(obj)) {
             if (space)
                 putchar(' ');
             if (++length >= max_length) {
@@ -561,7 +566,7 @@ static void print_slots(char **slots, int count, lispobj *ptr)
 static lispobj symbol_function(lispobj* symbol)
 {
     lispobj info = ((struct symbol*)symbol)->info;
-    if (lowtag_of(info) == LIST_POINTER_LOWTAG)
+    if (listp(info))
         info = CONS(info)->cdr;
     if (lowtag_of(info) == OTHER_POINTER_LOWTAG) {
         struct vector* v = VECTOR(info);
@@ -932,16 +937,14 @@ struct vector * layout_classoid_name(lispobj * layout)
   if (forwarding_pointer_p(layout))
       layout = native_pointer(forwarding_pointer_value(layout));
   lispobj classoid = ((struct layout*)layout)->classoid;
-  return lowtag_of(classoid) != INSTANCE_POINTER_LOWTAG ? NULL
-    : classoid_name(native_pointer(classoid));
+  return instancep(classoid) ? classoid_name(native_pointer(classoid)) : NULL;
 }
 struct vector * instance_classoid_name(lispobj * instance)
 {
   if (forwarding_pointer_p(instance))
       instance = native_pointer(forwarding_pointer_value(instance));
   lispobj layout = instance_layout(instance);
-  return lowtag_of(layout) != INSTANCE_POINTER_LOWTAG ? NULL
-    : layout_classoid_name(native_pointer(layout));
+  return instancep(layout) ? layout_classoid_name(native_pointer(layout)) : NULL;
 }
 void safely_show_lstring(struct vector * string, int quotes, FILE *s)
 {

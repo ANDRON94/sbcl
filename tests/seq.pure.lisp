@@ -248,7 +248,8 @@
                (t t)))
            (test (type expr &key (filter #'safe))
              (checked-compile-and-assert
-                 (:optimize `(:compilation-speed nil :space nil :filter ,filter))
+                 (:optimize `(:compilation-speed nil :space nil :filter ,filter)
+                  :allow-style-warnings t)
                  `(lambda () ,expr)
                (() (condition type)))))
     (test 'sb-kernel:bounding-indices-bad-error
@@ -447,17 +448,15 @@
             (map '(cons t (cons t null)) '+ '(1 2 3) '(10 10 10)))
    type-error))
 
-(defstruct ship size name)
-(with-test (:name (find :derive-type))
-  (let ((f (checked-compile '(lambda (x list)
-                              (ship-size (find x list :key 'ship-name))))))
-    ;; The test of SHIP-P in the SHIP-SIZE call is optimized into (NOT NULL).
-    ;; Therefore the code header for F does not reference #<LAYOUT for SHIP>
-    (assert (not (ctu:find-code-constants f :type 'sb-kernel:layout)))
-    ;; And the function is safe.
-    (assert-error (funcall f nil nil) type-error)))
-
 (with-test (:name (search :singleton-transform))
   (checked-compile-and-assert ()
     `(lambda (e) (search '(a) '(b) :end1 e))
     ((0) 0)))
+
+(with-test (:name (count :no-consing)
+            :skipped-on :interpreter)
+  (let ((f (checked-compile
+            '(lambda (x)
+              (count 1 x)))))
+    (ctu:assert-no-consing (funcall f #(1 2 3 4)))
+    (ctu:assert-no-consing (funcall f '(1 2 3 4)))))

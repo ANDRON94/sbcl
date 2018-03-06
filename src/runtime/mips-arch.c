@@ -390,7 +390,7 @@ void
 arch_handle_single_step_trap(os_context_t *context, int trap)
 {
     unsigned int code = *((u32 *)(os_context_pc(context)));
-    int register_offset = code >> 11 & 0x1f;
+    int register_offset = code >> 16 & 0x1f;
     handle_single_step_trap(context, trap, register_offset);
     arch_skip_instruction(context);
 }
@@ -398,7 +398,7 @@ arch_handle_single_step_trap(os_context_t *context, int trap)
 static void
 sigtrap_handler(int signal, siginfo_t *info, os_context_t *context)
 {
-    unsigned int code = (os_context_insn(context) >> 6) & 0x1f;
+    unsigned int code = (os_context_insn(context) >> 6) & 0xff;
     if (code == trap_PendingInterrupt) {
         /* KLUDGE: is this neccessary or will handle_trap do the same? */
         arch_clear_pseudo_atomic_interrupted(context);

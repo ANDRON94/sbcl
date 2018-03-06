@@ -474,10 +474,6 @@
            two-arg-char-not-greaterp)
     (character character) boolean (movable foldable flushable))
 
-(defknown char-equal-constant (character character character)
-  boolean
-  (movable foldable flushable))
-
 (defknown character (t) character (movable foldable unsafely-flushable))
 (defknown char-code (character) char-code (movable foldable flushable))
 (defknown (char-upcase char-downcase) (character) character
@@ -514,10 +510,9 @@
 (defknown reverse (sequence) consed-sequence (flushable)
   :derive-type (sequence-result-nth-arg 1 :preserve-dimensions t))
 
-(defknown nreverse (sequence) sequence (important-result)
+(defknown nreverse ((modifying sequence)) sequence (important-result)
   :derive-type (sequence-result-nth-arg 1 :preserve-dimensions t
-                                          :preserve-vector-type t)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+                                          :preserve-vector-type t))
 
 (defknown make-sequence (type-specifier index
                                         &key
@@ -549,17 +544,17 @@
   )
 (defknown %map (type-specifier function-designator &rest sequence) consed-sequence (call))
 (defknown %map-for-effect-arity-1 (function-designator sequence) null (call))
-(defknown %map-to-list-arity-1 (function-designator sequence) list (flushable call))
-(defknown %map-to-simple-vector-arity-1 (function-designator sequence) simple-vector
+(defknown %map-to-list-arity-1 ((function-designator ((nth-arg 1 :sequence t))) sequence) list (flushable call))
+(defknown %map-to-simple-vector-arity-1 ((function-designator ((nth-arg 1 :sequence t))) sequence) simple-vector
   (flushable call))
 
-(defknown map-into (sequence (function-designator ((rest-args :sequence t))
-                                                  (nth-arg 0 :sequence t))
-                             &rest sequence)
+(defknown map-into ((modifying sequence)
+                    (function-designator ((rest-args :sequence t))
+                                         (nth-arg 0 :sequence t))
+                    &rest sequence)
   sequence
   (call)
-  :derive-type #'result-type-first-arg
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+  :derive-type #'result-type-first-arg)
 
 (defknown #.(loop for info across sb!vm:*specialized-array-element-type-properties*
                   collect
@@ -579,31 +574,32 @@
 
 (defknown reduce ((function-designator ((nth-arg 1 :sequence t :key :key)
                                         (nth-arg 1 :sequence t :key :key)))
-                  sequence &rest t &key (:from-end t) (:start index)
-                  (:end sequence-end) (:initial-value t)
+                  sequence &rest t &key (:from-end t)
+                  (:start (inhibit-flushing index 0))
+                  (:end (inhibit-flushing sequence-end nil))
+                  (:initial-value t)
                   (:key (function-designator ((nth-arg 1 :sequence t)))))
   t
   (foldable flushable call))
 
-(defknown fill (sequence t &rest t &key
-                         (:start index) (:end sequence-end)) sequence
+(defknown fill ((modifying sequence) t &rest t &key
+                (:start index) (:end sequence-end)) sequence
     ()
   :derive-type #'result-type-first-arg
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1)
   :result-arg 0)
 
-(defknown replace (sequence sequence &rest t &key (:start1 index)
+(defknown replace ((modifying sequence) sequence &rest t &key (:start1 index)
                    (:end1 sequence-end) (:start2 index) (:end2 sequence-end))
   sequence ()
   :derive-type #'result-type-first-arg
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1)
   :result-arg 0)
 
 (defknown remove
     (t sequence &rest t &key (:from-end t)
      (:test (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
      (:test-not (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
-     (:start index) (:end sequence-end)
+     (:start (inhibit-flushing index 0))
+     (:end (inhibit-flushing sequence-end nil))
      (:count sequence-count)
      (:key (function-designator ((nth-arg 1 :sequence t)))))
   consed-sequence
@@ -614,7 +610,8 @@
   (t t sequence &rest t &key (:from-end t)
      (:test (function-designator ((nth-arg 1) (nth-arg 2 :sequence t :key :key))))
      (:test-not (function-designator ((nth-arg 1) (nth-arg 2 :sequence t :key :key))))
-     (:start index) (:end sequence-end)
+     (:start (inhibit-flushing index 0))
+     (:end (inhibit-flushing sequence-end nil))
      (:count sequence-count)
      (:key (function-designator ((nth-arg 2 :sequence t)))))
   consed-sequence
@@ -623,8 +620,10 @@
 
 (defknown (remove-if remove-if-not)
   ((function-designator ((nth-arg 1 :sequence t :key :key))) sequence
-   &rest t &key (:from-end t) (:start index)
-   (:end sequence-end) (:count sequence-count)
+   &rest t &key (:from-end t)
+   (:count sequence-count)
+   (:start (inhibit-flushing index 0))
+   (:end (inhibit-flushing sequence-end nil))
    (:key (function-designator ((nth-arg 1 :sequence t)))))
   consed-sequence
   (flushable call)
@@ -632,56 +631,54 @@
 
 (defknown (substitute-if substitute-if-not)
   (t (function-designator ((nth-arg 2 :sequence t :key :key))) sequence
-     &rest t &key (:from-end t) (:start index)
-     (:end sequence-end) (:count sequence-count)
+     &rest t &key (:from-end t)
+     (:start (inhibit-flushing index 0))
+     (:end (inhibit-flushing sequence-end nil))
+     (:count sequence-count)
      (:key (function-designator ((nth-arg 2 :sequence t)))))
   consed-sequence
   (flushable call)
   :derive-type (sequence-result-nth-arg 3))
 
 (defknown delete
-  (t sequence &rest t &key (:from-end t)
+  (t (modifying sequence) &rest t &key (:from-end t)
      (:test (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
      (:test-not (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
      (:start index) (:end sequence-end)
      (:count sequence-count)
      (:key (function-designator ((nth-arg 1 :sequence t)))))
   sequence
-  (flushable call important-result)
-  :derive-type (sequence-result-nth-arg 2)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 2))
+  (call important-result)
+  :derive-type (sequence-result-nth-arg 2))
 
 (defknown nsubstitute
-  (t t sequence &rest t &key (:from-end t)
+  (t t (modifying sequence) &rest t &key (:from-end t)
      (:test (function-designator ((nth-arg 1) (nth-arg 2 :sequence t :key :key))))
      (:test-not (function-designator ((nth-arg 1) (nth-arg 2 :sequence t :key :key))))
      (:start index) (:end sequence-end)
      (:count sequence-count)
      (:key (function-designator ((nth-arg 2 :sequence t)))))
   sequence
-  (flushable call)
-  :derive-type (sequence-result-nth-arg 3)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 3))
+  (call)
+  :derive-type (sequence-result-nth-arg 3))
 
 (defknown (delete-if delete-if-not)
-  ((function-designator ((nth-arg 1 :sequence t :key :key))) sequence
+  ((function-designator ((nth-arg 1 :sequence t :key :key))) (modifying sequence)
    &rest t &key (:from-end t) (:start index)
    (:end sequence-end) (:count sequence-count)
    (:key (function-designator ((nth-arg 1 :sequence t)))))
   sequence
-  (flushable call important-result)
-  :derive-type (sequence-result-nth-arg 2)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 2))
+  (call important-result)
+  :derive-type (sequence-result-nth-arg 2))
 
 (defknown (nsubstitute-if nsubstitute-if-not)
-  (t (function-designator ((nth-arg 2 :sequence t :key :key))) sequence
+  (t (function-designator ((nth-arg 2 :sequence t :key :key))) (modifying sequence)
      &rest t &key (:from-end t) (:start index)
      (:end sequence-end) (:count sequence-count)
      (:key (function-designator ((nth-arg 2 :sequence t)))))
   sequence
-  (flushable call)
-  :derive-type (sequence-result-nth-arg 3)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 3))
+  (call)
+  :derive-type (sequence-result-nth-arg 3))
 
 (defknown remove-duplicates
   (sequence &rest t &key
@@ -689,41 +686,44 @@
                                         (nth-arg 0 :sequence t :key :key))))
             (:test-not (function-designator ((nth-arg 0 :sequence t :key :key)
                                         (nth-arg 0 :sequence t :key :key))))
-            (:start index)
-            (:from-end t) (:end sequence-end)
+            (:start (inhibit-flushing index 0))
+            (:end (inhibit-flushing sequence-end nil))
+            (:from-end t)
             (:key (function-designator ((nth-arg 0 :sequence t)))))
   consed-sequence
-  (unsafely-flushable call)
+  (flushable call)
   :derive-type (sequence-result-nth-arg 1))
 
 (defknown delete-duplicates
-  (sequence &rest t &key
-            (:test (function-designator ((nth-arg 0 :sequence t :key :key)
-                                        (nth-arg 0 :sequence t :key :key))))
-            (:test-not (function-designator ((nth-arg 0 :sequence t :key :key)
-                                        (nth-arg 0 :sequence t :key :key))))
-            (:start index)
-            (:from-end t) (:end sequence-end)
-            (:key (function-designator ((nth-arg 0 :sequence t)))))
+  ((modifying sequence)
+   &rest t &key
+   (:test (function-designator ((nth-arg 0 :sequence t :key :key)
+                                (nth-arg 0 :sequence t :key :key))))
+   (:test-not (function-designator ((nth-arg 0 :sequence t :key :key)
+                                    (nth-arg 0 :sequence t :key :key))))
+   (:start index)
+   (:from-end t) (:end sequence-end)
+   (:key (function-designator ((nth-arg 0 :sequence t)))))
   sequence
-  (unsafely-flushable call important-result)
-  :derive-type (sequence-result-nth-arg 1)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+  (call important-result)
+  :derive-type (sequence-result-nth-arg 1))
 
 (defknown find
   (t sequence &rest t &key
      (:test (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
      (:test-not (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
-     (:start index) (:from-end t)
-     (:end sequence-end)
+     (:start (inhibit-flushing index 0))
+     (:end (inhibit-flushing sequence-end nil))
+     (:from-end t)
      (:key (function-designator ((nth-arg 1 :sequence t)))))
   t
   (foldable flushable call))
 
 (defknown (find-if find-if-not)
   ((function-designator ((nth-arg 1 :sequence t :key :key))) sequence
-   &rest t &key (:from-end t) (:start index)
-   (:end sequence-end)
+   &rest t &key (:from-end t)
+   (:start (inhibit-flushing index 0))
+   (:end (inhibit-flushing sequence-end nil))
    (:key (function-designator ((nth-arg 1 :sequence t)))))
   t
   (foldable flushable call))
@@ -732,16 +732,18 @@
  (t sequence &rest t &key
     (:test (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
     (:test-not (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
-    (:start index) (:from-end t)
-    (:end sequence-end)
+    (:start (inhibit-flushing index 0))
+    (:end (inhibit-flushing sequence-end nil))
+    (:from-end t)
     (:key (function-designator ((nth-arg 1 :sequence t)))))
   (or (mod #.(1- sb!xc:array-dimension-limit)) null)
   (foldable flushable call))
 
 (defknown (position-if position-if-not)
   ((function-designator ((nth-arg 1 :sequence t :key :key))) sequence
-   &rest t &key (:from-end t) (:start index)
-   (:end sequence-end)
+   &rest t &key (:from-end t)
+   (:start (inhibit-flushing index 0))
+    (:end (inhibit-flushing sequence-end nil))
    (:key (function-designator ((nth-arg 1 :sequence t)))))
   (or (mod #.(1- sb!xc:array-dimension-limit)) null)
   (foldable flushable call))
@@ -750,16 +752,18 @@
   (t sequence &rest t &key
      (:test (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
      (:test-not (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
-     (:start index) (:from-end t)
-     (:end sequence-end)
+     (:from-end t)
+     (:start (inhibit-flushing index 0))
+     (:end (inhibit-flushing sequence-end nil))
      (:key (function-designator ((nth-arg 1 :sequence t)))))
   index
   (foldable flushable call))
 
 (defknown (count-if count-if-not)
   ((function-designator ((nth-arg 1 :sequence t :key :key))) sequence
-   &rest t &key (:from-end t) (:start index)
-   (:end sequence-end)
+   &rest t &key (:from-end t)
+   (:start (inhibit-flushing index 0))
+   (:end (inhibit-flushing sequence-end nil))
    (:key (function-designator ((nth-arg 1 :sequence t)))))
   index
   (foldable flushable call))
@@ -770,8 +774,8 @@
                                 (nth-arg 1 :sequence t :key :key))))
    (:test-not (function-designator ((nth-arg 0 :sequence t :key :key)
                                     (nth-arg 1 :sequence t :key :key))))
-   (:start1 index) (:end1 sequence-end)
-   (:start2 index) (:end2 sequence-end)
+   (:start1 (inhibit-flushing index 0)) (:end1 (inhibit-flushing sequence-end nil))
+   (:start2 (inhibit-flushing index 0)) (:end2 (inhibit-flushing sequence-end nil))
    (:key (function-designator ((or (nth-arg 0 :sequence t)
                                    (nth-arg 1 :sequence t))))))
   (or index null)
@@ -779,43 +783,38 @@
 
 ;;; not FLUSHABLE, since vector sort guaranteed in-place...
 (defknown (stable-sort sort)
-  (sequence (function-designator ((nth-arg 0 :sequence t :key :key)
-                                  (nth-arg 0 :sequence t :key :key)))
-            &rest t
-            &key (:key (function-designator ((nth-arg 0 :sequence t)))))
+  ((modifying sequence)
+   (function-designator ((nth-arg 0 :sequence t :key :key)
+                         (nth-arg 0 :sequence t :key :key)))
+   &rest t
+   &key (:key (function-designator ((nth-arg 0 :sequence t)))))
   sequence
   (call)
-  :derive-type #'result-type-first-arg
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+  :derive-type #'result-type-first-arg)
 (defknown sb!impl::stable-sort-list (list function function) list
-  (call important-result)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+  (call important-result))
 (defknown sb!impl::sort-vector (vector index index function (or function null))
   * ; SORT-VECTOR works through side-effect
-  (call)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+  (call))
 
 (defknown sb!impl::stable-sort-vector
   (vector function (or function null))
   vector
-  (call)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+  (call))
 
 (defknown sb!impl::stable-sort-simple-vector
   (simple-vector function (or function null))
   simple-vector
-  (call)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+  (call))
 
-(defknown merge (type-specifier sequence sequence
+(defknown merge (type-specifier (modifying sequence) (modifying sequence)
                 (function-designator ((nth-arg 1 :sequence t :key :key)
                                       (nth-arg 2 :sequence t :key :key)))
                 &key (:key (function-designator ((or (nth-arg 1 :sequence t)
                                                      (nth-arg 2 :sequence t))))))
   sequence
   (call important-result)
-  :derive-type (creation-result-type-specifier-nth-arg 1)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 2 3))
+  :derive-type (creation-result-type-specifier-nth-arg 1))
 
 (defknown read-sequence (sequence stream
                                   &key
@@ -889,43 +888,34 @@
 (defknown copy-tree (t) t (flushable recursive))
 (defknown revappend (list t) t (flushable))
 
-;;; All but last must be of type LIST, but there seems to be no way to
-;;; express that in this syntax. The result must be LIST, but we do
-;;; not check it now :-).
-(defknown nconc (&rest t) t ()
-  :destroyed-constant-args (remove-non-constants-and-nils #'butlast))
+(defknown nconc (&rest (modifying t :butlast t)) t ())
 
-(defknown nreconc (list t) t (important-result)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+(defknown nreconc ((modifying list) t) t (important-result))
 (defknown butlast (list &optional unsigned-byte) list (flushable))
-(defknown nbutlast (list &optional unsigned-byte) list ()
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1))
+(defknown nbutlast ((modifying list) &optional unsigned-byte) list ())
 
 (defknown ldiff (list t) list (flushable))
-(defknown (rplaca rplacd) (cons t) cons ()
-  :destroyed-constant-args (nth-constant-args 1))
+(defknown (rplaca rplacd) ((modifying cons) t) cons ())
 
 (defknown subst (t t t &key
                    (:test (function-designator ((nth-arg 1) (nth-arg 2 :sequence t :key :key))))
                    (:test-not (function-designator ((nth-arg 1) (nth-arg 2 :sequence t :key :key))))
                    (:key (function-designator ((nth-arg 2 :sequence t)))))
   t (flushable call))
-(defknown nsubst (t t t &key
+(defknown nsubst (t t (modifying t) &key
                     (:test (function-designator ((nth-arg 1) (nth-arg 2 :sequence t :key :key))))
                     (:test-not (function-designator ((nth-arg 1) (nth-arg 2 :sequence t :key :key))))
                     (:key (function-designator ((nth-arg 2 :sequence t)))))
-  t (call)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 3))
+  t (call))
 
 (defknown (subst-if subst-if-not)
   (t (function-designator ((nth-arg 2 :sequence t :key :key))) t
        &key (:key (function-designator ((nth-arg 2 :sequence t)))))
   t (flushable call))
 (defknown (nsubst-if nsubst-if-not)
-  (t (function-designator ((nth-arg 2 :sequence t :key :key))) t
+  (t (function-designator ((nth-arg 2 :sequence t :key :key))) (modifying t)
      &key (:key (function-designator ((nth-arg 2 :sequence t)))))
-  t (call)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 3))
+  t (call))
 
 (defknown sublis
     (list t &key
@@ -936,14 +926,13 @@
           (:key (function-designator ((nth-arg 1 :sequence t)))))
   t (flushable call))
 (defknown nsublis
-  (list t &key
+  (list (modifying t) &key
         (:test (function-designator ((nth-arg 1 :sequence t :key :key)
                                      (nth-arg 0 :sequence t))))
         (:test-not (function-designator ((nth-arg 1 :sequence t :key :key)
                                          (nth-arg 0 :sequence t))))
         (:key (function-designator ((nth-arg 1 :sequence t)))))
-  t (flushable call)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 2))
+  t (flushable call))
 
 (defknown member (t list &key
                     (:test (function-designator ((nth-arg 0) (nth-arg 1 :sequence t :key :key))))
@@ -977,15 +966,15 @@
   (foldable flushable call))
 
 (defknown (nunion nintersection nset-difference nset-exclusive-or)
-  (list list &key (:key (function-designator ((or (nth-arg 0 :sequence t)
-                                                  (nth-arg 1 :sequence t)))))
-                  (:test (function-designator ((nth-arg 0 :sequence t :key :key)
-                                               (nth-arg 1 :sequence t :key :key))))
-                  (:test-not (function-designator ((nth-arg 0 :sequence t :key :key)
-                                                   (nth-arg 1 :sequence t :key :key)))))
+  ((modifying list) (modifying list)
+   &key (:key (function-designator ((or (nth-arg 0 :sequence t)
+                                        (nth-arg 1 :sequence t)))))
+   (:test (function-designator ((nth-arg 0 :sequence t :key :key)
+                                (nth-arg 1 :sequence t :key :key))))
+   (:test-not (function-designator ((nth-arg 0 :sequence t :key :key)
+                                    (nth-arg 1 :sequence t :key :key)))))
   list
-  (foldable flushable call important-result)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1 2))
+  (foldable flushable call important-result))
 
 (defknown subsetp
   (list list &key (:key (function-designator ((or (nth-arg 0 :sequence t)
@@ -1014,8 +1003,7 @@
     list (foldable flushable call))
 
 (defknown (memq assq) (t list) list (foldable flushable))
-(defknown delq (t list) list (flushable)
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 2))
+(defknown delq (t (modifying list)) list (flushable))
 
 ;;;; from the "Hash Tables" chapter:
 
@@ -1033,14 +1021,11 @@
   (flushable)) ; not FOLDABLE, since hash table contents can change
 (defknown sb!impl::gethash3 (t hash-table t) (values t boolean)
   (flushable)) ; not FOLDABLE, since hash table contents can change
-(defknown %puthash (t hash-table t) t ()
-  :destroyed-constant-args (nth-constant-args 2)
+(defknown %puthash (t (modifying hash-table) t) t ()
   :derive-type #'result-type-last-arg)
-(defknown remhash (t hash-table) boolean ()
-  :destroyed-constant-args (nth-constant-args 2))
+(defknown remhash (t (modifying hash-table)) boolean ())
 (defknown maphash ((function-designator (t t)) hash-table) null (flushable call))
-(defknown clrhash (hash-table) hash-table ()
-  :destroyed-constant-args (nth-constant-args 2))
+(defknown clrhash ((modifying hash-table)) hash-table ())
 (defknown hash-table-count (hash-table) index (flushable))
 (defknown hash-table-rehash-size (hash-table) (or index (single-float (1.0)))
   (foldable flushable))
@@ -1127,7 +1112,7 @@
 (defknown bit ((array bit) &rest index) bit (foldable flushable))
 (defknown sbit ((simple-array bit) &rest index) bit (foldable flushable))
 
-;;; FIXME: :DESTROYED-CONSTANT-ARGS for these is complicated.
+;;; FIXME: MODIFYING for these is complicated.
 (defknown (bit-and bit-ior bit-xor bit-eqv bit-nand bit-nor bit-andc1 bit-andc2
                    bit-orc1 bit-orc2)
   ((array bit) (array bit) &optional (or (array bit) (member t nil)))
@@ -1149,15 +1134,12 @@
     (unsafely-flushable))
 (defknown sb!impl::fill-pointer-error (t &optional t) nil)
 
-(defknown vector-push (t complex-vector) (or index null) ()
-  :destroyed-constant-args (nth-constant-args 2))
-(defknown vector-push-extend (t complex-vector &optional (and index (integer 1))) index
-    ()
-  :destroyed-constant-args (nth-constant-args 2))
-(defknown vector-pop (complex-vector) t ()
-  :destroyed-constant-args (nth-constant-args 1))
+(defknown vector-push (t (modifying complex-vector)) (or index null) ())
+(defknown vector-push-extend (t (modifying complex-vector) &optional (and index (integer 1))) index
+    ())
+(defknown vector-pop ((modifying complex-vector)) t ())
 
-;;; FIXME: complicated :DESTROYED-CONSTANT-ARGS
+;;; FIXME: complicated MODIFYING
 ;;; Also, an important-result warning could be provided if the array
 ;;; is known to be not expressly adjustable.
 (defknown adjust-array
@@ -1175,16 +1157,18 @@
 (defknown schar (simple-string index) character (foldable flushable))
 
 (defknown (string= string-equal)
-  (string-designator string-designator &key (:start1 index) (:end1 sequence-end)
-              (:start2 index) (:end2 sequence-end))
+  (string-designator string-designator &key
+    (:start1 (inhibit-flushing index 0)) (:end1 (inhibit-flushing sequence-end nil))
+    (:start2 (inhibit-flushing index 0)) (:end2 (inhibit-flushing sequence-end nil)))
   boolean
   (foldable flushable))
 
 (defknown (string< string> string<= string>= string/= string-lessp
                    string-greaterp string-not-lessp string-not-greaterp
                    string-not-equal)
-  (string-designator string-designator &key (:start1 index) (:end1 sequence-end)
-              (:start2 index) (:end2 sequence-end))
+  (string-designator string-designator &key
+   (:start1 (inhibit-flushing index 0)) (:end1 (inhibit-flushing sequence-end nil))
+   (:start2 (inhibit-flushing index 0)) (:end2 (inhibit-flushing sequence-end nil)))
   (or index null)
   (foldable flushable))
 
@@ -1208,13 +1192,14 @@
   (sequence string-designator) string (flushable))
 
 (defknown (string-upcase string-downcase string-capitalize)
-  (string-designator &key (:start index) (:end sequence-end))
+  (string-designator &key
+   (:start (inhibit-flushing index 0))
+   (:end (inhibit-flushing sequence-end nil)))
   simple-string (flushable))
 
 (defknown (nstring-upcase nstring-downcase nstring-capitalize)
-  (string &key (:start index) (:end sequence-end))
+  ((modifying string) &key (:start index) (:end sequence-end))
   string ()
-  :destroyed-constant-args (nth-constant-nonempty-sequence-args 1)
   :derive-type #'result-type-first-arg)
 
 (defknown string (string-designator) string (flushable))
@@ -1222,12 +1207,16 @@
 ;;;; internal non-keyword versions of string predicates:
 
 (defknown (string<* string>* string<=* string>=* string/=*)
-  (string-designator string-designator index sequence-end index sequence-end)
+    (string-designator string-designator
+                       (inhibit-flushing index 0) (inhibit-flushing sequence-end nil)
+                       (inhibit-flushing index 0) (inhibit-flushing sequence-end nil))
   (or index null)
   (foldable flushable))
 
 (defknown string=*
-  (string-designator string-designator index sequence-end index sequence-end)
+  (string-designator string-designator
+                     (inhibit-flushing index 0) (inhibit-flushing sequence-end nil)
+                     (inhibit-flushing index 0) (inhibit-flushing sequence-end nil))
   boolean
   (foldable flushable))
 
@@ -1436,7 +1425,7 @@
 (defknown write-byte (integer stream) integer ()
   :derive-type #'result-type-first-arg)
 
-;;; FIXME: complicated :DESTROYED-CONSTANT-ARGS
+;;; FIXME: complicated MODIFYING
 (defknown format ((or (member nil t) stream string)
                   (or string function) &rest t)
   (or string null)
@@ -1512,25 +1501,25 @@
        (:directory (or pathname-directory string (member :wild)))
        (:name (or pathname-name string (member :wild)))
        (:type (or pathname-type string (member :wild)))
-       (:version pathname-version) (:case (member :local :common)))
+       (:version pathname-version) (:case pathname-component-case))
   pathname (unsafely-flushable))
 
 (defknown pathnamep (t) boolean (movable flushable))
 
 (defknown pathname-host (pathname-designator
-                         &key (:case (member :local :common)))
+                         &key (:case pathname-component-case))
   pathname-host (flushable))
 (defknown pathname-device (pathname-designator
-                           &key (:case (member :local :common)))
+                           &key (:case pathname-component-case))
   pathname-device (flushable))
 (defknown pathname-directory (pathname-designator
-                              &key (:case (member :local :common)))
+                              &key (:case pathname-component-case))
   pathname-directory (flushable))
 (defknown pathname-name (pathname-designator
-                         &key (:case (member :local :common)))
+                         &key (:case pathname-component-case))
   pathname-name (flushable))
 (defknown pathname-type (pathname-designator
-                         &key (:case (member :local :common)))
+                         &key (:case pathname-component-case))
   pathname-type (flushable))
 (defknown pathname-version (pathname-designator)
   pathname-version (flushable))
@@ -1572,7 +1561,7 @@
 (defknown file-position (stream &optional
                                 (or unsigned-byte (member :start :end)))
   (or unsigned-byte (member t nil)))
-(defknown file-length (stream) (or unsigned-byte null) (unsafely-flushable))
+(defknown file-length ((or file-stream synonym-stream broadcast-stream)) (or unsigned-byte null) (unsafely-flushable))
 
 (defknown load
   ((or filename stream)
@@ -1821,11 +1810,13 @@
   (values (simple-array * (*)) index index index)
   (foldable flushable))
 (defknown %set-symbol-package (symbol t) t ())
-(defknown %coerce-callable-to-fun (function-designator) function (flushable))
+(defknown (%coerce-callable-to-fun %coerce-callable-for-call)
+    (function-designator)
+    function (flushable))
 (defknown array-bounding-indices-bad-error (t t t) nil)
 (defknown sequence-bounding-indices-bad-error (t t t) nil)
 (defknown %find-position
-    (t sequence t index sequence-end function function)
+    (t sequence t index sequence-end (function (t)) (function (t t)))
   (values t (or index null))
   (flushable call))
 (defknown (%find-position-if %find-position-if-not)
@@ -1851,49 +1842,49 @@
     (foldable flushable))
 
 (defknown (%adjoin-key %adjoin-key-eq)
-    (t list function)
+    (t list (function (t)))
     list
     (flushable call))
 
 (defknown (%member-key %member-key-eq
            %assoc-key %assoc-key-eq %rassoc-key %rassoc-key-eq)
-  (t list function)
+  (t list (function (t)))
   list
   (foldable flushable call))
 
 (defknown (%assoc-if %assoc-if-not %rassoc-if %rassoc-if-not
            %member-if %member-if-not)
-  (function list)
+  ((function (t)) list)
   list
   (foldable flushable call))
 
 (defknown (%assoc-if-key %assoc-if-not-key %rassoc-if-key %rassoc-if-not-key
            %member-if-key %member-if-not-key)
-  (function list function)
+  ((function (t)) list (function (t)))
   list
   (foldable flushable call))
 
 (defknown (%adjoin-test %adjoin-test-not)
-    (t list function)
+    (t list (function (t t)))
     list
     (flushable call))
 
 (defknown (%member-test %member-test-not
            %assoc-test %assoc-test-not
            %rassoc-test %rassoc-test-not)
-    (t list function)
+    (t list (function (t t)))
     list
     (foldable flushable call))
 
 (defknown (%adjoin-key-test %adjoin-key-test-not)
-    (t list function function)
+    (t list (function (t)) (function (t t)))
     list
     (flushable call))
 
 (defknown (%member-key-test %member-key-test-not
            %assoc-key-test %assoc-key-test-not
            %rassoc-key-test %rassoc-key-test-not)
-    (t list function function)
+    (t list (function (t)) (function (t t)))
     list
     (foldable flushable call))
 
@@ -1903,40 +1894,32 @@
 
 ;;;; SETF inverses
 
-(defknown (setf aref) (t array &rest index) t ()
-  :destroyed-constant-args (nth-constant-args 2)
-  :call-type-deriver #'array-call-type-deriver)
-(defknown %set-row-major-aref (array index t) t ()
-  :destroyed-constant-args (nth-constant-args 1))
-(defknown (%rplaca %rplacd) (cons t) t ()
-  :destroyed-constant-args (nth-constant-args 1)
+(defknown (setf aref) (t (modifying array) &rest index) t ()
+  :call-type-deriver (lambda (call trusted)
+                       (array-call-type-deriver call trusted t)))
+(defknown %set-row-major-aref ((modifying array) index t) t ())
+(defknown (%rplaca %rplacd) ((modifying cons) t) t ()
   :derive-type #'result-type-last-arg)
 (defknown %put (symbol t t) t ())
-(defknown %setelt (sequence index t) t ()
-  :destroyed-constant-args (nth-constant-args 1)
+(defknown %setelt ((modifying sequence) index t) t ()
   :derive-type #'result-type-last-arg)
-(defknown %svset (simple-vector index t) t ()
-  :destroyed-constant-args (nth-constant-args 1))
-(defknown (setf bit) (bit (array bit) &rest index) bit ()
-  :destroyed-constant-args (nth-constant-args 2))
-(defknown (setf sbit) (bit (simple-array bit) &rest index) bit ()
-  :destroyed-constant-args (nth-constant-args 2))
-(defknown %charset (string index character) character ()
-  :destroyed-constant-args (nth-constant-args 1))
-(defknown %scharset (simple-string index character) character ()
-  :destroyed-constant-args (nth-constant-args 1))
+(defknown %svset ((modifying simple-vector) index t) t ())
+(defknown (setf bit) (bit (modifying (array bit)) &rest index) bit ())
+(defknown (setf sbit) (bit (modifying (simple-array bit)) &rest index) bit ())
+(defknown %charset ((modifying string) index character) character ())
+(defknown %scharset ((modifying simple-string) index character) character ())
 (defknown %set-symbol-value (symbol t) t ())
 (defknown (setf symbol-function) (function symbol) function ())
 (defknown %set-symbol-plist (symbol list) list ()
   :derive-type #'result-type-last-arg)
-(defknown %setnth (unsigned-byte list t) t ()
-  :destroyed-constant-args (nth-constant-args 2)
+(defknown %setnth (unsigned-byte (modifying list) t) t ()
   :derive-type #'result-type-last-arg)
-(defknown %set-fill-pointer (complex-vector index) index ()
-  :destroyed-constant-args (nth-constant-args 1)
+(defknown %set-fill-pointer ((modifying complex-vector) index) index ()
   :derive-type #'result-type-last-arg)
 
 ;;;; ALIEN and call-out-to-C stuff
+
+(defknown %alien-funcall ((or string system-area-pointer) alien-type &rest *) *)
 
 ;; Used by WITH-PINNED-OBJECTS
 #!+(or x86 x86-64)
@@ -2049,3 +2032,7 @@
 (defknown find-class (symbol &optional t lexenv-designator) (or class null) ())
 (defknown class-of (t) class (flushable))
 (defknown class-name (class) symbol (flushable))
+
+(defknown finalize
+    (t (function-designator () * :no-function-conversion t) &key (:dont-save t))
+    *)

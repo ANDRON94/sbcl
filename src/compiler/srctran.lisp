@@ -79,7 +79,6 @@
 ;;; Don't transform CAD*R, they are treated specially for &more args
 ;;; optimizations
 
-(/show0 "about to set CxR source transforms")
 (loop for i of-type index from 2 upto 4 do
       ;; Iterate over BUF = all names CxR where x = an I-element
       ;; string of #\A or #\D characters.
@@ -96,7 +95,6 @@
                           :test #'equal)
             (setf (info :function :source-transform (intern buf))
                   #'source-transform-cxr)))))
-(/show0 "done setting CxR source transforms")
 
 ;;; Turn FIRST..FOURTH and REST into the obvious synonym, assuming
 ;;; whatever is right for them is right for us. FIFTH..TENTH turn into
@@ -439,10 +437,10 @@
                       (float-infinity-p y))
                  nil
                  (set-bound y (and strict (consp x))))))
-         ;; Some numerical operations will signal SIMPLE-TYPE-ERROR, e.g.
-         ;; in the course of converting a bignum to a float.  Default to
+         ;; Some numerical operations will signal an ERROR, e.g. in
+         ;; the course of converting a bignum to a float. Default to
          ;; NIL in that case.
-         (simple-type-error ()))))
+         (arithmetic-error ()))))
 
 (defun safe-double-coercion-p (x)
   (or (typep x 'double-float)
@@ -1966,31 +1964,34 @@
   ;; need.
   (let ((lo (interval-low quot))
         (hi (interval-high quot)))
-    ;; Take the floor of the lower bound. The result is always a
-    ;; closed lower bound.
-    (when lo
-      (setf lo (- (floor (type-bound-number lo))
-                  ;; FLOOR on floats depends on the divisor,
-                  ;; make it conservative
-                  (if (floatp (type-bound-number lo))
-                      1
-                      0))))
-    ;; For the upper bound, we need to be careful.
-    (setf hi
-          (cond ((consp hi)
+    (make-interval
+     ;; Take the floor of the lower bound. The result is always a
+     ;; closed lower bound.
+     :low
+     (and lo
+          (- (floor (type-bound-number lo))
+             ;; FLOOR on floats depends on the divisor,
+             ;; make it conservative
+             (if (floatp (type-bound-number lo))
+                 1
+                 0)))
+     :high
+     (and hi
+          (+ (if (consp hi)
                  ;; An open bound. We need to be careful here because
                  ;; the floor of '(10.0) is 9, but the floor of
                  ;; 10.0 is 10.
                  (multiple-value-bind (q r) (floor (first hi))
                    (if (zerop r)
                        (1- q)
-                       q)))
-                (hi
+                       q))
                  ;; A closed bound, so the answer is obvious.
                  (floor hi))
-                (t
-                 hi)))
-    (make-interval :low lo :high hi)))
+             ;; Be conservative
+             (if (floatp (type-bound-number hi))
+                 1
+                 0))))))
+
 (defun floor-rem-bound (div)
   ;; The remainder depends only on the divisor. Try to get the
   ;; correct sign for the remainder if we can.
@@ -2062,31 +2063,33 @@
   ;; need.
   (let ((lo (interval-low quot))
         (hi (interval-high quot)))
-    ;; Take the ceiling of the upper bound. The result is always a
-    ;; closed upper bound.
-    (when hi
-      (setf hi (+ (floor (type-bound-number hi))
-                  ;; CEILING on floats depends on the divisor,
-                  ;; make it conservative
-                  (if (ceiling (type-bound-number hi))
-                      1
-                      0))))
-    ;; For the lower bound, we need to be careful.
-    (setf lo
-          (cond ((consp lo)
+    (make-interval
+     :low
+     (and lo
+          (- (if (consp lo)
                  ;; An open bound. We need to be careful here because
                  ;; the ceiling of '(10.0) is 11, but the ceiling of
                  ;; 10.0 is 10.
                  (multiple-value-bind (q r) (ceiling (first lo))
                    (if (zerop r)
                        (1+ q)
-                       q)))
-                (lo
+                       q))
                  ;; A closed bound, so the answer is obvious.
                  (ceiling lo))
-                (t
-                 lo)))
-    (make-interval :low lo :high hi)))
+             ;; CEILING on floats depends on the divisor,
+             ;; make it conservative
+             (if (floatp (type-bound-number lo))
+                 1
+                 0)))
+     :high
+     ;; Take the ceiling of the upper bound. The result is always a
+     ;; closed upper bound.
+     (and hi
+          (+ (ceiling (type-bound-number hi))
+             ;; Be conservative
+             (if (floatp (type-bound-number hi))
+                 1
+                 0))))))
 (defun ceiling-rem-bound (div)
   ;; The remainder depends only on the divisor. Try to get the
   ;; correct sign for the remainder if we can.
@@ -2498,7 +2501,9 @@
 ;;;; A transform approximates that, but fails when BYTE is produced by an
 ;;;; inline function and not a macro.
 (flet ((xform (bytespec-form env int fun &optional (new nil setter-p))
-         (let ((spec (%macroexpand bytespec-form env)))
+         (let ((spec (handler-case (%macroexpand bytespec-form env)
+                       (error ()
+                         (return-from xform (values nil t))))))
            (if (and (consp spec) (eq (car spec) 'byte))
                (if (proper-list-of-length-p (cdr spec) 2)
                    (values `(,fun ,@(if setter-p (list new))
@@ -3636,18 +3641,19 @@
                  (and (> sum 415) (< sum 461))
                  (and (> sum 463) (< sum 477))))))))
 
-(deftransform two-arg-char-equal ((a b) (* (constant-arg character)) *
-                                  :node node)
+(defun transform-constant-char-equal (a b &optional (op 'char=))
   (let ((char (lvar-value b)))
     (if (both-case-p char)
         (let ((reverse (if (upper-case-p char)
                            (char-downcase char)
                            (char-upcase char))))
-          (if (policy node (> speed space))
-              `(or (char= a ,char)
-                   (char= a ,reverse))
-              `(char-equal-constant a ,char ,reverse)))
-        '(char= a b))))
+          `(or (,op ,a ,char)
+               (,op ,a ,reverse)))
+        `(,op ,a ,char))))
+
+(deftransform two-arg-char-equal ((a b) (* (constant-arg character)) *
+                                  :node node)
+  (transform-constant-char-equal 'a b))
 
 (deftransform char-upcase ((x) (base-char))
   "open code"
@@ -3815,6 +3821,9 @@
               (equal (lvar-value y) ""))
          `(and (stringp x)
                (zerop (length x))))
+        ((or (some-csubtypep 'symbol)
+             (some-csubtypep 'character))
+         `(eq x y))
         ((both-csubtypep 'string)
          '(string= x y))
         ((both-csubtypep 'bit-vector)
@@ -3861,19 +3870,31 @@
     (flet ((both-csubtypep (type)
              (let ((ctype (specifier-type type)))
                (and (csubtypep x-type ctype)
-                    (csubtypep y-type ctype)))))
+                    (csubtypep y-type ctype))))
+           (some-csubtypep (type)
+             (let ((ctype (specifier-type type)))
+               (or (csubtypep x-type ctype)
+                   (csubtypep y-type ctype))))
+           (transform-char-equal (x y)
+             (and (constant-lvar-p y)
+                  (characterp (lvar-value y))
+                  (transform-constant-char-equal x y 'eq))))
       (cond
         ((same-leaf-ref-p x y) t)
         ((array-type-dimensions-mismatch x-type y-type)
          nil)
         ((and (constant-lvar-p x)
-              (equal (lvar-value x) ""))
-         `(and (stringp y)
+              (typep (lvar-value x) '(simple-array * (0))))
+         `(and (vectorp y)
                (zerop (length y))))
         ((and (constant-lvar-p y)
-              (equal (lvar-value y) ""))
-         `(and (stringp x)
+              (typep (lvar-value y) '(simple-array * (0))))
+         `(and (vectorp x)
                (zerop (length x))))
+        ((some-csubtypep 'symbol)
+         `(eq x y))
+        ((transform-char-equal 'x y))
+        ((transform-char-equal 'y x))
         ((both-csubtypep 'string)
          '(string-equal x y))
         ((both-csubtypep 'bit-vector)
@@ -3881,7 +3902,7 @@
         ((both-csubtypep 'pathname)
          '(pathname= x y))
         ((both-csubtypep 'character)
-         '(char-equal x y))
+         '(two-arg-char-equal x y))
         ((both-csubtypep 'number)
          '(= x y))
         ((both-csubtypep 'hash-table)
@@ -3942,6 +3963,14 @@
            ;; They are both rationals and complexp is the same.
            ;; Convert to EQL.
            '(eql x y))
+          ((or (and (csubtypep x-type (specifier-type 'real))
+                    (csubtypep y-type
+                               (specifier-type '(complex rational))))
+               (and (csubtypep y-type (specifier-type 'real))
+                    (csubtypep x-type
+                               (specifier-type '(complex rational)))))
+           ;; Can't be EQL since imagpart can't be 0.
+           nil)
           (t
            (give-up-ir1-transform
             "The operands might not be the same type.")))))
@@ -4460,15 +4489,13 @@
       `(values-list list)))
 
 (deftransform %rest-ref ((n list context count &optional length-checked-p))
-  (cond ((rest-var-more-context-ok list)
-         (if (and (constant-lvar-p length-checked-p)
-                  (lvar-value length-checked-p))
-             `(%more-arg context n)
-             `(and (< (the index n) count) (%more-arg context n))))
-        ((and (constant-lvar-p n) (zerop (lvar-value n)))
-         `(car list))
+  (cond ((not (rest-var-more-context-ok list))
+         `(nth n list))
+        ((and (constant-lvar-p length-checked-p)
+              (lvar-value length-checked-p))
+         `(%more-arg context n))
         (t
-         `(nth n list))))
+         `(and (< (the index n) count) (%more-arg context n)))))
 
 (deftransform %rest-length ((list context count))
   (if (rest-var-more-context-ok list)
@@ -4502,8 +4529,6 @@
 ;;; list type, a warning could be signalled.
 (defun check-format-args (string args fun)
   (declare (type string string))
-  (unless (typep string 'simple-string)
-    (setq string (coerce string 'simple-string)))
   (multiple-value-bind (min max)
       (handler-case (sb!format:%compiler-walk-format-string string args)
         (sb!format:format-error (c)
@@ -4615,7 +4640,7 @@
 (deftransform format ((stream control &rest args) (null (constant-arg string) &rest string))
   (let ((tokenized
           (handler-case
-              (sb!format::tokenize-control-string (lvar-value control))
+              (sb!format::tokenize-control-string (coerce (lvar-value control) 'simple-string))
             (sb!format:format-error ()
               (give-up-ir1-transform)))))
     (unless (concatenate-format-p tokenized args)
@@ -4841,44 +4866,39 @@
               (%parent (i) `(ash ,i -1))
               (%left (i) `(%index (ash ,i 1)))
               (%right (i) `(%index (1+ (ash ,i 1))))
+              (%elt (i)
+                `(aref ,',vector
+                       (%index (+ (%index ,i) start-1))))
               (%heapify (i)
-               `(do* ((i ,i)
-                      (left (%left i) (%left i)))
-                 ((> left current-heap-size))
-                 (declare (type index i left))
-                 (let* ((i-elt (%elt i))
-                        (i-key (funcall keyfun i-elt))
-                        (left-elt (%elt left))
-                        (left-key (funcall keyfun left-elt)))
-                   (multiple-value-bind (large large-elt large-key)
-                       (if (funcall ,',predicate i-key left-key)
-                           (values left left-elt left-key)
-                           (values i i-elt i-key))
-                     (let ((right (%right i)))
-                       (multiple-value-bind (largest largest-elt)
-                           (if (> right current-heap-size)
-                               (values large large-elt)
-                               (let* ((right-elt (%elt right))
-                                      (right-key (funcall keyfun right-elt)))
-                                 (if (funcall ,',predicate large-key right-key)
-                                     (values right right-elt)
-                                     (values large large-elt))))
-                         (cond ((= largest i)
-                                (return))
-                               (t
-                                (setf (%elt i) largest-elt
-                                      (%elt largest) i-elt
-                                      i largest)))))))))
-              (%sort-vector (keyfun &optional (vtype 'vector))
-               `(macrolet (;; KLUDGE: In SBCL ca. 0.6.10, I had
-                           ;; trouble getting type inference to
-                           ;; propagate all the way through this
-                           ;; tangled mess of inlining. The TRULY-THE
-                           ;; here works around that. -- WHN
-                           (%elt (i)
-                            `(aref (truly-the ,',vtype ,',',vector)
-                              (%index (+ (%index ,i) start-1)))))
-                 (let (;; Heaps prefer 1-based addressing.
+                `(do* ((i ,i)
+                       (left (%left i) (%left i)))
+                      ((> left current-heap-size))
+                   (declare (type index i left))
+                   (let* ((i-elt (%elt i))
+                          (i-key (funcall keyfun i-elt))
+                          (left-elt (%elt left))
+                          (left-key (funcall keyfun left-elt)))
+                     (multiple-value-bind (large large-elt large-key)
+                         (if (funcall ,',predicate i-key left-key)
+                             (values left left-elt left-key)
+                             (values i i-elt i-key))
+                       (let ((right (%right i)))
+                         (multiple-value-bind (largest largest-elt)
+                             (if (> right current-heap-size)
+                                 (values large large-elt)
+                                 (let* ((right-elt (%elt right))
+                                        (right-key (funcall keyfun right-elt)))
+                                   (if (funcall ,',predicate large-key right-key)
+                                       (values right right-elt)
+                                       (values large large-elt))))
+                           (cond ((= largest i)
+                                  (return))
+                                 (t
+                                  (setf (%elt i) largest-elt
+                                        (%elt largest) i-elt
+                                        i largest)))))))))
+              (%sort-vector (keyfun)
+                `(let ( ;; Heaps prefer 1-based addressing.
                        (start-1 (1- ,',start))
                        (current-heap-size (- ,',end ,',start))
                        (keyfun ,keyfun))
@@ -4894,21 +4914,22 @@
                       (return))
                     (rotatef (%elt 1) (%elt current-heap-size))
                     (decf current-heap-size)
-                    (%heapify 1))))))
-    (if (typep ,vector 'simple-vector)
-        ;; (VECTOR T) is worth optimizing for, and SIMPLE-VECTOR is
-        ;; what we get from (VECTOR T) inside WITH-ARRAY-DATA.
-        (if (null ,key)
-            ;; Special-casing the KEY=NIL case lets us avoid some
-            ;; function calls.
-            (%sort-vector #'identity simple-vector)
-            (%sort-vector ,key simple-vector))
-        ;; It's hard to anticipate many speed-critical applications for
-        ;; sorting vector types other than (VECTOR T), so we just lump
-        ;; them all together in one slow dynamically typed mess.
-        (locally
-          (declare (optimize (speed 2) (space 2) (inhibit-warnings 3)))
-          (%sort-vector (or ,key #'identity))))))
+                    (%heapify 1)))))
+     (declare (optimize (insert-array-bounds-checks 0) speed))
+     (if (typep ,vector 'simple-vector)
+         ;; (VECTOR T) is worth optimizing for, and SIMPLE-VECTOR is
+         ;; what we get from (VECTOR T) inside WITH-ARRAY-DATA.
+         (if (null ,key)
+             ;; Special-casing the KEY=NIL case lets us avoid some
+             ;; function calls.
+             (%sort-vector #'identity)
+             (%sort-vector ,key))
+         ;; It's hard to anticipate many speed-critical applications for
+         ;; sorting vector types other than (VECTOR T), so we just lump
+         ;; them all together in one slow dynamically typed mess.
+         (locally
+             (declare (optimize (inhibit-warnings 3)))
+           (%sort-vector (or ,key #'identity))))))
 
 (deftransform sort ((list predicate &key key)
                     (list * &rest t) *)
@@ -4983,7 +5004,9 @@
 
 #!-(and win32 (not sb-thread))
 (deftransform sleep ((seconds) ((integer 0 #.(expt 10 8))))
-  `(sb!unix:nanosleep seconds 0))
+  `(if sb!impl::*deadline*
+       (locally (declare (notinline sleep)) (sleep seconds))
+       (sb!unix:nanosleep seconds 0)))
 
 #!-(and win32 (not sb-thread))
 (deftransform sleep ((seconds) ((constant-arg (real 0))))
@@ -4992,7 +5015,9 @@
         (sb!impl::split-seconds-for-sleep seconds-value)
       (if (> seconds (expt 10 8))
           (give-up-ir1-transform)
-          `(sb!unix:nanosleep ,seconds ,nano)))))
+          `(if sb!impl::*deadline*
+               (locally (declare (notinline sleep)) (sleep seconds))
+               (sb!unix:nanosleep ,seconds ,nano))))))
 
 ;; On 64-bit architectures the TLS index is in the symbol header,
 ;; !DEFINE-PRIMITIVE-OBJECT doesn't define an accessor for it.
@@ -5013,7 +5038,8 @@
   (let ((element-type (cond ((not element-type)
                              'character)
                             ((constant-lvar-p element-type)
-                             (let ((specifier (careful-specifier-type (lvar-value element-type))))
+                             (let ((specifier (ir1-transform-specifier-type
+                                               (lvar-value element-type))))
                                (and (csubtypep specifier (specifier-type 'character))
                                     (type-specifier specifier)))))))
    (if element-type
@@ -5056,6 +5082,15 @@
     (xform symbol :global `(sym-global-val symbol)))
   (deftransform symbol-value ((symbol))
     (xform symbol :special `(symeval symbol))))
+
+(deftransform symeval ((symbol) ((constant-arg symbol)))
+  (let* ((symbol (lvar-value symbol))
+         (kind (info :variable :kind symbol)))
+    (if (and (eq kind :constant)
+             (boundp symbol)
+             (typep (symbol-value symbol) '(or number character symbol)))
+        symbol
+        (give-up-ir1-transform))))
 
 (flet ((xform (symbol match-kind)
          (let* ((symbol (lvar-value symbol))

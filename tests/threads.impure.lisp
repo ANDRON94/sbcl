@@ -11,18 +11,23 @@
 ;;;; absoluely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
-; WHITE-BOX TESTS
+
+;;;; WHITE-BOX TESTS
 
-(cl:in-package #:sb-thread)
-(cl:shadowing-import 'assertoid:assert-error)
-(cl:use-package '#:test-util)
-(cl:use-package '#:assertoid)
+(shadowing-import 'assertoid:assert-error)
+(use-package :sb-thread)
+(use-package :sb-sys)
+(use-package '#:test-util)
+(use-package '#:assertoid)
 
 (setf sb-unix::*on-dangerous-wait* :error)
 
 (defun wait-for-threads (threads)
-  (mapc (lambda (thread) (sb-thread:join-thread thread :default nil)) threads)
-  (assert (not (some #'sb-thread:thread-alive-p threads))))
+  (mapc (lambda (thread) (join-thread thread :default nil)) threads)
+  (assert (not (some #'thread-alive-p threads))))
+
+(defun process-all-interrupts (&optional (thread *current-thread*))
+  (sb-ext:wait-for (null (sb-thread::thread-interruptions thread))))
 
 (with-test (:name (:threads :trivia))
   (assert (eql 1 (length (list-all-threads))))
@@ -33,7 +38,7 @@
 
   (assert (thread-alive-p *current-thread*)))
 
-(with-test (:name (:with-mutex :basics))
+(with-test (:name (with-mutex :basics))
   (let ((mutex (make-mutex)))
     (with-mutex (mutex)
       mutex)))
@@ -45,35 +50,42 @@
     void
   (where sb-alien:unsigned-long))
 
-(with-test (:name (:interrupt-thread :basics :no-unwinding))
+(with-test (:name (interrupt-thread :basics :no-unwinding))
   (let ((a 0))
     (interrupt-thread *current-thread* (lambda () (setq a 1)))
+    (process-all-interrupts)
     (assert (eql a 1))))
 
-(with-test (:name (:interrupt-thread :deferrables-blocked))
-  (sb-thread:interrupt-thread sb-thread:*current-thread*
-                              (lambda ()
-                                (check-deferrables-blocked-or-lose 0))))
+(with-test (:name (interrupt-thread :deferrables-blocked))
+  (interrupt-thread *current-thread*
+                    (lambda ()
+                      ;; Make sure sb-ext:gc doesn't leave the
+                      ;; deferrables unblocked
+                      (sb-ext:gc)
+                      (check-deferrables-blocked-or-lose 0)))
+  (process-all-interrupts))
 
-(with-test (:name (:interrupt-thread :deferrables-unblocked))
-  (sb-thread:interrupt-thread sb-thread:*current-thread*
-                              (lambda ()
-                                (with-interrupts
-                                  (check-deferrables-unblocked-or-lose 0)))))
+(with-test (:name (interrupt-thread :deferrables-unblocked))
+  (interrupt-thread *current-thread*
+                    (lambda ()
+                      (with-interrupts
+                        (check-deferrables-unblocked-or-lose 0))))
+  (process-all-interrupts))
 
-(with-test (:name (:interrupt-thread :nlx))
+(with-test (:name (interrupt-thread :nlx))
   (catch 'xxx
-    (sb-thread:interrupt-thread sb-thread:*current-thread*
-                                (lambda ()
-                                  (check-deferrables-blocked-or-lose 0)
-                                  (throw 'xxx nil))))
+    (interrupt-thread *current-thread*
+                      (lambda ()
+                        (check-deferrables-blocked-or-lose 0)
+                        (throw 'xxx nil)))
+    (process-all-interrupts))
   (check-deferrables-unblocked-or-lose 0))
 
 #-sb-thread (sb-ext:exit :code 104)
 
 ;;;; Now the real tests...
 
-(with-test (:name (:with-mutex :timeout))
+(with-test (:name (with-mutex :timeout))
   (let ((m (make-mutex)))
     (with-mutex (m)
       (assert (null (join-thread (make-thread
@@ -85,31 +97,16 @@
                             (with-mutex (m :timeout 0.1)
                               t)))))))
 
-(with-test (:name (:interrupt-thread :deferrables-unblocked-by-lock)
-            :broken-on :win32)
-  (let ((lock (sb-thread::make-mutex))
-        (thread (make-join-thread (lambda ()
-                                    (loop (sleep 1))))))
-    (sb-thread::grab-mutex lock)
-    (sb-thread:interrupt-thread thread
-                                (lambda ()
-                                  (check-deferrables-blocked-or-lose 0)
-                                  (sb-thread::grab-mutex lock)
-                                  (check-deferrables-unblocked-or-lose 0)
-                                  (sb-thread:abort-thread)))
-    (sleep 3)
-    (sb-thread::release-mutex lock)))
-
 ;;; compare-and-swap
 
 (defmacro defincf (name accessor &rest args)
   `(defun ,name (x)
      (let* ((old (,accessor x ,@args))
-         (new (1+ old)))
-    (loop until (eq old (sb-ext:compare-and-swap (,accessor x ,@args) old new))
-       do (setf old (,accessor x ,@args)
-                new (1+ old)))
-    new)))
+            (new (1+ old)))
+       (loop until (eq old (sb-ext:compare-and-swap (,accessor x ,@args) old new))
+             do (setf old (,accessor x ,@args)
+                      new (1+ old)))
+       new)))
 
 (defstruct cas-struct (slot 0))
 
@@ -120,42 +117,39 @@
 (defincf incf-svref/1 svref 1)
 (defincf incf-svref/0 svref 0)
 
-(defmacro def-test-cas (name init incf op)
-  `(with-test (:name ,name)
-     (flet ((,name (n)
-              (declare (fixnum n))
-              (let* ((x ,init)
-                     (run nil)
-                     (threads
-                      (loop repeat 10
-                            collect (sb-thread:make-thread
-                                     (lambda ()
-                                       (loop until run
-                                             do (sb-thread:thread-yield))
-                                       (loop repeat n do (,incf x)))))))
-                (setf run t)
-                (dolist (th threads)
-                  (sb-thread:join-thread th))
-                (assert (= (,op x) (* 10 n))))))
-       (,name 200000))))
+(macrolet
+    ((def (name init incf op)
+       `(with-test (:name ,name)
+          (let* ((n 200000)
+                 (x ,init)
+                 (run nil)
+                 (threads
+                  (loop repeat 10
+                        collect (make-thread
+                                 (lambda ()
+                                   (loop until run do (thread-yield))
+                                   (loop repeat n do (,incf x)))))))
+            (setf run t)
+            (map nil #'join-thread threads)
+            (assert (= (,op x) (* 10 n)))))))
 
-(def-test-cas test-cas-car (cons 0 nil) incf-car car)
-(def-test-cas test-cas-cdr (cons nil 0) incf-cdr cdr)
-(def-test-cas test-cas-slot (make-cas-struct) incf-slot cas-struct-slot)
-(def-test-cas test-cas-value (let ((x '.x.))
-                               (set x 0)
-                               x)
-  incf-symbol-value symbol-value)
-(def-test-cas test-cas-svref/0 (vector 0 nil) incf-svref/0 (lambda (x)
-                                                             (svref x 0)))
-(def-test-cas test-cas-svref/1 (vector nil 0) incf-svref/1 (lambda (x)
-                                                             (svref x 1)))
-(format t "~&compare-and-swap tests done~%")
+  (def (cas car) (cons 0 nil) incf-car car)
+  (def (cas cdr) (cons nil 0) incf-cdr cdr)
+  (def (cas :slot) (make-cas-struct) incf-slot cas-struct-slot)
+  (def (cas :value)
+      (let ((x '.x.))
+        (set x 0)
+        x)
+    incf-symbol-value
+    symbol-value)
+  (def (cas :svref/0) (vector 0 nil) incf-svref/0 (lambda (x) (svref x 0)))
+  (def (cas :svref/1) (vector nil 0) incf-svref/1 (lambda (x) (svref x 1))))
 
 (with-test (:name (:threads :more-trivia))
   (let ((old-threads (list-all-threads))
         (thread (make-thread (lambda ()
-                               (assert (find *current-thread* *all-threads*))
+                               (assert (find *current-thread*
+                                             sb-thread::*all-threads*))
                                (sleep 2))))
         (new-threads (list-all-threads)))
     (assert (thread-alive-p thread))
@@ -177,14 +171,20 @@
 
 (with-test (:name (join-thread :timeout :default))
   (let* ((sym (gensym))
-         (thread (make-kill-thread (lambda () (sleep most-positive-fixnum)))))
+         (sem (make-semaphore))
+         (thread (make-thread (lambda () (wait-on-semaphore sem)))))
     (assert (equal (multiple-value-list
                     (join-thread thread :timeout .001 :default sym))
-                   (list sym :timeout)))))
+                   (list sym :timeout)))
+    (signal-semaphore sem)
+    (assert (join-thread thread))))
 
 (with-test (:name (join-thread :timeout :error))
-  (let ((thread (make-kill-thread (lambda () (sleep most-positive-fixnum)))))
-    (assert-error (join-thread thread :timeout .001) join-thread-error)))
+  (let* ((sem (make-semaphore))
+         (thread (make-thread (lambda () (wait-on-semaphore sem)))))
+    (assert-error (join-thread thread :timeout .001) join-thread-error)
+    (signal-semaphore sem)
+    (assert (join-thread thread))))
 
 (with-test (:name (join-thread :multiple-values))
   (assert (equal '(1 2 3)
@@ -199,29 +199,27 @@
 ;;; don't reappear.
 (defun scaling-test (function &optional (nthreads 5))
   "Execute FUNCTION with NTHREADS lurking to slow it down."
-  (let ((queue (sb-thread:make-waitqueue))
-        (mutex (sb-thread:make-mutex)))
+  (let ((queue (make-waitqueue))
+        (mutex (make-mutex)))
     ;; Start NTHREADS idle threads.
     (dotimes (i nthreads)
       (make-join-thread (lambda ()
                           (with-mutex (mutex)
-                            (sb-thread:condition-wait queue mutex))
-                          (sb-thread:abort-thread))))
-    (let ((start-time (get-internal-run-time)))
-      (funcall function)
-      (prog1 (- (get-internal-run-time) start-time)
-        (sb-thread:condition-broadcast queue)))))
+                            (condition-wait queue mutex))
+                          (abort-thread))))
+    (prog1 (runtime (funcall function))
+      (condition-broadcast queue))))
 
 (defun fact (n)
   "A function that does work with the CPU."
   (if (zerop n) 1 (* n (fact (1- n)))))
-
+(compile 'fact)
 (with-test (:name :lurking-threads)
   (let ((work (lambda () (fact 15000))))
     (let ((zero (scaling-test work 0))
           (four (scaling-test work 4)))
       ;; a slightly weak assertion, but good enough for starters.
-      (assert (< four (* 1.5 zero))))))
+      (assert (< four (* 2 zero))))))
 
 ;;; For one of the interupt-thread tests, we want a foreign function
 ;;; that does not make syscalls
@@ -242,24 +240,24 @@
   (let ((l (make-mutex :name "foo"))
         (p *current-thread*))
     (assert (eql (mutex-value l) nil) nil "1")
-    (sb-thread:grab-mutex l)
+    (grab-mutex l)
     (assert (eql (mutex-value l) p) nil "3")
-    (sb-thread:release-mutex l)
+    (release-mutex l)
     (assert (eql (mutex-value l) nil) nil "5")))
 
-(with-test (:name (:with-recursive-lock :basics))
+(with-test (:name (with-recursive-lock :basics))
   (labels ((ours-p (value)
              (eq *current-thread* value)))
     (let ((l (make-mutex :name "rec")))
       (assert (eql (mutex-value l) nil) nil "1")
-      (sb-thread:with-recursive-lock (l)
+      (with-recursive-lock (l)
         (assert (ours-p (mutex-value l)) nil "3")
-        (sb-thread:with-recursive-lock (l)
+        (with-recursive-lock (l)
           (assert (ours-p (mutex-value l)) nil "4"))
         (assert (ours-p (mutex-value l)) nil "5"))
       (assert (eql (mutex-value l) nil) nil "6"))))
 
-(with-test (:name (:with-recursive-lock :wait-p))
+(with-test (:name (with-recursive-lock :wait-p))
   (let ((m (make-mutex)))
     (with-mutex (m)
       (assert (null (join-thread (make-thread
@@ -271,7 +269,7 @@
                             (with-recursive-lock (m :wait-p nil)
                               t)))))))
 
-(with-test (:name (:with-recursive-lock :wait-p :recursive))
+(with-test (:name (with-recursive-lock :wait-p :recursive))
   (let ((m (make-mutex)))
     (assert (join-thread (make-thread
                           (lambda ()
@@ -279,7 +277,7 @@
                               (with-recursive-lock (m :wait-p nil)
                                 t))))))))
 
-(with-test (:name (:with-recursive-lock :timeout))
+(with-test (:name (with-recursive-lock :timeout))
   (let ((m (make-mutex)))
     (with-mutex (m)
       (assert (null (join-thread (make-thread
@@ -291,7 +289,7 @@
                             (with-recursive-lock (m :timeout 0.1)
                               t)))))))
 
-(with-test (:name (:with-recursive-lock :timeout :recursive))
+(with-test (:name (with-recursive-lock :timeout :recursive))
   (let ((m (make-mutex)))
     (assert (join-thread (make-thread
                           (lambda ()
@@ -306,14 +304,14 @@
 
 ;; test that SLEEP actually sleeps for at least the given time, even
 ;; if interrupted by another thread exiting/a gc/anything
-(with-test (:name (:sleep :continue-sleeping-after-interrupt))
+(with-test (:name (sleep :continue-sleeping-after-interrupt))
   (let ((start-time (get-universal-time)))
     (make-join-thread (lambda () (sleep 1) (sb-ext:gc :full t)))
     (sleep 5)
     (assert (>= (get-universal-time) (+ 5 start-time)))))
 
 
-(with-test (:name (:condition-wait :basics-1))
+(with-test (:name (condition-wait :basics-1))
   (let ((queue (make-waitqueue :name "queue"))
         (lock (make-mutex :name "lock"))
         (n 0))
@@ -337,7 +335,7 @@
         (condition-notify queue))
       (sleep 1))))
 
-(with-test (:name (:condition-wait :basics-2))
+(with-test (:name (condition-wait :basics-2))
   (let ((queue (make-waitqueue :name "queue"))
         (lock (make-mutex :name "lock")))
     (labels ((ours-p (value)
@@ -377,14 +375,14 @@
 
 ;;; GRAB-MUTEX
 
-(with-test (:name (:grab-mutex :waitp nil))
+(with-test (:name (grab-mutex :waitp nil))
   (let ((m (make-mutex)))
     (with-mutex (m)
       (assert (null (join-thread (make-thread
                                   #'(lambda ()
                                       (grab-mutex m :waitp nil)))))))))
 
-(with-test (:name (:grab-mutex :timeout :acquisition-fail))
+(with-test (:name (grab-mutex :timeout :acquisition-fail))
   (let ((m (make-mutex))
         (w (make-semaphore)))
     (with-mutex (m)
@@ -398,7 +396,7 @@
         (wait-on-semaphore w)
         (assert (null (join-thread th)))))))
 
-(with-test (:name (:grab-mutex :timeout :acquisition-success))
+(with-test (:name (grab-mutex :timeout :acquisition-success))
   (let ((m (make-mutex))
         (child))
     (with-mutex (m)
@@ -406,21 +404,24 @@
       (sleep 0.2))
     (assert (eq (join-thread child) 't))))
 
-(with-test (:name (:grab-mutex :timeout+deadline))
-  (let ((m (make-mutex))
-        (w (make-semaphore)))
-    (with-mutex (m)
-      (let ((th (make-thread #'(lambda ()
-                                 (sb-sys:with-deadline (:seconds 0.0)
-                                   (handler-case
-                                       (grab-mutex m :timeout 0.0)
-                                     (sb-sys:deadline-timeout ()
-                                       (signal-semaphore w)
-                                       :deadline)))))))
-        (wait-on-semaphore w)
-        (assert (eq (join-thread th) :deadline))))))
+(with-test (:name (grab-mutex :timeout+deadline :lp-1727789))
+  (flet ((test (deadline)
+           (let ((m (make-mutex))
+                 (w (make-semaphore)))
+             (with-mutex (m)
+               (let ((th (make-thread #'(lambda ()
+                                          (sb-sys:with-deadline (:seconds 0.0)
+                                            (handler-case
+                                                (grab-mutex m :timeout deadline)
+                                              (sb-sys:deadline-timeout ()
+                                                (signal-semaphore w)
+                                                :deadline)))))))
+                 (wait-on-semaphore w)
+                 (assert (eq (join-thread th) :deadline)))))))
+    (test 0.0)
+    (test 10000000000000000000000)))
 
-(with-test (:name (:grab-mutex :waitp+deadline))
+(with-test (:name (grab-mutex :waitp+deadline))
   (let ((m (make-mutex)))
     (with-mutex (m)
       (assert (eq (join-thread
@@ -438,18 +439,18 @@
   `(handler-case (progn (progn ,@body) nil)
     (sb-ext:timeout () t)))
 
-(with-test (:name (:semaphore :wait-forever))
+(with-test (:name (semaphore :wait-forever))
   (let ((sem (make-semaphore :count 0)))
     (assert (raises-timeout-p
               (sb-ext:with-timeout 0.1
                 (wait-on-semaphore sem))))))
 
-(with-test (:name (:semaphore :initial-count))
+(with-test (:name (semaphore :initial-count))
   (let ((sem (make-semaphore :count 1)))
     (sb-ext:with-timeout 0.1
       (assert (= 0 (wait-on-semaphore sem))))))
 
-(with-test (:name (:semaphore :wait-then-signal))
+(with-test (:name (semaphore :wait-then-signal))
   (let ((sem (make-semaphore))
         (signalled-p nil))
     (make-join-thread (lambda ()
@@ -459,7 +460,7 @@
     (assert (= 0 (wait-on-semaphore sem)))
     (assert signalled-p)))
 
-(with-test (:name (:semaphore :signal-then-wait))
+(with-test (:name (semaphore :signal-then-wait))
   (let ((sem (make-semaphore))
         (signalled-p nil))
     (make-join-thread (lambda ()
@@ -488,34 +489,34 @@
       (sleep 0.5)
       (assert (= 0 (count-live-threads))))))
 
-(with-test (:name (:semaphore :multiple-signals))
+(with-test (:name (semaphore :multiple-signals))
   (test-semaphore-multiple-signals #'wait-on-semaphore))
 
-(with-test (:name (:try-semaphore :trivial-fail))
+(with-test (:name (try-semaphore :trivial-fail))
   (assert (eq (try-semaphore (make-semaphore :count 0)) 'nil)))
 
-(with-test (:name (:try-semaphore :trivial-success))
+(with-test (:name (try-semaphore :trivial-success))
   (let ((sem (make-semaphore :count 1)))
     (assert (= 0 (try-semaphore sem)))
     (assert (zerop (semaphore-count sem)))))
 
-(with-test (:name (:try-semaphore :trivial-fail :n>1))
+(with-test (:name (try-semaphore :trivial-fail :n>1))
   (assert (eq (try-semaphore (make-semaphore :count 1) 2) 'nil)))
 
-(with-test (:name (:try-semaphore :trivial-success :n>1))
+(with-test (:name (try-semaphore :trivial-success :n>1))
   (let ((sem (make-semaphore :count 10)))
     (assert (= 5 (try-semaphore sem 5)))
     (assert (= 0 (try-semaphore sem 5)))
     (assert (zerop (semaphore-count sem)))))
 
-(with-test (:name (:try-semaphore :emulate-wait-on-semaphore))
+(with-test (:name (try-semaphore :emulate-wait-on-semaphore))
   (flet ((busy-wait-on-semaphore (sem)
            (loop until (try-semaphore sem) do (sleep 0.001))))
     (test-semaphore-multiple-signals #'busy-wait-on-semaphore)))
 
 ;;; Here we test that interrupting TRY-SEMAPHORE does not leave a
 ;;; semaphore in a bad state.
-(with-test (:name (:try-semaphore :interrupt-safe)
+(with-test (:name (try-semaphore :interrupt-safe)
             :broken-on :win32)
   (flet ((make-threads (count fn)
            (loop repeat count collect (make-thread fn)))
@@ -553,12 +554,12 @@
 ;; At some point %DECREMENT-SEMAPHORE did not adjust the remaining
 ;; timeout after spurious wakeups, potentially leading to
 ;; longer/infinite waiting despite the specified timeout.
-(with-test (:name (:semaphore :timeout :spurious-wakeup))
+(with-test (:name (semaphore :timeout :spurious-wakeup))
   (let* ((semaphore (make-semaphore))
          (done nil)
          (thread (make-thread (lambda ()
-                                (let ((mutex (semaphore-mutex semaphore))
-                                      (queue (semaphore-queue semaphore)))
+                                (let ((mutex (sb-thread::semaphore-mutex semaphore))
+                                      (queue (sb-thread::semaphore-queue semaphore)))
                                   (loop :until done :do
                                      (with-mutex (mutex)
                                        (condition-notify queue))))))))
@@ -566,41 +567,37 @@
     (setf done t)
     (join-thread thread)))
 
-(format t "~&semaphore tests done~%")
-
 (defun test-interrupt (function-to-interrupt &optional quit-p)
   (let ((child  (make-kill-thread function-to-interrupt)))
-    ;;(format t "gdb ./src/runtime/sbcl ~A~%attach ~A~%" child child)
-    (sleep 2)
     (format t "interrupting child ~A~%" child)
     (interrupt-thread child
                       (lambda ()
                         (format t "child pid ~A~%" *current-thread*)
                         (when quit-p (abort-thread))))
-    (sleep 1)
+    (process-all-interrupts child)
     child))
 
 ;; separate tests for (a) interrupting Lisp code, (b) C code, (c) a syscall,
 ;; (d) waiting on a lock, (e) some code which we hope is likely to be
 ;; in pseudo-atomic
 
-(with-test (:name (:interrupt-thread :more-basics)
+(with-test (:name (interrupt-thread :more-basics)
             :broken-on :win32)
   (let ((child (test-interrupt (lambda () (loop)))))
     (terminate-thread child)))
 
-(with-test (:name (:interrupt-thread :interrupt-foreign-loop)
+(with-test (:name (interrupt-thread :interrupt-foreign-loop)
                   ;; This feature is explicitly unsupported on Win32.
             :broken-on :win32)
   (test-interrupt #'loop-forever :quit))
 
-(with-test (:name (:interrupt-thread :interrupt-sleep)
+(with-test (:name (interrupt-thread :interrupt-sleep)
                   :broken-on :win32)
   (let ((child (test-interrupt (lambda () (loop (sleep 2000))))))
     (terminate-thread child)
     (wait-for-threads (list child))))
 
-(with-test (:name (:interrupt-thread :interrupt-mutex-acquisition)
+(with-test (:name (interrupt-thread :interrupt-mutex-acquisition)
                   :broken-on :win32)
   (let ((lock (make-mutex :name "loctite"))
         child)
@@ -615,34 +612,32 @@
       (sleep 5)
       (interrupt-thread child (lambda () (format t "l ~A~%" (mutex-value lock))))
       (format t "parent releasing lock~%"))
+    (process-all-interrupts child)
     (terminate-thread child)
     (wait-for-threads (list child))))
 
-(format t "~&locking test done~%")
-
 (defun alloc-stuff () (copy-list '(1 2 3 4 5)))
 
-(with-test (:name (:interrupt-thread :interrupt-consing-child)
+(with-test (:name (interrupt-thread :interrupt-consing-child)
                   :broken-on :win32)
   (let ((thread (make-thread (lambda () (loop (alloc-stuff))))))
     (let ((killers
            (loop repeat 4 collect
-                 (sb-thread:make-thread
+                 (make-thread
                   (lambda ()
                     (loop repeat 25 do
                           (sleep (random 0.1d0))
                           (princ ".")
                           (force-output)
-                          (sb-thread:interrupt-thread thread (lambda ()))))))))
+                          (interrupt-thread thread (lambda ()))))))))
       (wait-for-threads killers)
-      (sb-thread:terminate-thread thread)
+      (process-all-interrupts thread)
+      (terminate-thread thread)
       (wait-for-threads (list thread))))
   (sb-ext:gc :full t))
 
-(format t "~&multi interrupt test done~%")
-
 #+(or x86 x86-64) ;; x86oid-only, see internal commentary.
-(with-test (:name (:interrupt-thread :interrupt-consing-child :again)
+(with-test (:name (interrupt-thread :interrupt-consing-child :again)
                   :broken-on :win32)
   (let ((c (make-thread (lambda () (loop (alloc-stuff))))))
     ;; NB this only works on x86: other ports don't have a symbol for
@@ -655,10 +650,9 @@
                           (assert (thread-alive-p *current-thread*))
                           (assert
                            (not (logbitp 0 SB-KERNEL:*PSEUDO-ATOMIC-BITS*))))))
+    (process-all-interrupts c)
     (terminate-thread c)
     (wait-for-threads (list c))))
-
-(format t "~&interrupt test done~%")
 
 (defstruct counter (n 0 :type sb-vm:word))
 (defvar *interrupt-counter* (make-counter))
@@ -670,7 +664,7 @@
   (unless (typep i 'fixnum)
     (error "!!!!!!!!!!!")))
 
-(with-test (:name (:interrupt-thread :interrupt-ATOMIC-INCF)
+(with-test (:name (interrupt-thread :interrupt-ATOMIC-INCF)
                   :broken-on :win32)
   (let ((c (make-thread
             (lambda ()
@@ -692,48 +686,39 @@
       (terminate-thread c)
       (wait-for-threads (list c)))))
 
-(format t "~&interrupt count test done~%")
-
 (defvar *runningp* nil)
 
-(with-test (:name (:interrupt-thread :no-nesting)
-                  :broken-on :win32)
-  (let ((thread (sb-thread:make-thread
-                 (lambda ()
-                   (catch 'xxx
-                     (loop))))))
+(with-test (:name (interrupt-thread :no-nesting) :broken-on :win32)
+  (let ((thread (make-thread (lambda ()
+                               (catch 'xxx
+                                 (loop))))))
     (declare (special runningp))
     (sleep 0.2)
-    (sb-thread:interrupt-thread thread
-                                (lambda ()
-                                    (let ((*runningp* t))
-                                      (sleep 1))))
+    (interrupt-thread thread (lambda ()
+                               (let ((*runningp* t))
+                                 (sleep 1))))
     (sleep 0.2)
-    (sb-thread:interrupt-thread thread
-                                (lambda ()
-                                  (throw 'xxx *runningp*)))
-    (assert (not (sb-thread:join-thread thread)))))
+    (interrupt-thread thread (lambda ()
+                               (throw 'xxx *runningp*)))
+    (assert (not (join-thread thread)))))
 
-(with-test (:name (:interrupt-thread :nesting)
-                  :broken-on :win32)
-  (let ((thread (sb-thread:make-thread
-                 (lambda ()
-                   (catch 'xxx
-                     (loop))))))
+(with-test (:name (interrupt-thread :nesting) :broken-on :win32)
+  (let ((thread (make-thread (lambda ()
+                               (catch 'xxx
+                                 (loop))))))
     (declare (special runningp))
     (sleep 0.2)
-    (sb-thread:interrupt-thread thread
-                                (lambda ()
-                                  (let ((*runningp* t))
-                                    (sb-sys:with-interrupts
-                                      (sleep 1)))))
+    (interrupt-thread thread (lambda ()
+                               (let ((*runningp* t))
+                                 (sb-sys:with-interrupts
+                                   (sleep 1)))))
     (sleep 0.2)
-    (sb-thread:interrupt-thread thread
-                                (lambda ()
-                                  (throw 'xxx *runningp*)))
-    (assert (sb-thread:join-thread thread))))
+    (interrupt-thread thread (lambda ()
+                               (throw 'xxx *runningp*)))
+    (assert (join-thread thread))))
 
-(with-test (:name (:two-threads-running-gc))
+(with-test (:name (:two-threads-running-gc)
+                  :broken-on :sb-safepoint)
   (let (a-done b-done)
     (make-join-thread (lambda ()
                         (dotimes (i 100)
@@ -750,6 +735,8 @@
 
 (defun waste (&optional (n 100000))
   (loop repeat n do (make-string 16384)))
+
+(compile 'waste)
 
 (with-test (:name (:one-thread-runs-gc-while-other-conses)
                   :broken-on :win32)
@@ -812,22 +799,17 @@
     (sleep 10)
     (princ "terminating threads")
     (dolist (thread threads)
-      (sb-thread:terminate-thread thread))))
-
-(format t "~&errno test done~%")
+      (terminate-thread thread))))
 
 (with-test (:name :all-threads-have-abort-restart
                   :broken-on :win32)
   (loop repeat 100 do
         (let ((thread (make-kill-thread (lambda () (sleep 0.1)))))
-          (sb-thread:interrupt-thread
-           thread
-           (lambda ()
-             (assert (find-restart 'abort)))))))
+          (interrupt-thread thread (lambda ()
+                                     (assert (find-restart 'abort))))
+          (process-all-interrupts thread))))
 
 (sb-ext:gc :full t)
-
-(format t "~&thread startup sigmask test done~%")
 
 ;; expose thread creation races by exiting quickly
 (with-test (:name (:no-thread-creation-race :light))
@@ -837,9 +819,7 @@
   (loop repeat 20 do
         (wait-for-threads
          (loop for i below 100 collect
-               (sb-thread:make-thread (lambda ()))))))
-
-(format t "~&creation test done~%")
+               (make-thread (lambda ()))))))
 
 ;; interrupt handlers are per-thread with pthreads, make sure the
 ;; handler installed in one thread is global
@@ -907,30 +887,34 @@
                                       (send-gc))))
                  threads)
            (sleep 4))
-      (mapc #'sb-thread:terminate-thread threads))))
+      (mapc #'terminate-thread threads))))
+
+;; No interpreter stub
+(defun symbol-tls-index (symbol)
+  (sb-kernel:symbol-tls-index symbol))
+(compile 'symbol-tls-index)
 
 (with-test (:name :test-%thread-local-references)
+
   (let ((mysym (gensym))
         (fool1 (cons 1 2))
         (fool2 (cons 2 3)))
     (progv (list mysym) '(nil)
-      (let* ((i (get-lisp-obj-address (sb-kernel:symbol-tls-index mysym)))
+      (let* ((i (sb-kernel:get-lisp-obj-address (symbol-tls-index mysym)))
              (j (+ i sb-vm:n-word-bytes)))
-        (assert (eql (sap-ref-word (current-thread-sap) j)
+        (assert (eql (sap-ref-word (sb-thread::current-thread-sap) j)
                      sb-vm:no-tls-value-marker-widetag))
-        (setf (sap-ref-lispobj (current-thread-sap) i) fool1
-              (sap-ref-lispobj (current-thread-sap) j) fool2)
+        (setf (sap-ref-lispobj (sb-thread::current-thread-sap) i) fool1
+              (sap-ref-lispobj (sb-thread::current-thread-sap) j) fool2)
         ;; assert that my pointer arithmetic worked as expected
         (assert (eq (symbol-value mysym) fool1))
         ;; assert that FOOL1 is found by the TLS scan and that FOOL2 is not.
-        (let ((list (%thread-local-references)))
-          (assert (memq fool1 list))
-          (assert (not (memq fool2 list))))
+        (let ((list (sb-thread::%thread-local-references)))
+          (assert (member fool1 list))
+          (assert (not (member fool2 list))))
         ;; repair the TLS entry that was corrupted by the test
-        (setf (sap-ref-word (current-thread-sap) j)
+        (setf (sap-ref-word (sb-thread::current-thread-sap) j)
               sb-vm:no-tls-value-marker-widetag)))))
-
-(format t "~&binding test done~%")
 
 ;;; HASH TABLES
 
@@ -942,7 +926,7 @@
   (sb-debug:print-backtrace)
   (catch 'done))
 
-(with-test (:name (:unsynchronized-hash-table)
+(with-test (:name (hash-table :unsynchronized)
                   ;; FIXME: This test occasionally eats out craploads
                   ;; of heap instead of expected error early. Not 100%
                   ;; sure if it would finish as expected, but since it
@@ -980,11 +964,9 @@
                          :name "collector"))))
     (unwind-protect
          (sleep 10)
-      (mapc #'sb-thread:terminate-thread threads))))
+      (mapc #'terminate-thread threads))))
 
-(format t "~&unsynchronized hash table test done~%")
-
-(with-test (:name (:synchronized-hash-table)
+(with-test (:name (hash-table :synchronized)
             :broken-on :win32)
   (let* ((hash (make-hash-table :synchronized t))
          (*errors* nil)
@@ -1014,12 +996,10 @@
                          :name "collector"))))
     (unwind-protect
          (sleep 10)
-      (mapc #'sb-thread:terminate-thread threads))
+      (mapc #'terminate-thread threads))
     (assert (not *errors*))))
 
-(format t "~&synchronized hash table test done~%")
-
-(with-test (:name (:hash-table-parallel-readers)
+(with-test (:name (hash-table :parallel-readers)
                   :broken-on :win32)
   (let ((hash (make-hash-table))
         (*errors* nil))
@@ -1056,12 +1036,10 @@
                           :name "collector"))))
       (unwind-protect
            (sleep 10)
-        (mapc #'sb-thread:terminate-thread threads))
+        (mapc #'terminate-thread threads))
       (assert (not *errors*)))))
 
-(format t "~&multiple reader hash table test done~%")
-
-(with-test (:name :hash-table-single-accessor-parallel-gc
+(with-test (:name (hash-table :single-accessor :parallel-gc)
                   :broken-on :win32)
   (let ((hash (make-hash-table))
         (*errors* nil))
@@ -1083,10 +1061,8 @@
                           :name "collector"))))
       (unwind-protect
            (sleep 10)
-        (mapc #'sb-thread:terminate-thread threads))
+        (mapc #'terminate-thread threads))
       (assert (not *errors*)))))
-
-(format t "~&single accessor hash table test~%")
 
 #|  ;; a cll post from eric marsden
 | (defun crash ()
@@ -1137,41 +1113,39 @@
               (force-output)
               (condition-broadcast queue)))))
 
-(format t "waitqueue wakeup tests done~%")
-
 ;;; Make sure that a deadline handler is not invoked twice in a row in
 ;;; CONDITION-WAIT. See LP #512914 for a detailed explanation.
 ;;;
-(with-test (:name (:condition-wait :deadlines :LP-512914))
+(with-test (:name (condition-wait :deadlines :LP-512914))
   (let ((n 2)                      ; was empirically enough to trigger the bug
-        (mutex (sb-thread:make-mutex))
-        (waitq (sb-thread:make-waitqueue))
+        (mutex (make-mutex))
+        (waitq (make-waitqueue))
         (threads nil)
         (deadline-handler-run-twice? nil))
     (dotimes (i n)
       (let ((child
-              (sb-thread:make-thread
-               #'(lambda ()
-                   (handler-bind
-                       ((sb-sys:deadline-timeout
-                          (let ((already? nil))
-                            #'(lambda (c)
-                                (when already?
-                                  (setq deadline-handler-run-twice? t))
-                                (setq already? t)
-                                (sleep 0.2)
-                                (sb-thread:condition-broadcast waitq)
-                                (sb-sys:defer-deadline 10.0 c)))))
-                     (sb-sys:with-deadline (:seconds 0.1)
-                       (sb-thread:with-mutex (mutex)
-                         (sb-thread:condition-wait waitq mutex))))))))
+              (make-thread
+               (lambda ()
+                 (handler-bind
+                     ((sb-sys:deadline-timeout
+                       (let ((already? nil))
+                         #'(lambda (c)
+                             (when already?
+                               (setq deadline-handler-run-twice? t))
+                             (setq already? t)
+                             (sleep 0.2)
+                             (sb-thread:condition-broadcast waitq)
+                             (sb-sys:defer-deadline 10.0 c)))))
+                   (sb-sys:with-deadline (:seconds 0.1)
+                     (with-mutex (mutex)
+                       (condition-wait waitq mutex))))))))
         (push child threads)))
-    (mapc #'sb-thread:join-thread threads)
+    (mapc #'join-thread threads)
     (assert (not deadline-handler-run-twice?))))
 
-(with-test (:name (:condition-wait :signal-deadline-with-interrupts-enabled))
-  (let ((mutex (sb-thread:make-mutex))
-        (waitq (sb-thread:make-waitqueue))
+(with-test (:name (condition-wait :signal-deadline-with-interrupts-enabled))
+  (let ((mutex (make-mutex))
+        (waitq (make-waitqueue))
         (A-holds? :unknown)
         (B-holds? :unknown)
         (A-interrupts-enabled? :unknown)
@@ -1179,46 +1153,46 @@
         (A)
         (B))
     ;; W.L.O.G., we assume that A is executed first...
-    (setq A (sb-thread:make-thread
-             #'(lambda ()
-                 (handler-bind
-                     ((sb-sys:deadline-timeout
-                       #'(lambda (c)
-                           ;; We came here through the call to DECODE-TIMEOUT
-                           ;; in CONDITION-WAIT; hence both here are supposed
-                           ;; to evaluate to T.
-                           (setq A-holds? (sb-thread:holding-mutex-p mutex))
-                           (setq A-interrupts-enabled?
-                                 sb-sys:*interrupts-enabled*)
-                           (sleep 0.2)
-                           (sb-thread:condition-broadcast waitq)
-                           (sb-sys:defer-deadline 10.0 c))))
-                   (sb-sys:with-deadline (:seconds 0.1)
-                     (sb-thread:with-mutex (mutex)
-                       (sb-thread:condition-wait waitq mutex)))))
+    (setq A (make-thread
+             (lambda ()
+               (handler-bind
+                   ((sb-sys:deadline-timeout
+                     (lambda (c)
+                       ;; We came here through the call to DECODE-TIMEOUT
+                       ;; in CONDITION-WAIT; hence both here are supposed
+                       ;; to evaluate to T.
+                       (setq A-holds? (holding-mutex-p mutex))
+                       (setq A-interrupts-enabled?
+                             sb-sys:*interrupts-enabled*)
+                       (sleep 0.2)
+                       (condition-broadcast waitq)
+                       (sb-sys:defer-deadline 10.0 c))))
+                 (sb-sys:with-deadline (:seconds 0.1)
+                   (with-mutex (mutex)
+                     (condition-wait waitq mutex)))))
              :name "A"))
-    (setq B (sb-thread:make-thread
-             #'(lambda ()
-                 (thread-yield)
-                 (handler-bind
-                     ((sb-sys:deadline-timeout
-                       #'(lambda (c)
-                           ;; We came here through the call to DECODE-TIMEOUT
-                           ;; in CONDITION-WAIT (contended case of
-                           ;; reaquiring the mutex) - so the former will
-                           ;; be NIL, but interrupts should still be enabled.
-                           (setq B-holds? (sb-thread:holding-mutex-p mutex))
-                           (setq B-interrupts-enabled?
-                                 sb-sys:*interrupts-enabled*)
-                           (sleep 0.2)
-                           (sb-thread:condition-broadcast waitq)
-                           (sb-sys:defer-deadline 10.0 c))))
-                   (sb-sys:with-deadline (:seconds 0.1)
-                     (sb-thread:with-mutex (mutex)
-                       (sb-thread:condition-wait waitq mutex)))))
+    (setq B (make-thread
+             (lambda ()
+               (thread-yield)
+               (handler-bind
+                   ((sb-sys:deadline-timeout
+                     (lambda (c)
+                       ;; We came here through the call to DECODE-TIMEOUT
+                       ;; in CONDITION-WAIT (contended case of
+                       ;; reaquiring the mutex) - so the former will
+                       ;; be NIL, but interrupts should still be enabled.
+                       (setq B-holds? (holding-mutex-p mutex))
+                       (setq B-interrupts-enabled?
+                             sb-sys:*interrupts-enabled*)
+                       (sleep 0.2)
+                       (condition-broadcast waitq)
+                       (sb-sys:defer-deadline 10.0 c))))
+                 (sb-sys:with-deadline (:seconds 0.1)
+                   (with-mutex (mutex)
+                     (condition-wait waitq mutex)))))
              :name "B"))
-    (sb-thread:join-thread A)
-    (sb-thread:join-thread B)
+    (join-thread A)
+    (join-thread B)
     (let ((A-result (list A-holds? A-interrupts-enabled?))
           (B-result (list B-holds? B-interrupts-enabled?)))
       ;; We also check some subtle behaviour w.r.t. whether a deadline
@@ -1238,8 +1212,6 @@
     (dotimes (i 500000)
       (setf a (make-mutex)))))
 
-(format t "mutex finalization test done~%")
-
 ;; You have to shoehorn this arbitrary sexpr into a feature expression
 ;; to have the test summary show that a test was disabled.
 #+gencgc
@@ -1255,18 +1227,16 @@
   ;; backtraces a loot of symbol lookups need to be done due to
   ;; *PRINT-ESCAPE*.
   (let* ((threads (loop repeat 10
-                        collect (sb-thread:make-thread
+                        collect (make-thread
                                  (lambda ()
                                    (dotimes (i 1000)
                                      (with-output-to-string (*debug-io*)
                                        (sb-debug:print-backtrace :count 10))))))))
     (wait-for-threads threads)))
 
-(format t "backtrace test done~%")
-
-(format t "~&starting gc deadlock test: WARNING: THIS TEST WILL HANG ON FAILURE!~%")
-
-(with-test (:name :gc-deadlock)
+(with-test (:name :gc-deadlock
+            :broken-on :win32)
+  (write-line "WARNING: THIS TEST WILL HANG ON FAILURE!")
   ;; Prior to 0.9.16.46 thread exit potentially deadlocked the
   ;; GC due to *all-threads-lock* and session lock. On earlier
   ;; versions and at least on one specific box this test is good enough
@@ -1301,7 +1271,6 @@
            (sleep 0.1)
            (incf i)))))
 
-(format t "~&gc deadlock test done~%")
 
 (let ((count (make-array 8 :initial-element 0)))
   (defun closure-one ()
@@ -1366,8 +1335,6 @@
             (terminate-thread test)
             (wait-for-threads (list changer test))))))))
 
-(format t "~&funcallable-instance test done~%")
-
 (defun random-type (n)
   `(integer ,(random n) ,(+ n (random n))))
 
@@ -1381,22 +1348,23 @@
   (write-char #\.)
   (force-output))
 
-(with-test (:name (:hash-cache :subtypep))
+(with-test (:name (:hash-cache subtypep))
   (mapc #'join-thread
         ;; this didn't "reliably fail" with a small number of threads.
         ;; 30 is a compromise between running time and confidence in the result.
         (loop repeat 30
-              collect (sb-thread:make-thread #'subtypep-hash-cache-test)))
+              collect (make-thread #'subtypep-hash-cache-test)))
   (terpri))
-
+
 ;;;; BLACK BOX TESTS
 
 (in-package :cl-user)
 (use-package :test-util)
 (use-package "ASSERTOID")
 
-(format t "parallel defclass test -- WARNING, WILL HANG ON FAILURE!~%")
-(with-test (:name :parallel-defclass)
+
+(with-test (:name (:parallel defclass))
+  (write-line "WARNING, WILL HANG ON FAILURE!")
   (defclass test-1 () ((a :initform :orig-a)))
   (defclass test-2 () ((b :initform :orig-b)))
   (defclass test-3 (test-1 test-2) ((c :initform :orig-c)))
@@ -1442,7 +1410,6 @@
             (format t "~%joined ~S~%" (sb-thread:thread-name th)))
           (list d1 d2 d3 i))
     (force-output)))
-(format t "parallel defclass test done~%")
 
 (with-test (:name (:deadlock-detection :interrupts)
             :broken-on :win32)
@@ -1581,22 +1548,24 @@
       (alien-funcall (extern-alien "alloca_test" (function void)))))))
 
 (with-test (:name :fp-mode-inheritance-threads)
-  (flet ((test ()
-           (let* ((reserved-bits #+x86 (ash #b1110000011000000 16)
-                                 #-x86 0)
-                  (fp-mode (logandc2 (dpb 0 sb-vm::float-sticky-bits (sb-vm:floating-point-modes))
-                                     reserved-bits))
-                  (thread-fp-mode
-                    (sb-thread:join-thread
-                     (sb-thread:make-thread
-                      (lambda ()
-                        (dpb 0 sb-vm::float-sticky-bits (sb-vm:floating-point-modes)))))))
-             (assert (= fp-mode thread-fp-mode)))))
+  (labels ((fp-mode ()
+             (let ((reserved-bits #+x86 (ash #b1110000011000000 16)
+                                  #-x86 0))
+               (logandc2 (dpb 0 sb-vm:float-sticky-bits (sb-vm:floating-point-modes))
+                         reserved-bits)))
+           (test ()
+             (let* ((fp-mode (fp-mode))
+                    (thread-fp-mode
+                      (sb-thread:join-thread
+                       (sb-thread:make-thread
+                        (lambda ()
+                          (fp-mode))))))
+               (assert (= fp-mode thread-fp-mode)))))
     (test)
     (sb-int:with-float-traps-masked (:divide-by-zero)
       (test))
     (setf (sb-vm:floating-point-modes)
           (dpb sb-vm:float-divide-by-zero-trap-bit
-               sb-vm::float-traps-byte
+               sb-vm:float-traps-byte
                (sb-vm:floating-point-modes)))
     (test)))

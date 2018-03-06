@@ -50,7 +50,7 @@
   (lowtag nil :type symbol :read-only t)
   (options nil :type list :read-only t)
   (slots nil :type list :read-only t)
-  (size 0 :type fixnum :read-only t)
+  (length 0 :type fixnum :read-only t)
   (variable-length-p nil :type (member t nil) :read-only t))
 
 (declaim (freeze-type prim-object-slot primitive-object))
@@ -141,7 +141,7 @@
             (setf variable-length-p t))
           (incf offset length)))
       (unless variable-length-p
-        (constants `(def!constant ,(symbolicate name "-SIZE") ,offset)))
+        (constants `(defconstant ,(symbolicate name "-SIZE") ,offset)))
       #-c-headers-only
       (when alloc-trans
         (forms `(def-alloc ,alloc-trans ,offset
@@ -156,7 +156,7 @@
                                      :widetag widetag
                                      :lowtag lowtag
                                      :slots (slots)
-                                     :size offset
+                                     :length offset
                                      :variable-length-p variable-length-p))
            ,@(constants)
            ,@(specials))
@@ -179,7 +179,7 @@
                (let* ((sc-number (or (cdr (assoc sc-name fixed-numbers))
                                      (1- (incf index))))
                       (constant-name (symbolicate sc-name "-SC-NUMBER")))
-                 `((define-storage-class ,sc-name ,sc-number
+                 `((!define-storage-class ,sc-name ,sc-number
                      ,sb-name ,@args)
                    (defconstant ,constant-name ,sc-number))))))
       `(progn ,@(mapcan #'process-class classes)))))
@@ -211,7 +211,7 @@
 (in-package "SB!C")
 
 ;;; the maximum number of SCs in any implementation
-(def!constant sc-number-limit 62)
+(defconstant sc-number-limit 62)
 
 ;;; Modular functions
 

@@ -206,20 +206,6 @@
   (:generator 1
     (load-binding-stack-pointer int)))
 
-(defknown (setf binding-stack-pointer-sap)
-    (system-area-pointer) system-area-pointer ())
-
-(define-vop (set-binding-stack-pointer-sap)
-  (:args (new-value :scs (sap-reg) :target int))
-  (:arg-types system-area-pointer)
-  (:results (int :scs (sap-reg)))
-  (:result-types system-area-pointer)
-  (:translate (setf binding-stack-pointer-sap))
-  (:policy :fast-safe)
-  (:generator 1
-    (store-binding-stack-pointer new-value)
-    (move int new-value)))
-
 (define-vop (control-stack-pointer-sap)
   (:results (int :scs (sap-reg)))
   (:result-types system-area-pointer)
@@ -277,10 +263,18 @@
                             (* simple-fun-code-offset n-word-bytes))))))
 
 ;;;; symbol frobbing
+(defun load-symbol-info-vector (result symbol temp)
+  (loadw result symbol symbol-info-slot other-pointer-lowtag)
+  ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
+  ;; This CMOV safely reads from memory when it does not move, because if
+  ;; there is an info-vector in the slot, it has at least one element.
+  ;; This would compile to almost the same code without a VOP,
+  ;; but using a jmp around a mov instead.
+  (inst lea temp (make-ea :dword :base result :disp (- list-pointer-lowtag)))
+  (inst test (reg-in-size temp :byte) lowtag-mask)
+  (inst cmov :e result
+        (make-ea-for-object-slot result cons-cdr-slot list-pointer-lowtag)))
 
-;; only define if the feature is enabled to test building without it
-#!+symbol-info-vops
-(progn
 (define-vop (symbol-info-vector)
   (:policy :fast-safe)
   (:translate symbol-info-vector)
@@ -288,16 +282,8 @@
   (:results (res :scs (descriptor-reg)))
   (:temporary (:sc unsigned-reg :offset rax-offset) rax)
   (:generator 1
-    (loadw res x symbol-info-slot other-pointer-lowtag)
-    ;; If RES has list-pointer-lowtag, take its CDR. If not, use it as-is.
-    ;; This CMOV safely reads from memory when it does not move, because if
-    ;; there is an info-vector in the slot, it has at least one element.
-    ;; This would compile to almost the same code without a VOP,
-    ;; but using a jmp around a mov instead.
-    (inst lea rax (make-ea :dword :base res :disp (- list-pointer-lowtag)))
-    (inst test (reg-in-size rax :byte) lowtag-mask)
-    (inst cmov :e res
-          (make-ea-for-object-slot res cons-cdr-slot list-pointer-lowtag))))
+    (load-symbol-info-vector res x rax)))
+
 (define-vop (symbol-plist)
   (:policy :fast-safe)
   (:translate symbol-plist)
@@ -311,7 +297,7 @@
     (loadw res res cons-car-slot list-pointer-lowtag)
     (inst mov temp nil-value)
     (inst test (reg-in-size res :byte) fixnum-tag-mask)
-    (inst cmov :e res temp))))
+    (inst cmov :e res temp)))
 
 ;;;; other miscellaneous VOPs
 
@@ -321,13 +307,6 @@
   (:translate sb!unix::receive-pending-interrupt)
   (:generator 1
     (inst break pending-interrupt-trap)))
-
-#!+sb-safepoint
-(define-vop (insert-safepoint)
-  (:policy :fast-safe)
-  (:translate sb!kernel::gc-safepoint)
-  (:generator 0
-    (emit-safepoint)))
 
 #!+sb-thread
 ;; 28 unsigned bits is the max before shifting left by 3 that fits in the
@@ -362,16 +341,6 @@
 (define-vop (halt)
   (:generator 1
     (inst break halt-trap)))
-
-(defknown float-wait () (values))
-(define-vop (float-wait)
-  (:policy :fast-safe)
-  (:translate float-wait)
-  (:vop-var vop)
-  (:save-p :compute-only)
-  (:generator 1
-    (note-next-instruction vop :internal-error)
-    (inst wait)))
 
 ;;;; Miscellany
 
@@ -447,32 +416,27 @@ number of CPU cycles elapsed as secondary value. EXPERIMENTAL."
 
 ;;;; Memory barrier support
 
-#!+memory-barrier-vops
 (define-vop (%compiler-barrier)
   (:policy :fast-safe)
   (:translate %compiler-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%memory-barrier)
   (:policy :fast-safe)
   (:translate %memory-barrier)
   (:generator 3
     (inst mfence)))
 
-#!+memory-barrier-vops
 (define-vop (%read-barrier)
   (:policy :fast-safe)
   (:translate %read-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%write-barrier)
   (:policy :fast-safe)
   (:translate %write-barrier)
   (:generator 3))
 
-#!+memory-barrier-vops
 (define-vop (%data-dependency-barrier)
   (:policy :fast-safe)
   (:translate %data-dependency-barrier)

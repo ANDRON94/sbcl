@@ -109,9 +109,6 @@
   ;; further optimiz'ns) is backwards from the return convention for
   ;; transforms. -- WHN 19990917
   (optimizer nil :type (or function null))
-  ;; a function computing the constant or literal arguments which are
-  ;; destructively modified by the call.
-  (destroyed-constant-args nil :type (or function null))
   ;; If true, a special-case LTN annotation method that is used in
   ;; place of the standard type/policy template selection. It may use
   ;; arbitrary code to choose a template, decide to do a full call, or
@@ -160,11 +157,9 @@
   ;; If non-null, the index of the argument which becomes the result
   ;; of the function.
   (result-arg nil :type (or index null))
-  ;; A function that maps over callable arguments,
-  ;; Used by MAP-CALLABLE-ARGUMENTS
-  (callable-map nil :type (or function null))
   ;; Customizing behavior of ASSERT-CALL-TYPE
-  (call-type-deriver nil :type (or function null)))
+  (call-type-deriver nil :type (or function null))
+  annotation)
 
 (defprinter (fun-info)
   (attributes :test (not (zerop attributes))

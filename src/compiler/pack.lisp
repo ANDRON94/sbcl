@@ -40,7 +40,7 @@
 ;;;    it is local to.
 ;;;
 ;;; If there is a conflict, returns the first such conflicting offset.
-(declaim (ftype (sfunction (tn sc index) (or null index)) conflicts-in-sc))
+(declaim (ftype (sfunction (tn storage-class index) (or null index)) conflicts-in-sc))
 (defun conflicts-in-sc (tn sc offset)
   (let* ((confs (tn-global-conflicts tn))
          (kind (tn-kind tn))
@@ -100,7 +100,7 @@
 ;;; -- If the TN is local, then we just do the block it is local to,
 ;;;    setting always-live and OR'ing in the local conflicts.
 (defun add-location-conflicts (tn sc offset optimize)
-  (declare (type tn tn) (type sc sc) (type index offset))
+  (declare (type tn tn) (type storage-class sc) (type index offset))
   (let ((confs (tn-global-conflicts tn))
         (sb (sc-sb sc))
         (kind (tn-kind tn)))
@@ -218,7 +218,7 @@
 ;;; the SC element size, whichever is larger. If NEEDED-SIZE is
 ;;; larger, then use that size.
 (defun grow-sc (sc &optional (needed-size 0))
-  (declare (type sc sc) (type index needed-size))
+  (declare (type storage-class sc) (type index needed-size))
   (let* ((sb (sc-sb sc))
          (size (finite-sb-current-size sb))
          (align-mask (1- (sc-alignment sc)))
@@ -791,6 +791,18 @@
           (when (eq (vop-info-save-p (vop-info vop)) t)
             (let ((penalty (+ save-penalty (vop-depth-cost vop))))
               (do-live-tns (tn (vop-save-set vop) block)
+                #!-fp-and-pc-standard-save
+                (let ((save-tn (tn-save-tn tn)))
+                  (when (and save-tn (eq :specified-save (tn-kind save-tn)))
+                    ;; If we're expecting to spill a TN with a
+                    ;; specified save slot (the OCFP or LRA save TNs),
+                    ;; force it to the stack now.  If we don't, then
+                    ;; it might not end up on the stack, which may
+                    ;; lead to some useless loads in some code, and
+                    ;; will lead to race conditions in the debugger
+                    ;; involving backtraces from asynchronous
+                    ;; interrupts.
+                    (setf (tn-sc tn) (tn-sc save-tn))))
                 (decf (tn-cost tn) penalty))))))
 
       (do ((tn (ir2-component-normal-tns (component-info component))
@@ -805,6 +817,28 @@
               ((null ref))
             (incf cost (+ write-cost (vop-depth-cost (tn-ref-vop ref)))))
           (setf (tn-cost tn) cost))))))
+
+;;; If we're not assigning costs, and on a system where it matters, go
+;;; through and force TNs with specified save locations (OCFP and LRA
+;;; save locations) to the stack if they are going to be spilled.  See
+;;; the comment in ASSIGN-TN-COSTS for consequences of not doing so.
+#!-fp-and-pc-standard-save
+(defun maybe-force-specified-saves-to-stack (component)
+  (do-ir2-blocks (block component)
+    (do ((vop (ir2-block-start-vop block) (vop-next vop)))
+        ((null vop))
+      (when (eq (vop-info-save-p (vop-info vop)) t)
+        (do-live-tns (tn (vop-save-set vop) block)
+          (let ((save-tn (tn-save-tn tn)))
+            (when (and save-tn (eq :specified-save (tn-kind save-tn)))
+              ;; If we're expecting to spill a TN with a
+              ;; specified save slot (the OCFP or LRA save TNs),
+              ;; force it to the stack now.  If we don't, then
+              ;; it might not end up on the stack, which may
+              ;; lead to some useless loads in some code, and
+              ;; race conditions in the debugger involving
+              ;; backtraces from asynchronous interrupts.
+              (setf (tn-sc tn) (tn-sc save-tn)))))))))
 
 ;;; Iterate over the normal TNs, folding over the depth of the looops
 ;;; that the TN is used in and storing the result in TN-LOOP-DEPTH.
@@ -1048,7 +1082,7 @@
 ;;; iterate over the SC's locations. If we can't find a legal
 ;;; location, return NIL.
 (defun select-load-tn-location (op sc)
-  (declare (type tn-ref op) (type sc sc))
+  (declare (type tn-ref op) (type storage-class sc))
 
   ;; Check any target location first.
   (let ((target (tn-ref-target op)))
@@ -1102,7 +1136,7 @@
 ;;; argument or result TN. The only way we can fail is if all
 ;;; locations in SC are used by load-TNs or temporaries in VOP.
 (defun unpack-for-load-tn (sc op)
-  (declare (type sc sc) (type tn-ref op))
+  (declare (type storage-class sc) (type tn-ref op))
   (let ((sb (sc-sb sc))
         (normal-tns (ir2-component-normal-tns
                      (component-info *component-being-compiled*)))
@@ -1263,7 +1297,7 @@
 ;;; then return the offset to pack at, otherwise return NIL. TARGET
 ;;; must be already packed.
 (defun check-ok-target (target tn sc)
-  (declare (type tn target tn) (type sc sc) (inline member))
+  (declare (type tn target tn) (type storage-class sc) (inline member))
   (let* ((loc (tn-offset target))
          (target-sc (tn-sc target))
          (target-sb (sc-sb target-sc)))
@@ -1329,9 +1363,10 @@
        (%call-with-target-tns ,source-tn #',callback ,@keys))))
 
 (defun find-ok-target-offset (tn sc)
-  (declare (type tn tn) (type sc sc))
+  (declare (type tn tn) (type storage-class sc))
   (do-target-tns (target tn)
     (awhen (and (tn-offset target)
+                (neq (tn-kind target) :arg-pass)
                 (check-ok-target target tn sc))
       (return-from find-ok-target-offset it))))
 
@@ -1350,7 +1385,7 @@
 ;;; on register-starved architectures (x86) this seems to be a bad
 ;;; strategy. -- JES 2004-09-11
 (defun select-location (tn sc &key use-reserved-locs optimize)
-  (declare (type tn tn) (type sc sc))
+  (declare (type tn tn) (type storage-class sc))
   (let* ((sb (sc-sb sc))
          (element-size (sc-element-size sc))
          (alignment (sc-alignment sc))
@@ -1618,8 +1653,10 @@
 
          ;; Assign costs to normal TNs so we know which ones should always
          ;; be packed on the stack, and which are important not to spill.
-         (when *pack-assign-costs*
-           (assign-tn-costs component))
+         (if *pack-assign-costs*
+             (assign-tn-costs component)
+             #!-fp-and-pc-standard-save
+             (maybe-force-specified-saves-to-stack component))
 
          ;; Actually allocate registers for most TNs. After this, only
          ;; :normal tns may be left unallocated (or TNs :restricted to
@@ -1699,7 +1736,8 @@
   ;; Pack wired TNs first.
   (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
       ((null tn))
-    (pack-wired-tn tn optimize))
+    (unless (eq (tn-kind tn) :arg-pass)
+      (pack-wired-tn tn optimize)))
 
   ;; Then, pack restricted TNs, ones that are live over the whole
   ;; component first (they cause no fragmentation).  Sort by TN cost

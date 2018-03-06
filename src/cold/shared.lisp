@@ -235,10 +235,14 @@
           ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
+         ("(and sb-safepoint (not (or arm64 ppc x86 x86-64)))"
+          ":SB-SAFEPOINT not supported on selected architecture")
+         ("(and sb-safepoint-strictly (not sb-safepoint))"
+          ":SB-SAFEPOINT-STRICTLY requires :SB-SAFEPOINT")
          ("(and sb-dynamic-core (not linkage-table))"
           ":SB-DYNAMIC-CORE requires :LINKAGE-TABLE")
-         ("(and relocatable-heap (or cheneygc win32))"
-          "Relocatable heap requires gencgc + not win32")
+         ("(and relocatable-heap win32)"
+          "Relocatable heap requires (not win32)")
          ("(and sb-linkable-runtime (not sb-dynamic-core))"
           ":SB-LINKABLE-RUNTIME requires :SB-DYNAMIC-CORE")
          ("(and sb-linkable-runtime (not (or x86 x86-64)))"
@@ -583,7 +587,9 @@
            (lambda ()
              (progv (list (intern "*SOURCE-NAMESTRING*" "SB!C"))
                     (list (lpnify-stem stem))
-               (compile-stem stem flags :target-compile)))))
+               (loop
+                (with-simple-restart (recompile "Recompile")
+                  (return (compile-stem stem flags :target-compile))))))))
 (compile 'target-compile-stem)
 
 ;;; (This function is not used by the build process, but is intended

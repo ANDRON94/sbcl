@@ -144,12 +144,12 @@
 (with-test (:name :space-bounds-no-consing
                   :skipped-on :interpreter)
   ;; Asking for the size of a heap space should not cost anything!
-  (ctu:assert-no-consing (sb-vm::%space-bounds :static))
-  (ctu:assert-no-consing (sb-vm::space-bytes :static)))
+  (ctu:assert-no-consing (sb-vm:%space-bounds :static))
+  (ctu:assert-no-consing (sb-vm:space-bytes :static)))
 
 (with-test (:name (sb-vm::map-allocated-objects :no-consing)
-                  :skipped-on :interpreter
-                  :fails-on :ppc)
+                  :fails-on :cheneygc
+                  :skipped-on :interpreter)
   (let ((n 0))
     (sb-int:dx-flet ((f (obj type size)
                        (declare (ignore obj type size))
@@ -341,7 +341,8 @@
                       :allow-style-warnings t))))
 
 (with-test (:name :type-across-hairy-lambda-transforms)
-  (assert (subtypep (sb-kernel:%simple-fun-type (lambda (x) (find 1 (the vector x))))
+  (assert (subtypep (sb-kernel:%simple-fun-type
+                     (checked-compile `(lambda (x) (find 1 (the vector x)))))
                     '(function * (values (or (integer 1 1) null) &optional)))))
 
 (with-test (:name :lea-type-derivation)
@@ -592,8 +593,16 @@
     (() (values -1354984705 8473228.0)))
   (checked-compile-and-assert (:optimize :safe)
    `(lambda ()
+      (floor -302254842 50510.5))
+    (() (eval '(floor -302254842 50510.5))))
+  (checked-compile-and-assert (:optimize :safe)
+   `(lambda ()
       (ceiling 114658225103614 84619.58))
-    (() (values 1354984705 -8473228.0))))
+    (() (values 1354984705 -8473228.0)))
+  (checked-compile-and-assert (:optimize :safe)
+   `(lambda ()
+      (ceiling 285493348393 94189.93))
+    (() (values 3031039 0.0))))
 
 (with-test (:name :complex-float-contagion)
   (checked-compile-and-assert ()
@@ -628,6 +637,14 @@
        (equalp a b))
     (("" #*) t)))
 
+(with-test (:name :equalp-transform-zero-string)
+  (checked-compile-and-assert
+   ()
+   `(lambda (a)
+      (equalp "" a))
+   ((#*) t)
+   ((#()) t)))
+
 (with-test (:name :fill-transform-returning-array-data)
   (let ((vector (make-array 10 :fill-pointer 2)))
     (checked-compile-and-assert ()
@@ -648,3 +665,512 @@
     ;; with a toplevel value, so the second would not print enough context
     ;; because the format control and args were the same.
     (run)))
+
+(with-test (:name :cast-deletion-notes)
+  (checked-compile-and-assert
+      (:allow-notes nil)
+      `(lambda (m)
+         (setf m (list 1 2 3))
+         (the simple-vector
+              (coerce m 'vector)))
+    ((nil) #(1 2 3) :test #'equalp)))
+
+(with-test (:name :cast-deletion-notes.2)
+  (multiple-value-bind (fun fail warn style notes)
+      (checked-compile
+       `(lambda (m)
+          (setf m (list 1 2 3))
+          (the simple-vector
+               (if (vectorp m)
+                   m
+                   #(1)))))
+    (declare (ignore fail warn style))
+    (assert (equalp (funcall fun nil)
+                    #(1)))
+    (assert (= (length notes) 1))
+    (assert (typep (car notes) 'code-deletion-note))))
+
+(with-test (:name :array-call-type-deriver)
+  (checked-compile-and-assert
+      ()
+      `(lambda (vector)
+         (funcall (the (function (t t)) #'aref)
+                  vector
+                  0))
+    (((vector 333)) 333)))
+
+(with-test (:name :function-designator-cast-removal)
+  (let ((fun (checked-compile
+              `(lambda (vectors x)
+                 (declare (list vectors x))
+                 (map 'list #'svref vectors x)))))
+    (assert (notany (lambda (c)
+                      (typecase c
+                        (sb-kernel:fdefn
+                         (eq (sb-c::fdefn-name c) 'svref))
+                        (function
+                         (eq c #'svref))))
+                    (ctu:find-code-constants fun)))
+    (assert (equal (funcall fun '(#(44)) '(0)) '(44)))))
+
+(with-test (:name :zombie-casts)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (flet ((f (a b)
+                  (declare (ignore a))
+                  b))
+           (multiple-value-call #'f
+             (values (the integer (unwind-protect (f 10 20)))
+                     322))))
+    (() 322)))
+
+(with-test (:name :zombie-casts.2)
+  (let ((sb-c::*max-optimize-iterations* 1))
+    (checked-compile-and-assert
+        ()
+        `(lambda (a b)
+           (declare (type fixnum a b))
+           (elt '(167992664 119771479)
+                (max 0
+                     (catch 'ct2
+                       (if (typep b '(integer -52))
+                           a
+                           0)))))
+      ((1 2) 119771479))))
+
+
+(with-test (:name :find-dfo-on-deleted-lambda)
+  (assert (= (funcall
+              (funcall (checked-compile
+                        `(lambda ()
+                           (declare (notinline <))
+                           (block nil
+                             (lambda (&key (key
+                                            (unwind-protect
+                                                 (if (< 0)
+                                                     34
+                                                     (return (catch 'c))))))
+                               key))))))
+             34)))
+
+(with-test (:name :ir1-ir2-dead-code-consistency)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (loop for x below 2
+               count (zerop (min x x x x x x x x x x))))
+    (() 1)))
+
+(with-test (:name :ir1-ir2-dead-code-consistency)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (loop for x below 2
+               count (zerop (min x x x x x x x x x x))))
+    (() 1)))
+
+(with-test (:name (setf svref :constant-modification))
+  (assert
+   (= (length (nth-value 2
+                         (checked-compile
+                          `(lambda (x)
+                             (setf (svref #(a b c) 1) x))
+                          :allow-warnings 'sb-int:constant-modified)))
+            1)))
+
+(with-test (:name (debug :constant-modification))
+  (assert
+   (= (length (nth-value 2
+                         (checked-compile
+                          `(lambda (x)
+                             (declare (optimize (debug 2)))
+                             (let ((m "abc"))
+                               (delete x m)))
+                          :allow-warnings 'sb-int:constant-modified)))
+      1)))
+
+(with-test (:name (debug :unused-tn-long-arglist))
+  (checked-compile-and-assert
+      ()
+      `(lambda (n x)
+         (declare (sb-vm:word n))
+         (log (float n))
+         (nth-value 33 (funcall x . #.(loop for i to 35 collect i))))
+    ((10 (lambda (&rest args) (values-list args))) 33)))
+
+(with-test (:name (debug :unused-tn-very-long-arglist))
+  (checked-compile-and-assert
+      ()
+      `(lambda (n x)
+         (declare (sb-vm:word n))
+         (log (float n))
+         (nth-value 33 (funcall x . #.(loop for i to 350 collect i))))
+    ((10 (lambda (&rest args) (values-list args))) 33)))
+
+(with-test (:name (dynamic-extent :recursive-local-functions))
+  (checked-compile
+   `(lambda ()
+      (let ((s (labels ((%f () (%f)))
+                 (%f))))
+        (declare (dynamic-extent s))
+        (car s)))))
+
+(with-test (:name (:ctypep :hairy-types))
+  (checked-compile
+   `(lambda ()
+      (the (cons (satisfies error)) '("a"))))
+  (assert
+   (nth-value 3
+              (checked-compile
+               `(lambda () (the (array abc) #()))
+               :allow-style-warnings t))))
+
+(with-test (:name (catch :evaluate-tag-before-%catch))
+  (checked-compile-and-assert
+      (:allow-style-warnings t)
+      `(lambda (z)
+         (catch (multiple-value-call #'+
+                  (if z 1 (values 1 2)))
+           :done))
+    ((t) :done)
+      ((nil) :done)))
+
+(with-test (:name :fewer-cast-conversions)
+  (multiple-value-bind (fun failed)
+      (checked-compile
+       `(lambda ()
+          (let* ((v (cons 0 (catch 'ct (the integer nil)))))
+            (declare (dynamic-extent v))
+            (flet ((%f (x) x))
+              (%f (cdr v)))))
+       :allow-warnings t)
+    (assert failed)
+    (handler-bind ((error (lambda (c) c (throw 'ct 33))))
+      (assert (= (funcall fun) 33)))))
+
+(with-test (:name :constant-folding-with-callable-args)
+  (checked-compile '(lambda () (count #'%f '(a)))
+                   :allow-style-warnings t))
+
+(with-test (:name :flushable-with-callable-args)
+  (let ((fun (checked-compile '(lambda (y) (let ((x (count y '(1 2 3))))
+                                             (declare (ignore x)))))))
+    (assert (not (ctu:find-named-callees fun)))))
+
+(with-test (:name (remove :count))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (remove x "aaa" :count 2))
+   ((#\a) "a"))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (remove-if (lambda (y) (eql y x)) "aaa" :count 2))
+   ((#\a) "a")))
+
+(with-test (:name (:constant-fold :allow-other-keys))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (reduce #'+ '(1 2 3)  :allow-other-keys t :bad x))
+   ((1) 6)))
+
+(with-test (:name (:constant-fold :allow-other-keys.2))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (reduce #'+ '(1 2 3)  :allow-other-keys x))
+   ((1) 6)))
+
+(with-test (:name (:constant-fold :repeat-keys))
+  (checked-compile-and-assert
+   ()
+   `(lambda (x)
+      (member nil '(1 2 3) :key #'evenp :key x))
+   ((1) '(1 2 3) :test #'equal)))
+
+
+
+(with-test (:name :function-and-instance-primitive-type)
+  (checked-compile-and-assert
+      ()
+      `(lambda (f)
+         (declare (function f))
+         (the standard-object f)
+         (funcall f #'list t))
+    ((#'documentation) (documentation #'list t))))
+
+(with-test (:name :mv-call-safety-0)
+  (checked-compile-and-assert
+      ()
+      `(lambda (a)
+         (flet ((%f1 (x y) (+ x y)))
+           (apply #'%f1 a (list 0))))
+    ((3) 3)))
+
+(with-test (:name :cast-type-check-external)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (declare (notinline +))
+         (gcd
+          (loop for lv2 below 1
+                count (logbitp 0
+                               (if x
+                                   (return x)
+                                   1)))
+          0))
+    ((334) 334)))
+
+(with-test (:name :flush-combination-non-fun-type)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (rassoc-if-not #'values '((1 . a)) :allow-other-keys t)
+         1)
+    (() 1)))
+
+(with-test (:name :symeval-nil)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (sb-kernel:symeval nil))
+    (() nil)))
+
+(with-test (:name (:physenv-analyze :deleted-lambda))
+  (checked-compile-and-assert
+      ()
+      `(lambda (log)
+         (loop for str in nil
+               for i from 0
+               do
+               (ignore-errors (format log ""))))
+    ((t) nil)))
+
+(with-test (:name (:ensure-lvar-fun-form :lvar-uses))
+  (checked-compile-and-assert
+      ()
+      `(lambda (op) (funcall (case op (equal '=) (t '=)) 1 2))
+    (('equal) nil)
+    ((t) nil)))
+
+(with-test (:name :substitute-let-funargs-during-find-initial-dfo)
+  (checked-compile
+   `(lambda ()
+      (labels ((%r (f)
+                 (loop)
+                 (%r f)))
+        (%r (lambda ()))))))
+
+(with-test (:name :split-ir2-blocks-cmov)
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (let ((v (list 0)))
+           (if (block nil
+                 (eq v (cdr v)))
+               1
+               2)))
+    (() 2)))
+
+(with-test (:name :=-rational-complex-rational-fold)
+  (let ((fun (checked-compile '(lambda (x)
+                                (declare ((complex integer) x))
+                                (= x 10))))
+        (fun2 (checked-compile '(lambda (x)
+                                (declare ((complex rational) x))
+                                (= x 10d0)))))
+    (assert (equal (sb-kernel:%simple-fun-type fun)
+                   '(function ((complex integer)) (values null &optional))))
+    (assert (not (funcall fun #C(10 10))))
+    (assert (equal (sb-kernel:%simple-fun-type fun2)
+                   '(function ((complex rational)) (values null &optional))))
+    (assert (not (funcall fun2 #C(10 10))))))
+
+(with-test (:name :find-type-deriver)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (find 1 x :key #'values))
+    (('(1)) 1)))
+
+(with-test (:name :tail-call-ltn-annotation)
+  (checked-compile-and-assert
+      ()
+      `(lambda (x)
+         (labels ((ff1 ()
+                    (multiple-value-call #'print
+                      (if x
+                          (values t t)
+                          nil))
+                    (ff1)))
+           (identity (ff1))))))
+
+(with-test (:name (:substitute-lvar-uses :deleted-code-and-dx-lvars))
+  (assert (nth-value 1
+                     (checked-compile
+                      `(lambda ()
+                         (let ((v (values
+                                   (the integer
+                                        (flet ((%f5 (x) x))
+                                          (%f5)))
+                                   (unwind-protect 1))))
+                           (declare (dynamic-extent v))
+                           v))
+                      :allow-warnings t))))
+
+(with-test (:name (restart-case :declaration-processing))
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (restart-case (list)
+           (my-restart (x) "foo" "bar" x)))
+    (() ()))
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (restart-case (list)
+           (my-restart () (declare))))
+    (() ())))
+
+(with-test (:name (handler-case :declaration-processing))
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (handler-case (list 1 2) (error (e) "foo" "bar" e)))
+    (() '(1 2)))
+  (assert (nth-value 1
+                     (checked-compile
+                      `(lambda ()
+                         (handler-case (declare)))
+                      :allow-failure t))))
+
+(with-test (:name (:unconvert-tail-calls :deleted-call))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda ()
+                        (labels ((%f (&optional (x (* 2 nil (%f)))) x))
+                          (%f)
+                          (%f 1)))
+                      :allow-warnings t))))
+
+(with-test (:name (:equal-transform :nil-types))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda ()
+                        (loop for y below 3
+                              count (or
+                                     (not (or (>= y y) (equal y -787357528)))
+                                     (the integer (or (>= y y) (equal y -787357528))))))
+                      :allow-warnings t))))
+
+
+
+(with-test (:name (:delete-recursive-optional))
+  (checked-compile '(lambda (x)
+                     (lambda ()
+                       (labels ((f (&optional a) (values x a #'f))))))))
+
+(with-test (:name (:combination-args-flow-cleanly-p :unused-result))
+  (checked-compile-and-assert
+      ()
+      `(lambda ()
+         (let ((v (flet ((%f (x)
+                           (list x)
+                           (list 1)))
+                    (%f 2))))
+           (declare (dynamic-extent v))
+           (car v)))
+    (() 1)))
+
+(with-test (:name (:delete-ref :maintain-lambda-calls-or-closes))
+  (checked-compile `(lambda (c y)
+                      (labels ((f1 ()
+                                 (if y
+                                     (f3 2)))
+                               (l () (loop))
+                               (f2 ()
+                                 (l)
+                                 (f3 3))
+                               (f3 (x)
+                                 (f3 x))
+                               (f4 ()
+                                 (f1)
+                                 (f2)))
+                        (f4)
+                        c))))
+
+(with-test (:name (the :nil-type))
+  (checked-compile
+   `(lambda ()
+      (flet ((f () (the nil 0)))
+        (oddp (f))))))
+
+(with-test (:name :concatenate-transform-hairy-type)
+  (checked-compile
+      '(lambda (x)
+        (concatenate '(and string (satisfies eval)) x))))
+
+(with-test (:name :make-array-transform-deletion-notes)
+  (checked-compile
+   `(lambda (vector)
+      (let* ((length (length vector))
+             (new (make-array length :adjustable t
+                                     :fill-pointer length)))
+        new))
+   :allow-notes nil))
+
+(with-test (:name :ltn-analyze-cast-unlink)
+  (assert (nth-value 1 (checked-compile
+                        `(lambda (n)
+                           (* 2 n)
+                           (let ((p (make-array n :element-type 'double-float)))
+                             (dotimes (i n)
+                               (setf (aref p i)
+                                     (ignore-errors i)))))
+                        :allow-warnings t))))
+
+(with-test (:name :call-type-validation)
+  (checked-compile
+   `(lambda ()
+      (funcall (the (or cons function) *debugger-hook*)))))
+
+(with-test (:name :setf-schar-hairy-types)
+  (checked-compile-and-assert
+      ()
+      `(lambda (s v)
+         (setf (schar (the (satisfies eval) s) 0) v)
+         s)
+    (((copy-seq "abc") #\m) "mbc" :test #'equal)))
+
+(with-test (:name :check-function-designator-cast-key-lambda-var)
+  (checked-compile-and-assert
+      (:optimize '(:speed 3 :space 0))
+      `(lambda (p1 p4)
+         (declare (vector p1)
+                  ((member ,#'car "x" cdr) p4))
+         (stable-sort p1 #'<= :key p4))
+    (((vector '(2) '(3) '(1)) #'car) #((1) (2) (3)) :test #'equalp)))
+
+(with-test (:name :replace-zero-elements)
+  (checked-compile-and-assert
+      ()
+      '(lambda (x)
+        (declare ((simple-vector 2) x))
+        (replace x x :start1 2))
+    (((vector 1 2)) #(1 2) :test #'equalp))
+  (checked-compile-and-assert
+      ()
+      '(lambda (x)
+        (replace x x :start1 2))
+    (((vector 1 2)) #(1 2) :test #'equalp)))
+
+(with-test (:name :error-in-xep)
+  (checked-compile-and-assert
+      (:optimize :safe)
+      '(lambda (x)
+        (declare (type (satisfies error) x))
+        x)
+    (("") (condition 'error))))

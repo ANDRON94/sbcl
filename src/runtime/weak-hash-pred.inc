@@ -19,10 +19,11 @@ static int survived_gc_yet_OR(lispobj key, lispobj value) {
     return pointer_survived_gc_yet(key) || pointer_survived_gc_yet(value);
 }
 
-int (*HT_ENTRY_LIVENESS_FUN_ARRAY_NAME[5])(lispobj,lispobj) = {
-    NULL,
+/* magic number. cf WEAK-HASH-TABLE-KINDS in 'hash-table.lisp' */
+#define WEAKNESS_KEY_AND_VALUE 0
+int (*HT_ENTRY_LIVENESS_FUN_ARRAY_NAME[4])(lispobj,lispobj) = {
+    survived_gc_yet_AND,
     survived_gc_yet_KEY,
     survived_gc_yet_VALUE,
-    survived_gc_yet_AND,
     survived_gc_yet_OR
 };

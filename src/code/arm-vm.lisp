@@ -9,17 +9,18 @@
 
 ;;;; FIXUP-CODE-OBJECT
 
+(defconstant-eqx +fixup-kinds+ #(:absolute) #'equalp)
 (!with-bigvec-or-sap
-(defun fixup-code-object (code offset fixup kind &optional flavor)
+(defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let ((sap (code-instructions code)))
-     (ecase kind
-       (:absolute
-        (setf (sap-ref-32 sap offset) fixup)))))))
+  (let ((sap (code-instructions code)))
+    (ecase kind
+      (:absolute
+       (setf (sap-ref-32 sap offset) fixup))))
+  nil))
 
 ;;;; "Sigcontext" access functions, cut & pasted from sparc-vm.lisp,
 ;;;; then modified for ARM.
@@ -44,8 +45,7 @@
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
   (let* ((pc (context-pc context))
-         (error-number (sap-ref-8 pc 5)))
+         (trap-number (sap-ref-8 pc 4)))
     (declare (type system-area-pointer pc))
-    (values error-number
-            (sb!kernel::decode-internal-error-args (sap+ pc 6) error-number))))
+    (sb!kernel::decode-internal-error-args (sap+ pc 5) trap-number)))
 ) ; end PROGN

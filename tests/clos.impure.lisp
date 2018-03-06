@@ -1122,6 +1122,40 @@
   (:method ((x integer)) (setq x 3)
            (list x (call-next-method) (call-next-method x))))
 (assert (equal (cnm-assignment 1) '(3 1 3)))
+
+;;; lp#1734771: Even for assignment to parameters (implcitly or
+;;; explicitly) specialized to T, or using EQL specializers.
+(defgeneric bug-1734771 (x y)
+  (:method (x y) (list x y))
+  (:method ((x integer) y)
+    (incf y)
+    (call-next-method))
+  (:method ((x symbol) (y t))
+    (incf y)
+    (call-next-method))
+  (:method (x (y (eql nil)))
+    (setf y t)
+    (call-next-method)))
+(with-test (:name (:cnm-assignment :bug-1734771 1))
+  (assert (equal (bug-1734771 2 3) '(2 3))))
+(with-test (:name (:cnm-assignment :bug-1734771 2))
+  (assert (equal (bug-1734771 t 3) '(t 3))))
+(with-test (:name (:cnm-assignment :bug-1734771 3))
+  (assert (equal (bug-1734771 #\c nil) '(#\c nil))))
+
+(defgeneric bug-1734771-2 (x &optional y)
+  (:method (x &optional (y nil y-p)) (list x y y-p))
+  (:method ((x integer) &optional (y 0))
+    (incf y)
+    (call-next-method))
+  (:method ((x symbol) &optional (y 0))
+    (call-next-method)))
+(with-test (:name (:cnm-assignment :bug-1734771 4))
+  (assert (equal (bug-1734771-2 2) '(2 nil nil))))
+(with-test (:name (:cnm-assignment :bug-1734771 5))
+  (assert (equal (bug-1734771-2 2 0) '(2 0 t))))
+(with-test (:name (:cnm-assignment :bug-1734771 6))
+  (assert (equal (bug-1734771-2 t) '(t nil nil))))
 
 ;;; Bug reported by Istvan Marko 2003-07-09
 (let ((class-name (gentemp)))

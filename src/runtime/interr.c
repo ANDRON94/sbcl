@@ -33,6 +33,7 @@
 #include "breakpoint.h"
 #include "var-io.h"
 #include "sc-offset.h"
+#include "gc.h"
 
 /* the way that we shut down the system on a fatal error */
 
@@ -143,17 +144,18 @@ corruption_warning_and_maybe_lose(char *fmt, ...)
     print_message(fmt, ap);
     va_end(ap);
     fprintf(stderr, "The integrity of this image is possibly compromised.\n");
-    if (lose_on_corruption_p)
+    if (lose_on_corruption_p || gc_active_p) {
         fprintf(stderr, "Exiting.\n");
-    else
-        fprintf(stderr, "Continuing with fingers crossed.\n");
-    fflush(stderr);
-    if (lose_on_corruption_p)
+        fflush(stderr);
         call_lossage_handler();
+    }
+    else {
+        fprintf(stderr, "Continuing with fingers crossed.\n");
+        fflush(stderr);
 #ifndef LISP_FEATURE_WIN32
-    else
         thread_sigmask(SIG_SETMASK,&oldset,0);
 #endif
+    }
 }
 
 void print_constant(os_context_t *context, int offset) {
@@ -206,14 +208,20 @@ describe_internal_error(os_context_t *context)
     char count;
     int position, sc_offset, sc_number, offset, ch;
     void * pc = (void*)*os_context_pc_addr(context);
+    unsigned char code;
 
 #ifdef LISP_FEATURE_ARM64
     u32 trap_instruction = *(u32 *)ptr;
-    unsigned char code = trap_instruction >> 13 & 0xFF;
+    code = trap_instruction >> 13 & 0xFF;
     ptr += 4;
 #else
-    unsigned char code = *ptr;
-    ptr++;
+    unsigned char trap = *(ptr-1);
+    if (trap >= trap_Error) {
+        code = trap - trap_Error;
+    } else {
+        code = *ptr;
+        ptr++;
+    }
 #endif
 
     if (code > sizeof(internal_error_nargs)) {

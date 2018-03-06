@@ -16,15 +16,15 @@
   "Returns a string describing the type of the local machine."
   "SPARC")
 
+(defconstant-eqx +fixup-kinds+ #(:call :sethi :add :absolute) #'equalp)
 (!with-bigvec-or-sap
-(defun fixup-code-object (code offset fixup kind &optional flavor)
+(defun fixup-code-object (code offset fixup kind flavor)
   (declare (type index offset))
   (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let ((sap (code-instructions code)))
-     (ecase kind
+  (let ((sap (code-instructions code)))
+    (ecase kind
        (:call
         (error "Can't deal with CALL fixups, yet."))
        (:sethi
@@ -35,7 +35,8 @@
               (ldb (byte 10 0) fixup)))
        (:absolute
         (setf (sap-ref-32 sap offset)
-              fixup)))))))
+              fixup))))
+  nil))
 
 
 ;;;; "Sigcontext" access functions, cut & pasted from alpha-vm.lisp.
@@ -79,20 +80,11 @@
   (warn "stub CONTEXT-FLOATING-POINT-MODES")
   0)
 
-;;;; INTERNAL-ERROR-ARGS.
-
-;;; Given a (POSIX) signal context, extract the internal error
-;;; arguments from the instruction stream.  This is e.g.
-;;; 4       23      254     240     2       0       0       0
-;;; |       ~~~~~~~~~~~~~~~~~~~~~~~~~
-;;; length         data              (everything is an octet)
-;;;  (pc)
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
   (/show0 "entering INTERNAL-ERROR-ARGS")
   (let* ((pc (context-pc context))
-         (error-number (sap-ref-8 pc 4)))
+         (trap-number (sap-ref-8 pc 3)))
     (declare (type system-area-pointer pc))
-    (values error-number
-            (sb!kernel::decode-internal-error-args (sap+ pc 5) error-number))))
+    (sb!kernel::decode-internal-error-args (sap+ pc 4) trap-number)))
 ) ; end PROGN

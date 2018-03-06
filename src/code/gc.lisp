@@ -118,11 +118,11 @@ run in any thread.")
 (define-alien-routine collect-garbage int
   (#!+gencgc last-gen #!-gencgc ignore int))
 
-#!+sb-thread
+#!+(or sb-thread sb-safepoint)
 (progn
   (define-alien-routine gc-stop-the-world void)
   (define-alien-routine gc-start-the-world void))
-#!-sb-thread
+#!-(or sb-thread sb-safepoint)
 (progn
   (defun gc-stop-the-world ())
   (defun gc-start-the-world ()))
@@ -197,12 +197,12 @@ statistics are appended to it."
                       ;; turn is a type-error.
                       (when (plusp run-time)
                         (incf *gc-run-time* run-time)))
-                    #!+sb-safepoint
+                    #!+(and sb-thread sb-safepoint)
                     (setf *stop-for-gc-pending* nil)
                     (setf *gc-pending* nil
                           new-usage (dynamic-usage))
                     #!+sb-thread
-                    (assert (not *stop-for-gc-pending*))
+                    (aver (not *stop-for-gc-pending*))
                     (gc-start-the-world)
                     ;; In a multithreaded environment the other threads
                     ;; will see *n-b-f-o-p* change a little late, but
@@ -223,7 +223,6 @@ statistics are appended to it."
              (sb!thread::without-thread-waiting-for
                  (:already-without-interrupts t)
                (let ((sb!impl::*deadline* nil)
-                     (sb!impl::*deadline-seconds* nil)
                      (epoch *gc-epoch*))
                  (loop
                   ;; GCing must be done without-gcing to avoid
@@ -273,7 +272,7 @@ statistics are appended to it."
   ;; another GC. FIXME: it can potentially exceed maximum interrupt
   ;; nesting by triggering GCs.
   ;;
-  ;; Can that be avoided by having the finalizers and hooks run only
+  ;; Can that be avoided by having the hooks run only
   ;; from the outermost SUB-GC? If the nested GCs happen in interrupt
   ;; handlers that's not enough.
   ;;
@@ -286,13 +285,26 @@ statistics are appended to it."
   ;;    don't want to run user code in such a case.
   ;;
   ;; The long-term solution will be to keep a separate thread for
-  ;; finalizers and after-gc hooks.
+  ;; after-gc hooks.
+  ;; Finalizers are in a separate thread (usually),
+  ;; but it's not permissible to invoke CONDITION-NOTIFY from a
+  ;; dying thread, so we still need the guard for that, but not
+  ;; the guard for whether interupts are enabled.
   (when (sb!thread:thread-alive-p sb!thread:*current-thread*)
-    (when *allow-with-interrupts*
-      (sb!thread::without-thread-waiting-for ()
-        (with-interrupts
-          (run-pending-finalizers)
-          (call-hooks "after-GC" *after-gc-hooks* :on-error :warn))))))
+    (let ((threadp #!+sb-thread (%instancep sb!impl::*finalizer-thread*)))
+      (when threadp
+        ;; It's OK to frob a condition variable regardless of
+        ;; *allow-with-interrupts*, and probably OK to start a thread.
+        ;; For consistency with the previous behavior, we delay finalization
+        ;; if there is no finalizer thread and interrupts are disabled.
+        ;; That's my excuse anyway, not having looked more in-depth.
+        (run-pending-finalizers))
+      (when *allow-with-interrupts*
+        (sb!thread::without-thread-waiting-for ()
+         (with-interrupts
+           (unless threadp
+             (run-pending-finalizers))
+           (call-hooks "after-GC" *after-gc-hooks* :on-error :warn)))))))
 
 ;;; This is the user-advertised garbage collection function.
 (defun gc (&key (full nil) (gen 0) &allow-other-keys)
@@ -385,10 +397,6 @@ Note: currently changes to this value are lost when saving core."
 #!+gencgc
 (define-alien-type generation
     (struct generation
-            (alloc-large-start-page page-index-t)
-            (alloc-start-page page-index-t)
-            (alloc-unboxed-start-page page-index-t)
-            (alloc-code-start-page page-index-t)
             (bytes-allocated os-vm-size-t)
             (gc-trigger os-vm-size-t)
             (bytes-consed-between-gcs os-vm-size-t)

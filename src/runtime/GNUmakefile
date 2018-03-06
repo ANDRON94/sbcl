@@ -59,8 +59,9 @@ LDFLAGS += -nopie
 __LDFLAGS__ += -nopie
 endif
 
-COMMON_SRC = alloc.c backtrace.c breakpoint.c coreparse.c dynbind.c     \
-	funcall.c gc-common.c globals.c hopscotch.c interr.c interrupt.c\
+COMMON_SRC = alloc.c backtrace.c breakpoint.c coalesce.c coreparse.c    \
+	dynbind.c funcall.c gc-common.c globals.c hopscotch.c           \
+	interr.c interrupt.c                                            \
 	largefile.c monitor.c murmur_hash.c os-common.c parse.c print.c \
 	purify.c pthread-futex.c regnames.c run-program.c runtime.c     \
 	safepoint.c save.c sc-offset.c search.c thread.c time.c         \
@@ -87,6 +88,23 @@ sbcl.o: $(OBJS)
 
 libsbcl.a: $(OBJS)
 	rm -f $@ ; ar rcs $@ $^
+
+libsbcl.so: $(subst .o,.pic.o,$(filter-out ldso-stubs.o,$(OBJS)))
+	cc -shared -o $@ $^ -ldl -lpthread -lm
+%.pic.o: %.c
+	$(CC) -DLISP_FEATURE_GCC_TLS -fPIC -c $(CFLAGS) $< -o $@
+%.pic.o: %.S # (-fPIC doesn't affect hand-written assembly source)
+	$(CC) -DLISP_FEATURE_GCC_TLS -DPOSITION_INDEPENDENT_ASM -c $(CFLAGS) $< -o $@
+testmain: testmain.c libsbcl.so -ldl
+
+shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o: ../../output/sbcl.core \
+ ../../tools-for-build/editcore.lisp
+	../../run-sbcl.sh --script ../../tools-for-build/editcore.lisp split \
+		../../output/sbcl.core shrinkwrap-sbcl.s
+shrinkwrap-sbcl: shrinkwrap-sbcl.s shrinkwrap-sbcl-core.o $(LIBSBCL)
+	$(CC) $(LINKFLAGS) $(CFLAGS) -o $@ $^ $(LIBS)
+semiwrap-sbcl: shrinkwrap-sbcl.s $(LIBSBCL)
+	$(CC) $(LINKFLAGS) $(CFLAGS) -o $@ $^ $(LIBS)
 
 sbcl.mk:
 	( echo 'CC=$(CC)' ; \

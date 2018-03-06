@@ -14,14 +14,31 @@
 
 ;;;; utilities
 
+;;; T if and only if table has non-null weakness kind.
+(declaim (inline hash-table-weak-p))
+(defun hash-table-weak-p (ht) (logbitp 0 (hash-table-flags ht)))
+
+;;; Value of :synchronized constructor argument.
+(declaim (inline hash-table-synchronized-p))
+(defun hash-table-synchronized-p (ht) (logbitp 1 (hash-table-flags ht)))
+
+;;; Keep in sync with weak_ht_alivep_funs[] in gc-common
+(declaim (inline decode-hash-table-weakness))
+(defun decode-hash-table-weakness (x)
+  ;; The bits of 'weakness' are interpreted as follows:
+  ;;   bit 0 : live key forces value to be live
+  ;;   bit 1 : live value forces key to be live
+  ;;   both  : either forces the other to be live
+  ;; :KEY-AND-VALUE has two zero bits, as neither object livens the other
+  (aref #(:key-and-value :key :value :key-or-value) x))
+
+;;; Non-NIL if this is some kind of weak hash table. For details see
+;;; the docstring of MAKE-HASH-TABLE.
 (defun hash-table-weakness (ht)
   "Return the WEAKNESS of HASH-TABLE which is one of NIL, :KEY,
 :VALUE, :KEY-AND-VALUE, :KEY-OR-VALUE."
-  (aref weak-hash-table-kinds (hash-table-%weakness ht)))
-
-(declaim (inline hash-table-weak-p))
-(defun hash-table-weak-p (ht)
-  (not (zerop (hash-table-%weakness ht))))
+  (and (hash-table-weak-p ht)
+       (decode-hash-table-weakness (ash (hash-table-flags ht) -3))))
 
 ;;; Code for detecting concurrent accesses to the same table from
 ;;; multiple threads. Only compiled in when the :SB-HASH-TABLE-DEBUG
@@ -400,6 +417,12 @@ Examples:
                                     '(unsigned-byte #.sb!vm:n-word-bits)))
            (kv-vector (make-array (* 2 size+1)
                                   :initial-element +empty-ht-slot+))
+           (weakness (if weakness
+                         (or (loop for i below 4
+                                   when (eq (decode-hash-table-weakness i) weakness)
+                                   do (return (logior (ash i 3) 1)))
+                             (bug "Unreachable"))
+                         0))
            (table (%make-hash-table
                    test
                    test-fun
@@ -408,7 +431,6 @@ Examples:
                    rehash-threshold
                    size
                    kv-vector
-                   (position weakness weak-hash-table-kinds :test #'eq)
                    index-vector
                    next-vector
                    (unless (eq test 'eq)
@@ -417,7 +439,7 @@ Examples:
                                  :element-type '(unsigned-byte
                                                  #.sb!vm:n-word-bits)
                                  :initial-element +magic-hash-vector-value+))
-                   synchronized)))
+                   (logior (if synchronized 2 0) weakness))))
       (declare (type index size+1 scaled-size length))
       (setf (kv-vector-needs-rehash kv-vector) 0)
       ;; Set up the free list, all free. These lists are 0 terminated.
@@ -464,38 +486,47 @@ multiple threads accessing the same hash-table without locking."
 
 ;;; Make new vectors for the table, extending the table based on the
 ;;; rehash-size.
-(defun rehash (table)
-  (declare (type hash-table table))
+(defun hash-table-new-vectors (table)
+  ;; Can at least some vectors be copied before entering WITHOUT-GCING
+  ;; for REHASH?
+  ;; So that they don't have to be alive at the same time and be collected.
+  (let* ((old-next-vector (hash-table-next-vector table))
+         (old-hash-vector (hash-table-hash-vector table))
+         (old-size (length old-next-vector))
+         (new-size
+           (power-of-two-ceiling
+            (let ((rehash-size (hash-table-rehash-size table)))
+              (etypecase rehash-size
+                (fixnum
+                 (+ rehash-size old-size))
+                (float
+                 (the index (truncate (* rehash-size old-size))))))))
+         (new-kv-vector (make-array (* 2 new-size)
+                                    :initial-element +empty-ht-slot+))
+         (new-next-vector
+           (make-array new-size :element-type 'word :initial-element 0))
+         (new-hash-vector
+           (when old-hash-vector
+             (make-array new-size
+                         :element-type 'word
+                         :initial-element +magic-hash-vector-value+)))
+         (new-index-vector (make-array new-size :element-type 'word :initial-element 0)))
+    (values new-size
+            new-kv-vector new-next-vector new-hash-vector new-index-vector)))
+
+(defun rehash (table new-size
+               new-kv-vector new-next-vector new-hash-vector
+               new-index-vector)
+  (declare (type hash-table table)
+           (type simple-vector new-kv-vector)
+           (type (simple-array word (*)) new-next-vector new-index-vector)
+           (type (or null (simple-array word (*))) new-hash-vector)
+           (type index new-size))
   (aver *gc-inhibit*)
   (let* ((old-kv-vector (hash-table-table table))
          (old-next-vector (hash-table-next-vector table))
          (old-hash-vector (hash-table-hash-vector table))
-         (old-size (length old-next-vector))
-         (new-size
-          (power-of-two-ceiling
-           (let ((rehash-size (hash-table-rehash-size table)))
-             (etypecase rehash-size
-               (fixnum
-                (+ rehash-size old-size))
-               (float
-                (the index (truncate (* rehash-size old-size))))))))
-         (new-kv-vector (make-array (* 2 new-size)
-                                    :initial-element +empty-ht-slot+))
-         (new-next-vector
-          (make-array new-size
-                      :element-type '(unsigned-byte #.sb!vm:n-word-bits)
-                      :initial-element 0))
-         (new-hash-vector
-          (when old-hash-vector
-            (make-array new-size
-                        :element-type '(unsigned-byte #.sb!vm:n-word-bits)
-                        :initial-element +magic-hash-vector-value+)))
-         (new-length new-size)
-         (new-index-vector
-          (make-array new-length
-                      :element-type '(unsigned-byte #.sb!vm:n-word-bits)
-                      :initial-element 0)))
-    (declare (type index new-size new-length old-size))
+         (old-size (length old-next-vector)))
 
     ;; Disable GC tricks on the OLD-KV-VECTOR.
     (set-header-data old-kv-vector sb!vm:vector-normal-subtype)
@@ -544,7 +575,7 @@ multiple threads accessing the same hash-table without locking."
                             +magic-hash-vector-value+)))
                ;; Can use the existing hash value (not EQ based)
                (let* ((hashing (aref new-hash-vector i))
-                      (index (index-for-hashing hashing new-length))
+                      (index (index-for-hashing hashing new-size))
                       (next (aref new-index-vector index)))
                  (declare (type index index)
                           (type hash hashing))
@@ -552,12 +583,12 @@ multiple threads accessing the same hash-table without locking."
                  (setf (aref new-next-vector i) next)
                  (setf (aref new-index-vector index) i)))
               (t
-               ;; EQ base hash.
+               ;; EQ-based hash.
                ;; Enable GC tricks.
                (set-header-data new-kv-vector
                                 sb!vm:vector-valid-hashing-subtype)
                (let* ((hashing (pointer-hash key))
-                      (index (index-for-hashing hashing new-length))
+                      (index (index-for-hashing hashing new-size))
                       (next (aref new-index-vector index)))
                  (declare (type index index)
                           (type hash hashing))
@@ -619,7 +650,7 @@ multiple threads accessing the same hash-table without locking."
                  (setf (aref next-vector i) next)
                  (setf (aref index-vector index) i)))
               (t
-               ;; EQ base hash.
+               ;; EQ-based hash.
                ;; Enable GC tricks.
                (set-header-data kv-vector sb!vm:vector-valid-hashing-subtype)
                (let* ((hashing (pointer-hash key))
@@ -647,15 +678,24 @@ multiple threads accessing the same hash-table without locking."
     (declare (inline rehash-p rehash-without-growing-p))
     (cond ((rehash-p)
            ;; Use recursive locks since for weak tables the lock has
-           ;; already been acquired. GC must be inhibited to prevent
-           ;; the GC from seeing a rehash in progress.
+           ;; already been acquired.
            (sb!thread::with-recursive-system-lock
-               ((hash-table-lock hash-table) :without-gcing t)
+               ((hash-table-lock hash-table))
              ;; Repeat the condition inside the lock to ensure that if
              ;; two reader threads enter MAYBE-REHASH at the same time
              ;; only one rehash is performed.
              (when (rehash-p)
-               (rehash hash-table))))
+               ;; Cons new vectors outside of WITHOUT-GCING (except
+               ;; for weak hash-tables, GETHASH3 already uses
+               ;; WITHOUT-GCING in that case)
+               (multiple-value-bind (new-size new-kv-vector new-next-vector new-hash-vector new-index-vector)
+                   (hash-table-new-vectors hash-table)
+                 (without-gcing
+                   ;; Rehash inside WITHOUT-GCING to avoid movement
+                   ;; and the keep GC from seeing half-initilizaed
+                   ;; hash vectors.
+                   (rehash hash-table new-size new-kv-vector new-next-vector
+                           new-hash-vector new-index-vector))))))
           ((rehash-without-growing-p)
            (sb!thread::with-recursive-system-lock
                ((hash-table-lock hash-table) :without-gcing t)

@@ -45,11 +45,13 @@
            (- list-pointer-lowtag)))
       0))
 
+(defconstant-eqx +all-static-fdefns+
+    #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+) #'equalp)
+
 ;;; Return the (byte) offset from NIL to the start of the fdefn object
 ;;; for the static function NAME.
 (defun static-fdefn-offset (name)
-  (let ((static-fun-index
-          (position name #.(concatenate 'vector +c-callable-fdefns+ +static-fdefns+))))
+  (let ((static-fun-index (position name +all-static-fdefns+)))
     (and static-fun-index
          (+ (* (length +static-symbols+) (pad-data-block symbol-size))
             (pad-data-block (1- symbol-size))
@@ -72,7 +74,7 @@
      (* fdefn-raw-addr-slot n-word-bytes)))
 
 ;;; Various error-code generating helpers
-(defvar *adjustable-vectors* nil)
+(defvar *adjustable-vectors*)
 
 (defmacro with-adjustable-vector ((var) &rest body)
   `(let ((,var (or (pop *adjustable-vectors*)
@@ -86,10 +88,13 @@
      ;; more than 16 elements. Maybe we should make it nonadjustable?
      (declare (type (vector (unsigned-byte 8)) ,var))
      (setf (fill-pointer ,var) 0)
-     (unwind-protect
-         (progn
-           ,@body)
-       (push ,var *adjustable-vectors*))))
+     ;; No UNWIND-PROTECT here - semantics are unaffected by nonlocal exit,
+     ;; and this macro is about speeding up the compiler, not slowing it down.
+     ;; GC will clean up any debris, and since the vector does not point
+     ;; to anything, even an accidental promotion to a higher generation
+     ;; will not cause transitive garbage retention.
+     ,@body
+     (push ,var *adjustable-vectors*)))
 
 ;;;; interfaces to IR2 conversion
 
@@ -101,6 +106,17 @@
       (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number
                      (nth n *register-arg-offsets*))
       (make-wired-tn *backend-t-primitive-type* control-stack-sc-number n)))
+
+;;; Same as above but marks stack locations as :arg-pass
+(defun standard-call-arg-location (n)
+  (declare (type unsigned-byte n))
+  (if (< n register-arg-count)
+      (make-wired-tn *backend-t-primitive-type* descriptor-reg-sc-number
+                     (nth n *register-arg-offsets*))
+      (let ((tn
+              (make-wired-tn *backend-t-primitive-type* control-stack-sc-number n)))
+        (setf (tn-kind tn) :arg-pass)
+        tn)))
 
 (defun standard-arg-location-sc (n)
   (declare (type unsigned-byte n))
@@ -159,3 +175,10 @@
 (defun cerror-call (vop error-code &rest values)
   "Cause a continuable error.  ERROR-CODE is the error to cause."
   (emit-error-break vop cerror-trap (error-number-or-lose error-code) values))
+
+#!+sb-safepoint
+(define-vop (insert-safepoint)
+  (:policy :fast-safe)
+  (:translate sb!kernel::gc-safepoint)
+  (:generator 0
+    (emit-safepoint)))

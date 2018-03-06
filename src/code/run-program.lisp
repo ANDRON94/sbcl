@@ -103,8 +103,6 @@
        (concatenate 'simple-string (symbol-name key) "=" val)))
    cmucl))
 
-;;;; Import wait3(2) from Unix.
-
 #-win32
 (define-alien-routine ("waitpid" c-waitpid) int
   (pid int)
@@ -112,38 +110,29 @@
   (options int))
 
 #-win32
-(defun waitpid (pid &optional do-not-hang check-for-stopped check-for-continued)
+(defun waitpid (pid)
   "Return any available status information on child process with PID."
   (multiple-value-bind (pid status)
       (c-waitpid pid
-                 (logior (if do-not-hang
-                             sb-unix:wnohang
-                             0)
-                         (if check-for-stopped
-                             sb-unix:wuntraced
-                             0)
-                         (if check-for-continued
-                             sb-unix:wcontinued
-                             0)))
+                 (logior sb-unix:wnohang sb-unix:wuntraced sb-unix:wcontinued))
     (cond ((or (minusp pid)
                (zerop pid))
-           nil)
-          ((and check-for-continued (wifcontinued status))
-           (values pid
-                   :continued
-                   sb-unix:sigcont))
-          ((and check-for-stopped (wifstopped status))
-           (values pid
-                   :stopped
-                   (ldb (byte 8 8) status)))
+           (values nil nil nil))
+          ((wifcontinued status)
+           (values :running
+                   nil
+                   nil))
+          ((wifstopped status)
+           (values :stopped
+                   (ldb (byte 8 8) status)
+                   nil))
           ((zerop (ldb (byte 7 0) status))
-           (values pid
-                   :exited
-                   (ldb (byte 8 8) status)))
+           (values :exited
+                   (ldb (byte 8 8) status)
+                   nil))
           (t
            (let ((signal (ldb (byte 7 0) status)))
-             (values pid
-                     (if (position signal
+             (values (if (position signal
                                    #.(vector
                                       sb-unix:sigstop
                                       sb-unix:sigtstp
@@ -177,7 +166,7 @@
      ,@body))
 
 (deftype process-status ()
-  '(member :running :stopped :continued :exited :signaled))
+  '(member :running :stopped :exited :signaled))
 
 (defstruct (process (:copier nil))
   (pid     nil :type word :read-only t) ; PID of child process
@@ -215,7 +204,7 @@
 
 (defun process-status (process)
   "Return the current status of PROCESS.  The result is one of :RUNNING,
-   :STOPPED, :CONTINUED, :EXITED, or :SIGNALED."
+   :STOPPED, :EXITED, or :SIGNALED."
   (get-processes-status-changes)
   (process-%status process))
 
@@ -249,7 +238,7 @@ PROCESS."
   #-win32
   (loop
       (case (process-status process)
-        (:running :continued)
+        (:running)
         (:stopped
          (when check-for-stopped
            (return)))
@@ -287,17 +276,9 @@ PROCESS."
     (let ((result (if (eq whom :process-group)
                       (sb-unix:unix-killpg pid signal)
                       (sb-unix:unix-kill pid signal))))
-      (cond ((not (eql result 0))
-             (values nil (sb-unix::get-errno)))
-            ((and (eql pid (process-pid process))
-                  (= signal sb-unix:sigcont))
-             (setf (process-%status process) :running)
-             (setf (process-%exit-code process) nil)
-             (when (process-status-hook process)
-               (funcall (process-status-hook process) process))
-             t)
-            (t
-             t)))))
+      (or (zerop result)
+          (values nil (sb-unix::get-errno))))))
+
 #+win32
 (defun process-kill (process signal &optional (whom :pid))
   (declare (ignore signal whom))
@@ -311,7 +292,6 @@ PROCESS."
   "Return T if PROCESS is still alive, NIL otherwise."
   (let ((status (process-status process)))
     (if (or (eq status :running)
-            (eq status :continued)
             (eq status :stopped))
         t
         nil)))
@@ -338,7 +318,7 @@ status slot."
   process)
 
 (defun get-processes-status-changes ()
-  (let (exited)
+  (let (changed)
     (with-active-processes-lock ()
       (setf *active-processes*
             (delete-if #-win32
@@ -348,15 +328,15 @@ status slot."
                          ;; WAIT3 call here, but that makes direct
                          ;; WAIT, WAITPID usage impossible due to the
                          ;; race with the SIGCHLD signal handler.
-                         (multiple-value-bind (pid what code core)
-                             (waitpid (process-pid proc) t t t)
-                           (when pid
-                             (setf (process-%status proc) what)
+                         (multiple-value-bind (status code core)
+                             (waitpid (process-pid proc))
+                           (when status
+                             (setf (process-%status proc) status)
                              (setf (process-%exit-code proc) code)
-                             (when (member what '(:exited :signaled))
+                             (when (process-status-hook proc)
+                               (push proc changed))
+                             (when (member status '(:exited :signaled))
                                (setf (process-core-dumped proc) core)
-                               (when (process-status-hook proc)
-                                 (push proc exited))
                                t))))
                        #+win32
                        (lambda (proc)
@@ -371,17 +351,16 @@ status slot."
                                  (sb-win32::close-handle handle)
                                  (setf (process-handle proc) nil)
                                  (when (process-status-hook proc)
-                                   (push proc exited))
+                                   (push proc changed))
                                  t)))))
                        *active-processes*)))
     ;; Can't call the hooks before all the processes have been deal
     ;; with, as calling a hook may cause re-entry to
     ;; GET-PROCESS-STATUS-CHANGES. That may be OK when using waitpid,
     ;; but in the Windows implementation it would be deeply bad.
-    (dolist (proc exited)
+    (dolist (proc changed)
       (let ((hook (process-status-hook proc)))
-        (when hook
-          (funcall hook proc))))))
+        (funcall hook proc)))))
 
 ;;;; RUN-PROGRAM and close friends
 
@@ -685,14 +664,8 @@ status slot."
                     (external-format :default)
                     directory
                     #+win32 (escape-arguments t))
-  #.(concatenate
-     'base-string
-     ;; The Texinfoizer is sensitive to whitespace, so mind the
-     ;; placement of the #-win32 pseudosplicings.
-     "RUN-PROGRAM creates a new process specified by the PROGRAM
-argument. ARGS are the standard arguments that can be passed to a
-program. For no arguments, use NIL (which means that just the
-name of the program is passed as arg 0).
+  "RUN-PROGRAM creates a new process specified by PROGRAM.
+ARGS are passed as the arguments to the program.
 
 The program arguments and the environment are encoded using the
 default external format for streams.
@@ -704,13 +677,13 @@ Users Manual for details about the PROCESS structure.
 
    - The SBCL implementation of RUN-PROGRAM, like Perl and many other
      programs, but unlike the original CMU CL implementation, copies
-     the Unix environment by default."#-win32"
+     the Unix environment by default.
    - Running Unix programs from a setuid process, or in any other
      situation where the Unix environment is under the control of someone
      else, is a mother lode of security problems. If you are contemplating
      doing this, read about it first. (The Perl community has a lot of good
      documentation about this and other security issues in script-like
-     programs.)""
+     programs.)
 
    The &KEY arguments have the following meanings:
    :ENVIRONMENT
@@ -725,43 +698,50 @@ Users Manual for details about the PROCESS structure.
       environment variable.  Otherwise an absolute pathname is required.
    :WAIT
       If non-NIL (default), wait until the created process finishes.  If
-      NIL, continue running Lisp until the program finishes."#-win32"
-   :PTY
+      NIL, continue running Lisp until the program finishes.
+   :PTY (not supported on win32)
       Either T, NIL, or a stream.  Unless NIL, the subprocess is established
       under a PTY.  If :pty is a stream, all output to this pty is sent to
       this stream, otherwise the PROCESS-PTY slot is filled in with a stream
-      connected to pty that can read output and write input.""
+      connected to pty that can read output and write input.
    :INPUT
-      Either T, NIL, a pathname, a stream, or :STREAM.  If T, the standard
-      input for the current process is inherited.  If NIL, "
-      #-win32"/dev/null"#+win32"nul""
-      is used.  If a pathname, the file so specified is used.  If a stream,
-      all the input is read from that stream and sent to the subprocess.  If
-      :STREAM, the PROCESS-INPUT slot is filled in with a stream that sends
-      its output to the process. Defaults to NIL.
+      Either T, NIL, a pathname, a stream, or :STREAM.
+      T: the standard input for the current process is inherited.
+      NIL: /dev/null (nul on win32) is used.
+      pathname: the specified file is used.
+      stream: all the input is read from that stream and sent to the
+      subprocess.
+      :STREAM: the PROCESS-INPUT slot is filled in with a stream that sends
+      its output to the process.
+      Defaults to NIL.
    :IF-INPUT-DOES-NOT-EXIST (when :INPUT is the name of a file)
       can be one of:
          :ERROR to generate an error
          :CREATE to create an empty file
          NIL (the default) to return NIL from RUN-PROGRAM
    :OUTPUT
-      Either T, NIL, a pathname, a stream, or :STREAM.  If T, the standard
-      output for the current process is inherited.  If NIL, "
-      #-win32"/dev/null"#+win32"nul""
-      is used.  If a pathname, the file so specified is used.  If a stream,
-      all the output from the process is written to this stream. If
-      :STREAM, the PROCESS-OUTPUT slot is filled in with a stream that can
-      be read to get the output. Defaults to NIL.
+      Either T, NIL, a pathname, a stream, or :STREAM.
+      T: the standard output for the current process is inherited.
+      NIL: /dev/null (nul on win32) is used.
+      pathname: the specified file is used.
+      stream: all the output from the process is written to this stream.
+      :STREAM: the PROCESS-OUTPUT slot is filled in with a stream that can be
+      read to get the output.
+      Defaults to NIL.
+   :ERROR
+      Same as :OUTPUT, additionally accepts :OUTPUT, making all error
+      output routed to the same place as normal output.
+      Defaults to :OUTPUT.
    :IF-OUTPUT-EXISTS (when :OUTPUT is the name of a file)
       can be one of:
          :ERROR (the default) to generate an error
          :SUPERSEDE to supersede the file with output from the program
          :APPEND to append output from the program to the file
          NIL to return NIL from RUN-PROGRAM, without doing anything
-   :ERROR and :IF-ERROR-EXISTS
-      Same as :OUTPUT and :IF-OUTPUT-EXISTS, except that :ERROR can also be
-      specified as :OUTPUT in which case all error output is routed to the
-      same place as normal output.
+   :IF-ERROR-EXISTS
+      Same as :IF-OUTPUT-EXISTS, controlling :ERROR output to files.
+      Ignored when :ERROR :OUTPUT.
+      Defaults to :ERROR.
    :STATUS-HOOK
       This is a function the system calls whenever the status of the
       process changes.  The function takes the process as an argument.
@@ -773,7 +753,7 @@ Users Manual for details about the PROCESS structure.
 
    Windows specific options:
    :ESCAPE-ARGUMENTS (default T)
-      Controls escaping of the arguments passed to CreateProcess.")
+      Controls escaping of the arguments passed to CreateProcess."
   (when (and env-p environment-p)
     (error "can't specify :ENV and :ENVIRONMENT simultaneously"))
   (let* (;; Clear various specials used by GET-DESCRIPTOR-FOR to
@@ -1018,7 +998,7 @@ Users Manual for details about the PROCESS structure.
      (values (fd-stream-fd stream) nil (stream-external-format stream)))
     (synonym-stream
      (get-stream-fd-and-external-format
-      (symbol-value (synonym-stream-symbol stream)) direction))
+      (resolve-synonym-stream stream) direction))
     (two-way-stream
      (ecase direction
        (:input

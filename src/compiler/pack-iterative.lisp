@@ -45,38 +45,15 @@
 ;;;; (http://citeseerx.ist.psu.edu/viewdoc/summary?doi=10.1.1.107.9598)
 
 ;;; Interference graph data structure
-(defstruct (ordered-set
-            (:include sset)
-            (:copier nil)
-            (:conc-name #:oset-))
-  (members nil :type list))
-
-(defun oset-adjoin (oset element)
-  (when (sset-adjoin element oset)
-    (push element (oset-members oset))
-    t))
-
-(defun oset-delete (oset element)
-  (when (sset-delete element oset)
-    (setf (oset-members oset)
-          (delete element (oset-members oset)))
-    t))
-
-(defun oset-member (oset element)
-  (sset-member element oset))
-
-(defmacro do-oset-elements ((variable oset &optional return) &body body)
-  `(dolist (,variable (oset-members ,oset) ,return)
-     ,@body))
 
 ;; vertex in an interference graph
-(def!struct (vertex
+(defstruct (vertex
              (:include sset-element)
              (:copier nil)
              (:constructor %make-vertex (tn element-size pack-type)))
   ;; incidence set, as an ordered list (for reproducibility)
-  (full-incidence  (make-ordered-set) :type ordered-set :read-only t)
-  (incidence       (vector)           :type simple-vector)
+  (full-incidence  (make-oset) :type oset :read-only t)
+  (incidence       #()                :type simple-vector)
   (incidence-count 0                  :type index)
   ;; list of potential locations in the TN's preferred SB for the
   ;; vertex, taking into account reserve locations and preallocated
@@ -103,7 +80,7 @@
   (tn-sc (vertex-tn vertex)))
 
 ;; interference graph
-(def!struct (interference-graph
+(defstruct (interference-graph
              (:copier nil)
              (:constructor %make-interference-graph)
              (:conc-name #:ig-))
@@ -115,7 +92,7 @@
   ;; A function that maps TNs to vertices, and then to the vertex's
   ;; assigned offset, if any.  The offset (or NIL) is returned first,
   ;; then the vertex as a second value.
-  (tn-vertex-mapping (bug "missing arg") :type function :read-only t))
+  (tn-vertex-mapping (missing-arg) :type function :read-only t))
 
 ;;; Interference graph construction
 ;;;
@@ -618,9 +595,10 @@
     ;; them in the graph for targeting purposes.
     (do ((tn (ir2-component-wired-tns 2comp) (tn-next tn)))
         ((null tn))
-      (pack-wired-tn tn optimize)
-      (unless (unbounded-tn-p tn)
-        (vertices (make-vertex tn :wired))))
+      (unless (eq (tn-kind tn) :arg-pass)
+        (pack-wired-tn tn optimize)
+        (unless (unbounded-tn-p tn)
+          (vertices (make-vertex tn :wired)))))
 
     ;; Preallocate vertices that *must* be in this finite SC.  If
     ;; targeting is improved, giving them a high priority in regular

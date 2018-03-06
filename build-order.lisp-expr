@@ -131,8 +131,6 @@
  ("src/compiler/parse-lambda-list" :c-headers)
  ("src/code/restart" :not-host) ; %DEFCONSTANT can bind a restart
 
- ("src/code/specializable-array")
-
  ("src/code/early-cl")
  ("src/code/ansi-stream" :not-host)
  ("src/code/early-fasl" :c-headers)
@@ -164,7 +162,6 @@
  ;; accessors and inline functions defined here can be compiled inline
  ;; later. (Avoiding full calls increases efficiency)
  ("src/code/type-class" :c-headers)
- ("src/code/early-alieneval")  ; for funs and vars needed at build and run time
 
  ("src/code/cas" :not-host)
  ("src/compiler/early-c" :c-headers)
@@ -173,10 +170,12 @@
  ;; 'info-vector' is needed at least as early as 'fdefinition' so that the
  ;; inlined INFO-VECTOR-FDEFINITION is available to %COERCE-CALLABLE-TO-FUN.
  ("src/code/signal" :not-host)
+ ("src/code/target-lfhash" :not-host)
  ("src/compiler/info-vector" :c-headers)
  ("src/compiler/globaldb" :c-headers)
  ("src/code/primordial-type" :c-headers)
  ("src/code/early-classoid" :c-headers)
+ ("src/code/early-alieneval" :c-headers)  ; for funs and vars needed at build and run time
 
  ("src/code/sysmacs" :not-host)
 
@@ -205,6 +204,10 @@
 
  ("src/code/early-float"   :not-host)
  ("src/pcl/early-low" :not-host)
+  ;; Define at most one INTERPRETED-FUNCTION type based on target features
+ #!+sb-eval ("src/code/early-full-eval" :not-host)
+ #!+sb-fasteval ("src/interpreter/function" :not-host)
+
  ("src/code/target-sxhash" :not-host) ; needs most-fooative-foo-float constants
 
  ("src/code/list"   :not-host)
@@ -242,6 +245,7 @@
  ("src/code/share-vm" :not-host)
 
  ("src/code/thread" :not-host) ; provides *CURRENT-THREAD* for target-signal
+ ("src/code/target-signal-common" :not-host)
  #!-win32 ("src/code/target-signal" :not-host) ; needs OS-CONTEXT-T from share-vm
  #!+win32 ("src/code/target-exception" :not-host)
 
@@ -283,6 +287,7 @@
 
  ("src/compiler/constantp" :c-headers)
  ("src/compiler/info-functions" :c-headers)
+ ("src/code/specializable-array" :not-target)
 
  ("src/compiler/generic/vm-macs" :c-headers)
  ("src/compiler/generic/objdef" :c-headers)
@@ -351,9 +356,6 @@
 
  ("src/code/debug-info" :c-headers)
  ("src/code/source-location")
- ;; Define at most one INTERPRETED-FUNCTION type based on target features
- #!+sb-eval ("src/code/early-full-eval" :not-host)
- #!+sb-fasteval ("src/interpreter/function" :not-host)
  ("src/code/early-class")
  ("src/code/condition" :not-host)
  ("src/code/toplevel"  :not-host)
@@ -508,6 +510,7 @@
  ;; the host lisp have setf expanders rather than setf functions).
  ("src/compiler/late-vmdef")
 
+ ("src/compiler/target-dstate" :not-host)
  ("src/compiler/target/insts")
  ("src/compiler/target/macros")
  ("src/compiler/generic/pinned-objects")
@@ -549,9 +552,6 @@
 
  ("src/compiler/target/subprim")
  ("src/compiler/target/debug")
- ;; src/compiler/sparc/c-call contains a deftransform for
- ;; %ALIEN-FUNCALL -- CSR
- ("src/compiler/early-aliencomp")
  ("src/compiler/target/c-call")
  ("src/compiler/target/cell")
  ("src/compiler/target/values")
@@ -573,9 +573,8 @@
  ("src/assembly/target/array")
  ("src/assembly/target/arith")
  ("src/assembly/target/alloc")
- ;; "tramps" should be listed first so that the physical order here
- ;; reflects the order in which assembler files get loaded.
- ("src/assembly/target/tramps"     :assem :not-host :not-genesis)
+ ;; assembly files are all loaded by genesis before any compiled files.
+ ("src/assembly/target/tramps"     :assem :not-host)
  ("src/assembly/target/assem-rtns" :assem :not-host)
  ("src/assembly/target/array"      :assem :not-host)
  ("src/assembly/target/arith"      :assem :not-host)
@@ -704,6 +703,7 @@
  ("src/code/late-format") ; needs SB!XC:DEFMACRO
  ("src/code/sxhash") ; needs SB!XC:DEFINE-MODIFY-MACRO
 
+ ("src/code/late-globaldb" :not-host)
  ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
  ;; PCL-related stuff, which shouldn't need to be done earlier than
  ;; anything else in cold build because after all it used to be
@@ -748,6 +748,8 @@
   "src/code/external-formats/enc-jpn"
   "src/code/external-formats/enc-utf")
 
+ ("src/code/stubs")
+
  ;; CLOS, derived from the PCL reference implementation
  ;;
  ;; This PCL build order is based on a particular
@@ -787,7 +789,6 @@
   "src/pcl/precom2")
 
  ("src/code/setf-funs"
-  "src/code/stubs"
   ;; miscellaneous functionality which depends on CLOS
   "src/code/late-condition"
 

@@ -66,11 +66,8 @@ provide bindings for printer control variables.")
 ;;; It actually works as long as the condition is not a subtype of WARNING
 ;;; or ERROR. (Any other direct descendant of CONDITION should be fine)
 (!defvar *stack-top-hint* nil)
-
-(defvar *real-stack-top* nil)
-(defvar *stack-top* nil)
-
 (defvar *current-frame* nil)
+(declaim (always-bound *stack-top-hint* *current-frame*))
 
 ;;; Beginner-oriented help messages are important because you end up
 ;;; in the debugger whenever something bad happens, or if you try to
@@ -210,7 +207,7 @@ backtraces. Possible values are :MINIMAL, :NORMAL, and :FULL.
    In the this case arguments may include values internal to SBCL's method
    dispatch machinery.")
 
-(define-deprecated-variable :early "1.1.4.9" *show-entry-point-details*
+(define-deprecated-variable :late "1.1.4.9" *show-entry-point-details*
   :value nil)
 
 (define-deprecated-function :early "1.2.15" backtrace (print-backtrace)
@@ -504,8 +501,8 @@ thread, NIL otherwise."
 
 ;;; When the frame is interrupted before any of the function code is called
 ;;; we can recover all the arguments, include the extra ones.
-;;; This includes the ARG-COUNT-ERROR on #+precise-arg-count-error and
-;;; UNDEFINED-FUNCTION coming from undefined-tramp
+;;; This includes the ARG-COUNT-ERROR and UNDEFINED-FUNCTION coming from
+;;; undefined-tramp.
 (defun early-frame-nth-arg (n frame)
   (let* ((escaped (sb!di::compiled-frame-escaped frame))
          (pointer (sb!di::frame-pointer frame))
@@ -578,24 +575,6 @@ thread, NIL otherwise."
 
 (defun clean-xep (frame name args info)
   (values name
-          #!-precise-arg-count-error
-          (if (consp args)
-              (let* ((count (first args))
-                     (real-args (rest args)))
-                (if (and (integerp count)
-                         (sb!di::all-args-available-p frame))
-                    ;; So, this is a cheap trick -- but makes backtraces for
-                    ;; too-many-arguments-errors much, much easier to to
-                    ;; understand.
-                    (loop repeat count
-                          for arg = (if real-args
-                                        (pop real-args)
-                                        (make-unprintable-object "unknown"))
-                          collect arg)
-                    real-args))
-              args)
-          ;; Clip arg-count.
-          #!+precise-arg-count-error
           (if (and (consp args)
                    ;; EARLY-FRAME-ARGS doesn't include arg-count
                    (not (sb!di::all-args-available-p frame)))
@@ -737,19 +716,7 @@ the current thread are replaced with dummy objects which can safely escape."
                  (dolist (arg args)
                    (write-char #\space stream)
                    (pprint-newline :linear stream)
-                   (cond ((and (stringp arg) (>= (length arg) 100))
-                          (print-unreadable-object (arg stream :type nil :identity t)
-                            (format stream "~A \"~A...\" (len=~D)"
-                                    (typecase arg
-                                      (simple-base-string 'simple-base-string)
-                                      (base-string 'base-string)
-                                      (simple-string 'simple-string)
-                                      (t 'string))
-                                    (make-array 50 :element-type (array-element-type arg)
-                                                   :displaced-to arg)
-                                    (length arg))))
-                         (t
-                          (write arg :stream stream :escape t)))))))))
+                   (write arg :stream stream :escape t)))))))
     (when info
       (format stream " [~{~(~A~)~^,~}]" info)))
   (when print-frame-source
@@ -889,7 +856,8 @@ the current thread are replaced with dummy objects which can safely escape."
 
 (defun invoke-debugger (condition)
   "Enter the debugger."
-  (let ((*stack-top-hint* (resolve-stack-top-hint)))
+  (let ((*stack-top-hint* (resolve-stack-top-hint))
+        (sb!impl::*deadline* nil))
     ;; call *INVOKE-DEBUGGER-HOOK* first, so that *DEBUGGER-HOOK* is not
     ;; called when the debugger is disabled
     (run-hook '*invoke-debugger-hook* condition)
@@ -967,29 +935,41 @@ the current thread are replaced with dummy objects which can safely escape."
       ;; older debugger code which was written to do i/o on whatever
       ;; stream was in fashion at the time, and not all of it has
       ;; been converted to behave this way. -- WHN 2000-11-16)
-
-      (unwind-protect
-           (let (;; We used to bind *STANDARD-OUTPUT* to *DEBUG-IO*
-                 ;; here as well, but that is probably bogus since it
-                 ;; removes the users ability to do output to a redirected
-                 ;; *S-O*. Now we just rebind it so that users can temporarily
-                 ;; frob it. FIXME: This and other "what gets bound when"
-                 ;; behaviour should be documented in the manual.
-                 (*standard-output* *standard-output*)
-                 ;; This seems reasonable: e.g. if the user has redirected
-                 ;; *ERROR-OUTPUT* to some log file, it's probably wrong
-                 ;; to send errors which occur in interactive debugging to
-                 ;; that file, and right to send them to *DEBUG-IO*.
-                 (*error-output* *debug-io*))
-             (unless (typep condition 'step-condition)
-               (when *debug-beginner-help-p*
-                 (format *debug-io*
-                         "~%~@<Type HELP for debugger help, or ~
+      (flet ((debug ()
+               (unwind-protect
+                    (let ( ;; We used to bind *STANDARD-OUTPUT* to *DEBUG-IO*
+                          ;; here as well, but that is probably bogus since it
+                          ;; removes the users ability to do output to a redirected
+                          ;; *S-O*. Now we just rebind it so that users can temporarily
+                          ;; frob it. FIXME: This and other "what gets bound when"
+                          ;; behaviour should be documented in the manual.
+                          (*standard-output* *standard-output*)
+                          ;; This seems reasonable: e.g. if the user has redirected
+                          ;; *ERROR-OUTPUT* to some log file, it's probably wrong
+                          ;; to send errors which occur in interactive debugging to
+                          ;; that file, and right to send them to *DEBUG-IO*.
+                          (*error-output* *debug-io*))
+                      (unless (typep condition 'step-condition)
+                        (when *debug-beginner-help-p*
+                          (format *debug-io*
+                                  "~%~@<Type HELP for debugger help, or ~
                                (SB-EXT:EXIT) to exit from SBCL.~:@>~2%"))
-               (show-restarts *debug-restarts* *debug-io*))
-             (internal-debug))
-        (when background-p
-          (sb!thread::release-foreground))))))
+                        (show-restarts *debug-restarts* *debug-io*))
+                      (internal-debug))
+                 (when background-p
+                   (sb!thread:release-foreground)))))
+        (if (find 'abort *debug-restarts* :key #'restart-name)
+            (debug)
+            (restart-case (let* ((restarts (compute-restarts condition))
+                                 ;; Put the ABORT restart last,
+                                 ;; as if it were provided by a toplevel function.
+                                 (*debug-restarts* (nconc (cdr restarts)
+                                                          (list (car restarts)))))
+                            (debug))
+              (abort ()
+                :report (lambda (stream)
+                          (format stream "~@<Exit from the current thread.~@:>"))
+                (sb!thread:abort-thread :allow-exit t))))))))
 
 ;;; this function is for use in *INVOKE-DEBUGGER-HOOK* when ordinary
 ;;; ANSI behavior has been suppressed by the "--disable-debugger"
@@ -1186,10 +1166,8 @@ and LDB (the low-level debugger).  See also ENABLE-DEBUGGER."
 
 (defun debug-loop-fun ()
   (let* ((*debug-command-level* (1+ *debug-command-level*))
-         (*real-stack-top* (sb!di:top-frame))
-         (*stack-top* (or *stack-top-hint* *real-stack-top*))
-         (*stack-top-hint* nil)
-         (*current-frame* *stack-top*))
+         (*current-frame* (or *stack-top-hint* (sb!di:top-frame)))
+         (*stack-top-hint* nil))
     (handler-bind ((sb!di:debug-condition
                     (lambda (condition)
                       (princ condition *debug-io*)
@@ -1916,12 +1894,12 @@ forms that explicitly control this kind of evaluation.")
 ;;;; debug loop command utilities
 
 (defun read-prompting-maybe (prompt)
-  (unless (sb!int:listen-skip-whitespace *debug-io*)
+  (unless (listen-skip-whitespace *debug-io*)
     (princ prompt *debug-io*)
     (force-output *debug-io*))
   (read *debug-io*))
 
 (defun read-if-available (default)
-  (if (sb!int:listen-skip-whitespace *debug-io*)
+  (if (listen-skip-whitespace *debug-io*)
       (read *debug-io*)
       default))

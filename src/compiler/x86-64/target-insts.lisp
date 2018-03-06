@@ -49,6 +49,17 @@
   (declare (type reg value) (type disassem-state dstate))
   (if (dstate-getprop dstate +rex-b+) (+ value 8) value))
 
+;; This reader extracts the 'imm' operand in "MOV reg,imm" format.
+;; KLUDGE: the REG instruction format can not define a reader
+;; because it has no field specification and no prefilter.
+;; (It's specified directly in the MOV instruction definition)
+(defun reg-imm-data (dchunk dstate) dchunk
+  (aref (sb!disassem::dstate-filtered-values dstate) 4))
+
+(defun regrm-inst-reg (dchunk dstate)
+  (logior (if (logtest (sb!disassem::dstate-inst-properties dstate) +rex-r+) 8 0)
+          (!regrm-inst-reg dchunk dstate)))
+
 (defstruct (machine-ea (:include sb!disassem::filtered-arg)
                        (:copier nil)
                        (:predicate nil)
@@ -132,6 +143,9 @@
   (print-reg/mem-with-width
    value (inst-operand-size-default-qword dstate) t stream dstate))
 
+(defun print-jmp-ea (value stream dstate)
+  (print-sized-reg/mem-default-qword value stream dstate))
+
 (defun print-sized-byte-reg/mem (value stream dstate)
   (print-reg/mem-with-width value :byte t stream dstate))
 
@@ -211,17 +225,14 @@
 ;;; Return contents of memory if either it refers to an unboxed code constant
 ;;; or is RIP-relative with a displacement of 0.
 (defun unboxed-constant-ref (dstate segment-offset addr disp)
-  (or  (and (eql disp 0)
+  ;; FIXME: why in one case do we read via SEGMENT-SAP and the other via ADDR?
+  (cond ((< segment-offset
+            (sb!disassem::seg-initial-raw-bytes (dstate-segment dstate)))
+         (sap-ref-word (dstate-segment-sap dstate) segment-offset))
+        ((eql disp 0)
             ;; Assume this is safe to read, since we're disassembling
             ;; from the memory just a few bytes preceding 'addr'.
-            (sap-ref-word (int-sap addr) 0))
-       (let* ((seg (dstate-segment dstate))
-              (code-offset
-               (sb!disassem::segment-offs-to-code-offs segment-offset seg))
-              (unboxed-range (sb!disassem::seg-unboxed-data-range seg)))
-         (or (and unboxed-range
-                  (<= (car unboxed-range) code-offset (cdr unboxed-range))
-                  (sap-ref-word (dstate-segment-sap dstate) segment-offset))))))
+         (sap-ref-word (int-sap addr) 0))))
 
 ;;; Prints a memory reference to STREAM. VALUE is a list of
 ;;; (BASE-REG OFFSET INDEX-REG INDEX-SCALE), where any component may be
@@ -278,7 +289,7 @@
                (or (minusp disp)
                    (nth-value 1 (note-code-constant-absolute disp dstate))
                    (maybe-note-assembler-routine disp nil dstate)
-                   ;; Static symbols coming frorm CELL-REF
+                   ;; Static symbols coming from CELL-REF
                    (maybe-note-static-symbol (+ disp (- other-pointer-lowtag
                                                         n-word-bytes))
                                              dstate)))
@@ -384,40 +395,41 @@
        ;; But ordinarily we get the string. Either way, the r/m arg reveals the
        ;; EA calculation. DCHUNK-ZERO is a meaningless value - any would do -
        ;; because the EA was computed in a prefilter.
-       (print-mem-ref :compute (reg-r/m-inst-r/m-arg dchunk-zero dstate)
+       (print-mem-ref :compute (regrm-inst-r/m dchunk-zero dstate)
                       width stream dstate)
        (setq addr value)
        (when (stringp value) (setq fmt "= ~A"))))
     (when addr
-      (note (lambda (s) (format s fmt addr)) dstate))))
+      (unless (maybe-note-assembler-routine addr nil dstate)
+        (note (lambda (s) (format s fmt addr)) dstate)))))
 
 ;;;; interrupt instructions
 
 (defun break-control (chunk inst stream dstate)
   (declare (ignore inst))
   (flet ((nt (x) (if stream (note x dstate))))
-    (case #!-ud2-breakpoints (byte-imm-code chunk dstate)
-          #!+ud2-breakpoints (word-imm-code chunk dstate)
-      (#.error-trap
-       (nt "error trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.cerror-trap
-       (nt "cerror trap")
-       (handle-break-args #'snarf-error-junk stream dstate))
-      (#.breakpoint-trap
-       (nt "breakpoint trap"))
-      (#.pending-interrupt-trap
-       (nt "pending interrupt trap"))
-      (#.halt-trap
-       (nt "halt trap"))
-      (#.fun-end-breakpoint-trap
-       (nt "function end breakpoint trap"))
-      (#.single-step-around-trap
-       (nt "single-step trap (around)"))
-      (#.single-step-before-trap
-       (nt "single-step trap (before)"))
-      (#.invalid-arg-count-trap
-       (nt "Invalid argument count trap")))))
+    (let ((trap #!-ud2-breakpoints (byte-imm-code chunk dstate)
+           #!+ud2-breakpoints (word-imm-code chunk dstate)))
+     (case trap
+       (#.breakpoint-trap
+        (nt "breakpoint trap"))
+       (#.pending-interrupt-trap
+        (nt "pending interrupt trap"))
+       (#.halt-trap
+        (nt "halt trap"))
+       (#.fun-end-breakpoint-trap
+        (nt "function end breakpoint trap"))
+       (#.single-step-around-trap
+        (nt "single-step trap (around)"))
+       (#.single-step-before-trap
+        (nt "single-step trap (before)"))
+       (#.invalid-arg-count-trap
+        (nt "Invalid argument count trap"))
+       (#.cerror-trap
+        (nt "cerror trap")
+        (handle-break-args #'snarf-error-junk trap stream dstate))
+       (t
+        (handle-break-args #'snarf-error-junk trap stream dstate))))))
 
 ;;;;
 
@@ -430,7 +442,8 @@
         (relocs
          (make-array 100000 :element-type '(unsigned-byte 32)
                             :fill-pointer 0 :adjustable t))
-        ;; Look for these two instruction formats.
+        ;; Look for these three instruction formats.
+        (lea-inst (find-inst #x8D (get-inst-space)))
         (jmp-inst (find-inst #b11101001 (get-inst-space)))
         (call-inst (find-inst #b11101000 (get-inst-space)))
         (seg (sb!disassem::%make-segment
@@ -443,12 +456,23 @@
                    (let ((sap (int-sap fun-entry-addr))) (lambda () sap)))
              (map-segment-instructions
               (lambda (dchunk inst)
-                (when (and (or (eq inst jmp-inst)
-                               (eq inst call-inst))
-                           (funcall predicate
-                                    (+ (near-jump-displacement dchunk dstate)
-                                       (dstate-next-addr dstate))))
-                  (vector-push-extend (dstate-cur-addr dstate) relocs)))
+                (cond ((and (or (eq inst jmp-inst) (eq inst call-inst))
+                            (funcall predicate
+                                     (+ (near-jump-displacement dchunk dstate)
+                                        (dstate-next-addr dstate))))
+                       (vector-push-extend (dstate-cur-addr dstate) relocs))
+                      ((eq inst lea-inst)
+                       (let ((sap (funcall (seg-sap-maker seg))))
+                         (aver (eql (sap-ref-8 sap (dstate-cur-offs dstate)) #x8D))
+                         (let ((modrm (sap-ref-8 sap (1+ (dstate-cur-offs dstate)))))
+                           (when (and (= (logand modrm #b11000111) #b00000101) ; RIP-relative mode
+                                      (funcall predicate
+                                               (+ (signed-sap-ref-32
+                                                   sap (+ (dstate-cur-offs dstate) 2))
+                                                  (dstate-next-addr dstate))))
+                             (aver (eql (logand (sap-ref-8 sap (1- (dstate-cur-offs dstate))) #xF0)
+                                        #x40)) ; expect a REX prefix
+                             (vector-push-extend (dstate-cur-addr dstate) relocs)))))))
               seg dstate nil))
            (finish-component (code start-relocs-index)
              (when (> (fill-pointer relocs) start-relocs-index)
@@ -456,24 +480,16 @@
                (vector-push-extend start-relocs-index code-components))))
 
       ;; Assembler routines contain jumps to immobile code.
-      ;; Since these code components do not contain simple-funs,
-      ;; we have to group the routines by looking at addresses.
-      (let ((asm-routines
-             (loop for addr being each hash-value of sb!fasl:*assembler-routines*
-                   collect addr)))
-        (dovector (code sb!fasl::*assembler-objects*)
-          (let* ((text-origin (sap-int (code-instructions code)))
-                 (text-end (+ text-origin (%code-code-size code)))
-                 (relocs-index (fill-pointer relocs)))
-            (mapl (lambda (list)
-                    (scan-function (car list)
-                                   (if (cdr list) (cadr list) text-end)
-                                   ;; Look for transfers into immobile code
-                                   #'immobile-space-addr-p))
-                  (sort (remove-if-not (lambda (address)
-                                         (<= text-origin address text-end))
-                                       asm-routines) #'<))
-            (finish-component code relocs-index))))
+      (let* ((code sb!fasl:*assembler-routines*)
+             (origin (sap-int (code-instructions code)))
+             (relocs-index (fill-pointer relocs)))
+        (dolist (range (sort (loop for range being each hash-value
+                                   of (car (%code-debug-info code)) collect range)
+                             #'< :key #'car))
+          ;; byte range is inclusive bound on both ends
+          (scan-function (+ origin (car range))
+                         (+ origin (cdr range) 1) #'immobile-space-addr-p))
+        (finish-component code relocs-index))
 
       ;; Immobile space - code components can jump to immobile space,
       ;; read-only space, and C runtime routines.
@@ -543,10 +559,26 @@
                                          verbose)
   (flet ((match-p (name include exclude)
            (and (not (member name exclude :test 'equal))
-                (or (not include) (member name include :test 'equal)))))
+                (or (not include) (member name include :test 'equal))))
+         (ambiguous-name-p (fun funs)
+           ;; Return T if FUN occurs more than once in FUNS
+           (declare (simple-vector funs))
+           (dotimes (i (length funs))
+             (when (eq (svref funs i) fun)
+               (loop (cond ((>= (incf i) (length funs))
+                            (return-from ambiguous-name-p nil))
+                           ((eq (svref funs i) fun)
+                            (return-from ambiguous-name-p t))))))))
     (do-immobile-functions (code fun addr)
       (when (match-p (%simple-fun-name fun) callers exclude-callers)
-        (let ((printed-fun-name nil))
+        (dx-let ((printed-fun-name nil)
+                 (code-header-funs (make-array (code-header-words code))))
+          ;; Collect the called functions
+          (do ((i code-constants-offset (1+ i)))
+              ((= i (length code-header-funs)))
+            (let ((obj (code-header-ref code i)))
+              (when (fdefn-p obj)
+                (setf (aref code-header-funs i) (fdefn-fun obj)))))
           ;; Loop over function's assembly code
           (map-segment-instructions
            (lambda (chunk inst)
@@ -559,7 +591,8 @@
                               (and (immobile-space-obj-p callee)
                                    (not (sb!vm::fun-requires-simplifying-trampoline-p callee))
                                    (match-p (%fun-name callee)
-                                            callees exclude-callees))))
+                                            callees exclude-callees)
+                                   (not (ambiguous-name-p callee code-header-funs)))))
                    (let ((entry (sb!vm::fdefn-call-target fdefn)))
                      (when verbose
                        (let ((*print-pretty* nil))

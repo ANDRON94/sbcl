@@ -27,23 +27,35 @@
                          (:copier nil))
   (number nil :type (or index null)))
 
-(defstruct (sset (:copier nil))
+(defstruct (sset (:copier nil)
+                 (:constructor make-sset (&optional vector free count)))
   ;; Vector containing the set values. 0 is used for empty (since
-  ;; initializing a vector with 0 is cheaper than with NIL), +DELETED+
+  ;; initializing a vector with 0 is cheaper than with NIL), -1
   ;; is used to mark buckets that used to contain an element, but no
   ;; longer do.
   (vector #() :type simple-vector)
-  ;; How many buckets currently contain or used to contain an element.
+  ;; How many elements can be inserted before rehashing.
+  ;; This is not the actual amount of free elements, but a ratio
+  ;; calculated from +sset-rehash-threshold+.
   (free 0 :type index)
   ;; How many elements are currently members of the set.
   (count 0 :type index))
+
+;;; Ordered set
+(defstruct (oset
+            (:include sset)
+            (:copier nil))
+  (members nil :type list))
+
+(declaim (freeze-type sset))
+
 (defprinter (sset) vector)
 
 ;;; Iterate over the elements in SSET, binding VAR to each element in
 ;;; turn.
 (defmacro do-sset-elements ((var sset &optional result) &body body)
   `(loop for ,var across (sset-vector ,sset)
-         do (unless (member ,var '(0 +deleted+))
+         do (unless (fixnump ,var)
               ,@body)
          finally (return ,result)))
 
@@ -79,47 +91,54 @@
     (declare (fixnum number))
     (logior 1 number)))
 
-;;; Double the size of the hash vector of SET.
-(defun sset-grow (set)
-  (let* ((vector (sset-vector set))
-         (new-vector (make-array (if (zerop (length vector))
-                                     2
-                                     (* (length vector) 2))
-                                 :initial-element 0)))
-    (setf (sset-vector set) new-vector
-          (sset-free set) (length new-vector)
-          (sset-count set) 0)
-    (loop for element across vector
-          do (unless (member element '(0 +deleted+))
-               (sset-adjoin element set)))))
-
 ;;; Rehash the sset when the proportion of free cells in the set is
 ;;; lower than this, the value is a reciprocal.
 (defconstant +sset-rehash-threshold+ 4)
+
+;;; Double the size of the hash vector of SET.
+(defun sset-grow (set)
+  (let* ((vector (sset-vector set))
+         (length (if (zerop (length vector))
+                     2
+                     (* (length vector) 2)))
+         (new-vector (make-array length
+                                 :initial-element 0)))
+    (setf (sset-vector set) new-vector
+          ;; SSET-ADJOIN below will decrement this and shouldn't reach zero
+          (sset-free set) length
+          (sset-count set) 0)
+    (loop for element across vector
+          do (unless (fixnump element)
+               (sset-adjoin element set)))
+    ;; Now the real amount of elements which can be inserted before rehashing
+    (setf (sset-free set) (- (sset-free set)
+                             (max 1 (truncate length
+                                              +sset-rehash-threshold+))))))
+
 
 ;;; Destructively add ELEMENT to SET. If ELEMENT was not in the set,
 ;;; then we return true, otherwise we return false.
 (declaim (ftype (sfunction (sset-element sset) boolean) sset-adjoin))
 (defun sset-adjoin (element set)
-  (when (<= (sset-free set)
-            (max 1 (truncate (length (sset-vector set))
-                       +sset-rehash-threshold+)))
+  (when (= (sset-free set) 0)
     (sset-grow set))
   (loop with vector = (sset-vector set)
         with mask of-type fixnum = (1- (length vector))
         with secondary-hash = (sset-hash2 element)
+        with deleted-index
         for hash of-type index = (logand mask (sset-hash1 element)) then
           (logand mask (+ hash secondary-hash))
         for current = (aref vector hash)
         do (cond ((eql current 0)
                   (incf (sset-count set))
-                  (decf (sset-free set))
-                  (setf (aref vector hash) element)
+                  (cond (deleted-index
+                         (setf (aref vector deleted-index) element))
+                        (t
+                         (decf (sset-free set))
+                         (setf (aref vector hash) element)))
                   (return t))
-                 ((eql current '+deleted+)
-                  (incf (sset-count set))
-                  (setf (aref vector hash) element)
-                  (return t))
+                 ((eql current -1)
+                  (setf deleted-index hash))
                  ((eq current element)
                   (return nil)))))
 
@@ -139,7 +158,7 @@
                   (return nil))
                  ((eq current element)
                   (decf (sset-count set))
-                  (setf (aref vector hash) '+deleted+)
+                  (setf (aref vector hash) -1)
                   (return t)))))
 
 ;;; Return true if ELEMENT is in SET, false otherwise.
@@ -176,17 +195,17 @@
 ;;; Return a new copy of SET.
 (declaim (ftype (sfunction (sset) sset) copy-sset))
 (defun copy-sset (set)
-  (make-sset :vector (let* ((vector (sset-vector set))
-                            (new-vector (make-array (length vector))))
-                       (declare (type simple-vector vector new-vector)
-                                (optimize speed (safety 0)))
-                       ;; There's no REPLACE deftransform for simple-vectors.
-                       (dotimes (i (length vector))
-                         (setf (aref new-vector i)
-                               (aref vector i)))
-                       new-vector)
-             :count (sset-count set)
-             :free (sset-free set)))
+  (make-sset (let* ((vector (sset-vector set))
+                    (new-vector (make-array (length vector))))
+               (declare (type simple-vector vector new-vector)
+                        (optimize speed (safety 0)))
+               ;; There's no REPLACE deftransform for simple-vectors.
+               (dotimes (i (length vector))
+                 (setf (aref new-vector i)
+                       (aref vector i)))
+               new-vector)
+             (sset-free set)
+             (sset-count set)))
 
 ;;; Perform the appropriate set operation on SET1 and SET2 by
 ;;; destructively modifying SET1. We return true if SET1 was modified,
@@ -196,7 +215,7 @@
 (defun sset-union (set1 set2)
   (loop with modified = nil
         for element across (sset-vector set2)
-        do (unless (member element '(0 +deleted+))
+        do (unless (fixnump element)
              (when (sset-adjoin element set1)
                (setf modified t)))
         finally (return modified)))
@@ -204,20 +223,20 @@
   (loop with modified = nil
         for element across (sset-vector set1)
         for index of-type index from 0
-        do (unless (member element '(0 +deleted+))
+        do (unless (fixnump element)
              (unless (sset-member element set2)
                (decf (sset-count set1))
-               (setf (aref (sset-vector set1) index) '+deleted+
+               (setf (aref (sset-vector set1) index) -1
                      modified t)))
         finally (return modified)))
 (defun sset-difference (set1 set2)
   (loop with modified = nil
         for element across (sset-vector set1)
         for index of-type index from 0
-        do (unless (member element '(0 +deleted+))
+        do (unless (fixnump element)
              (when (sset-member element set2)
                (decf (sset-count set1))
-               (setf (aref (sset-vector set1) index) '+deleted+
+               (setf (aref (sset-vector set1) index) -1
                      modified t)))
         finally (return modified)))
 
@@ -228,8 +247,29 @@
 (defun sset-union-of-difference (set1 set2 set3)
   (loop with modified = nil
         for element across (sset-vector set2)
-        do (unless (member element '(0 +deleted+))
+        do (unless (fixnump element)
              (unless (sset-member element set3)
                (when (sset-adjoin element set1)
                  (setf modified t))))
         finally (return modified)))
+
+;;; Ordered set
+
+(defun oset-adjoin (oset element)
+  (when (sset-adjoin element oset)
+    (push element (oset-members oset))
+    t))
+
+(defun oset-delete (oset element)
+  (when (sset-delete element oset)
+    (setf (oset-members oset)
+          (delete element (oset-members oset)))
+    t))
+
+(declaim (inline oset-member))
+(defun oset-member (oset element)
+  (sset-member element oset))
+
+(defmacro do-oset-elements ((variable oset &optional return) &body body)
+  `(dolist (,variable (oset-members ,oset) ,return)
+     ,@body))

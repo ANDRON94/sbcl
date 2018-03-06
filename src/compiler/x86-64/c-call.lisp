@@ -253,8 +253,7 @@
    (inst mov res (make-fixup foreign-symbol :foreign-dataref))))
 
 #!+sb-safepoint
-(defconstant thread-saved-csp-offset
-  (- (/ +backend-page-bytes+ n-word-bytes)))
+(defconstant thread-saved-csp-offset -1)
 
 (define-vop (call-out)
   (:args (function :scs (sap-reg)
@@ -265,70 +264,82 @@
   ;; determine which alien was accessed in case it's undefined.
   (:temporary (:sc sap-reg :offset rbx-offset :from (:argument 0)) rbx)
   (:temporary (:sc unsigned-reg :offset rax-offset :to :result) rax)
-  ;; For safepoint builds: Force values of non-volatiles to the stack.
-  ;; These are the callee-saved registers in the native ABI, but
-  ;; safepoint-based GC needs to see all Lisp values on the stack.  Note
-  ;; that R12-R15 are non-volatile registers, but there is no need to
-  ;; spill R12 because it is our thread-base-tn.  RDI and RSI are
-  ;; non-volatile on Windows, but argument passing registers on other
-  ;; platforms.
-  #!+sb-safepoint (:temporary (:sc unsigned-reg :offset r13-offset) r13)
-  #!+sb-safepoint (:temporary (:sc unsigned-reg :offset r14-offset) r14)
-  #!+sb-safepoint (:temporary (:sc unsigned-reg :offset r15-offset) r15)
-  #!+(and sb-safepoint win32) (:temporary
-                               (:sc unsigned-reg :offset rdi-offset) rdi)
-  #!+(and sb-safepoint win32) (:temporary
-                               (:sc unsigned-reg :offset rsi-offset) rsi)
-  (:ignore results
-           #!+(and sb-safepoint win32) rdi
-           #!+(and sb-safepoint win32) rsi
-           #!+sb-safepoint r15
-           #!+sb-safepoint r13)
+  #!+sb-safepoint
+  (:temporary (:sc unsigned-stack :from :eval :to :result) pc-save)
+  (:ignore results)
   (:vop-var vop)
   (:save-p t)
   (:generator 0
-    #!+sb-safepoint
-    (progn
-      ;; Current PC - don't rely on function to keep it in a form that
-      ;; GC understands
-      (let ((label (gen-label)))
-        (inst lea r14 (make-fixup nil :code-object label))
-        (emit-label label)))
-    (when sb!c::*msan-compatible-stack-unpoison*
-      (inst mov rax (static-symbol-value-ea 'msan-param-tls))
-      ;; Unpoison parameters
-      (do ((n 0 (+ n n-word-bytes))
-           (arg args (tn-ref-across arg)))
-          ((null arg))
-        ;; KLUDGE: assume all parameters are 8 bytes or less
-        (inst fs)
-        (inst mov (make-ea :qword :base rax :disp n) 0)))
-    #!-win32
-    ;; ABI: AL contains amount of arguments passed in XMM registers
-    ;; for vararg calls.
-    (move-immediate rax
-                    (loop for tn-ref = args then (tn-ref-across tn-ref)
-                          while tn-ref
-                          count (eq (sb-name (sc-sb (tn-sc (tn-ref-tn tn-ref))))
-                                    'float-registers)))
-    #!+win32 (inst sub rsp-tn #x20) ;MS_ABI: shadow zone
-    #!+sb-safepoint
-    (progn                 ;Store SP and PC in thread struct
-      (storew rsp-tn thread-base-tn thread-saved-csp-offset)
-      (storew r14 thread-base-tn thread-pc-around-foreign-call-slot))
     (move rbx function)
-    (inst call rbx)
-    #!+win32 (inst add rsp-tn #x20) ;MS_ABI: remove shadow space
-    #!+sb-safepoint
-    (progn
-      ;; Zeroing out
-      (inst xor r14 r14)
-      ;; Zero PC storage place. NB. CSP-then-PC: same sequence on
-      ;; entry/exit, is actually corrent.
-      (storew r14 thread-base-tn thread-saved-csp-offset)
-      (storew r14 thread-base-tn thread-pc-around-foreign-call-slot))
-    ;; To give the debugger a clue. XX not really internal-error?
-    (note-this-location vop :internal-error)))
+    (emit-c-call vop rax rbx args
+                 sb!alien::*alien-fun-type-varargs-default*
+                 #!+sb-safepoint pc-save)))
+
+;;; Calls to C can generally be made without loading a register
+;;; with the function. We receive the function name as an info argument.
+#!+sb-dynamic-core ;; broken when calling ldso-stubs
+(define-vop (call-out-named)
+  (:args (args :more t))
+  (:results (results :more t))
+  (:info c-symbol varargsp)
+  (:temporary (:sc unsigned-reg :offset rax-offset :to :result) rax)
+  #!+sb-safepoint
+  (:temporary (:sc unsigned-stack :from :eval :to :result) pc-save)
+  (:ignore results)
+  (:vop-var vop)
+  (:save-p t)
+  (:generator 0
+    (emit-c-call vop rax c-symbol args varargsp #!+sb-safepoint pc-save)))
+
+(defun emit-c-call (vop rax fun args varargsp #!+sb-safepoint pc-save)
+  (declare (ignorable varargsp))
+  ;; Current PC - don't rely on function to keep it in a form that
+  ;; GC understands
+  #!+sb-safepoint
+  (let ((label (gen-label)))
+    (inst lea (reg-in-size rax :immobile-code-pc) (make-fixup nil :code-object label))
+    (emit-label label)
+    (move-dword-if-immobile-code pc-save rax))
+  (when sb!c::*msan-compatible-stack-unpoison*
+    (inst mov rax (static-symbol-value-ea 'msan-param-tls))
+    ;; Unpoison parameters
+    (do ((n 0 (+ n n-word-bytes))
+         (arg args (tn-ref-across arg)))
+        ((null arg))
+      ;; KLUDGE: assume all parameters are 8 bytes or less
+      (inst fs)
+      (inst mov (make-ea :qword :base rax :disp n) 0)))
+  #!-win32
+  ;; ABI: AL contains amount of arguments passed in XMM registers
+  ;; for vararg calls.
+  (when varargsp
+    (move-immediate rax
+                  (loop for tn-ref = args then (tn-ref-across tn-ref)
+                        while tn-ref
+                        count (eq (sb-name (sc-sb (tn-sc (tn-ref-tn tn-ref))))
+                                  'float-registers))))
+  #!+sb-safepoint
+  ;; Store SP in thread struct
+  (storew rsp-tn thread-base-tn thread-saved-csp-offset)
+  #!+win32 (inst sub rsp-tn #x20)       ;MS_ABI: shadow zone
+  ;; From immobile space we use the "CALL rel32" format to the linkage
+  ;; table jump, and from dynamic space we use "CALL [ea]" format
+  ;; where ea is the address of the linkage table entry's operand.
+  ;; So while the former is a jump to a jump, we can optimize out
+  ;; one jump in a statically linked executable.
+
+  (inst call (cond ((tn-p fun) fun)
+                   #!+immobile-code
+                   ((sb!c::code-immobile-p (sb!c::vop-node vop))
+                    (make-fixup fun :foreign))
+                   (t (make-ea :qword :disp (make-fixup fun :foreign 8)))))
+  ;; For the undefined alien error
+  (note-this-location vop :internal-error)
+  #!+win32 (inst add rsp-tn #x20)       ;MS_ABI: remove shadow space
+  #!+sb-safepoint
+  ;; Zero the saved CSP
+  (inst xor (make-ea-for-object-slot thread-base-tn thread-saved-csp-offset 0)
+        rsp-tn))
 
 (define-vop (alloc-number-stack-space)
   (:info amount)

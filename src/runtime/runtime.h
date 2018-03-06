@@ -67,10 +67,14 @@ typedef enum {
 
 void map_gc_page();
 void unmap_gc_page();
-int check_pending_interrupts();
 void gc_state_lock();
 void gc_state_wait(gc_phase_t);
+int gc_cycle_active(void);
 void gc_state_unlock();
+
+#define WITH_GC_STATE_LOCK \
+    gc_state_lock(); \
+    RUN_BODY_ONCE(gc_state_lock, gc_state_unlock())
 
 #endif
 
@@ -271,6 +275,16 @@ HeaderValue(lispobj obj)
   return obj >> N_WIDETAG_BITS;
 }
 
+static inline int listp(lispobj obj) {
+    return lowtag_of(obj) == LIST_POINTER_LOWTAG;
+}
+static inline int instancep(lispobj obj) {
+    return lowtag_of(obj) == INSTANCE_POINTER_LOWTAG;
+}
+static inline int functionp(lispobj obj) {
+    return lowtag_of(obj) == FUN_POINTER_LOWTAG;
+}
+
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
 #define HEADER_VALUE_MASKED(x) (HeaderValue(x) & SHORT_HEADER_MAX_WORDS)
 #else
@@ -441,6 +455,7 @@ void *os_dlsym_default(char *name);
 struct lisp_startup_options {
     boolean noinform;
 };
+extern struct lisp_startup_options lisp_startup_options;
 
 /* Even with just -O1, gcc optimizes the jumps in this "loop" away
  * entirely, giving the ability to define WITH-FOO-style macros. */
@@ -456,6 +471,18 @@ struct lisp_startup_options {
       (__extension__ ({ __typeof__ (x) __x = (x); (void) __x; }))
 #else
 # define ignore_value(x) ((void) (x))
+#endif
+
+#if defined(__GNUC__) && defined(ADDRESS_SANITIZER)
+#define NO_SANITIZE_ADDRESS __attribute__((no_sanitize_address))
+#else
+#define NO_SANITIZE_ADDRESS
+#endif
+
+#if defined(__GNUC__) && defined(MEMORY_SANITIZER)
+#define NO_SANITIZE_MEMORY __attribute__((no_sanitize_memory))
+#else
+#define NO_SANITIZE_MEMORY
 #endif
 
 #endif /* _SBCL_RUNTIME_H_ */

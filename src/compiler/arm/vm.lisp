@@ -20,7 +20,7 @@
 (macrolet ((defreg (name offset)
              (let ((offset-sym (symbolicate name "-OFFSET")))
                `(eval-when (:compile-toplevel :load-toplevel :execute)
-                  (def!constant ,offset-sym ,offset)
+                  (defconstant ,offset-sym ,offset)
                   (setf (svref *register-names* ,offset-sym) ,(symbol-name name)))))
 
            (defregset (name &rest regs)
@@ -54,6 +54,10 @@
 
   (defregset non-descriptor-regs
       ocfp nfp nargs nl2 nl3)
+
+  ;; OAOOM: Same as runtime/arm-lispregs.h
+  (defregset boxed-regs
+      r0 r1 r2 lexenv r8 code)
 
   ;; registers used to pass arguments
   ;;

@@ -25,23 +25,25 @@ struct ndir_entry {
     core_entry_elt_t identifier;
     core_entry_elt_t nwords;
     core_entry_elt_t data_page;
-    core_entry_elt_t address; /* expressed in units of KiB */
+    core_entry_elt_t address;
     core_entry_elt_t page_count;
 };
 #define NDIR_ENTRY_LENGTH (sizeof (struct ndir_entry)/sizeof (core_entry_elt_t))
 
-/* Tri-state flag to determine whether we attempt to mark pages
- * as targets for virtual memory deduplication (ala MADV_MERGEABLE
- * on Linux).
- *
- * 1: Yes
- * 0: No
- * -1: default, yes for compressed cores, no otherwise.
- */
-extern int merge_core_pages;
+#define RUNTIME_OPTIONS_MAGIC 0x31EBF355
+/* 1 for magic, 1 for core entry size in words, 2 for struct runtime_options fields */
+#define RUNTIME_OPTIONS_WORDS (1 + 1 + 2)
 
-extern lispobj load_core_file(char *file, os_vm_offset_t offset);
-extern os_vm_offset_t search_for_embedded_core(char *file);
+struct memsize_options {
+    os_vm_size_t dynamic_space_size;
+    os_vm_size_t thread_control_stack_size;
+    int present_in_core;
+};
+
+extern lispobj load_core_file(char *file, os_vm_offset_t file_offset,
+                              int merge_core_pages);
+extern os_vm_offset_t search_for_embedded_core(char *filename,
+                                               struct memsize_options *memsize_options);
 
 /* arbitrary string identifying this build, embedded in .core files to
  * prevent people mismatching a runtime built e.g. with :SB-SHOW

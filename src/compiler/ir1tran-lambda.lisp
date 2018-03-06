@@ -166,7 +166,7 @@
   (declare (type ctran start next) (type (or lvar null) result)
            (list body aux-vars aux-vals))
   (if (null aux-vars)
-      (let ((*lexenv* (make-lexenv :vars (copy-list post-binding-lexenv))))
+      (let ((*lexenv* (make-lexenv :vars post-binding-lexenv)))
         (ir1-convert-progn-body start next result body))
       (let ((ctran (make-ctran))
             (fun-lvar (make-lvar))
@@ -1112,13 +1112,15 @@
                (make-lexenv
                 :default (process-inline-lexenv (second fun))
                 :handled-conditions (lexenv-handled-conditions *lexenv*)
-                :policy policy)
+                :policy policy
+                :flushable (lexenv-flushable *lexenv*))
                (make-almost-null-lexenv
                 policy
                 ;; Inherit MUFFLE-CONDITIONS from the call-site lexenv
                 ;; rather than the definition-site lexenv, since it seems
                 ;; like a much more common case.
-                (lexenv-handled-conditions *lexenv*))))
+                (lexenv-handled-conditions *lexenv*)
+                (lexenv-flushable *lexenv*))))
          (clambda (ir1-convert-lambda body
                                       :source-name source-name
                                       :debug-name debug-name
@@ -1145,7 +1147,7 @@
                                           (list (parse-key-arg-spec spec) t))
                                         key-list))))
             (allow (when (ll-kwds-allowp llks) '(&allow-other-keys))))
-        (compiler-specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
+        (careful-specifier-type `(function (,@reqs ,@opts ,@rest ,@keys ,@allow) *))))))
 
 ;;; Get a DEFINED-FUN object for a function we are about to define. If
 ;;; the function has been forward referenced, then substitute for the
@@ -1165,8 +1167,8 @@
                                           :defined-here)
                           :type (if (eq :declared where-from)
                                     (leaf-type found)
-                                    (if lp
-                                        (ftype-from-lambda-list lambda-list)
+                                    (or (and lp
+                                             (ftype-from-lambda-list lambda-list))
                                         (specifier-type 'function))))))
                (substitute-leaf res found)
                (setf (gethash name *free-funs*) res)))
@@ -1338,14 +1340,13 @@
 ;; and not flat-out wrong, though there is indeed some waste in the fasl.
 ;;
 ;; KIND is the globaldb KIND of this NAME
-(defun %compiler-defmacro (kind name compile-toplevel)
-  (when compile-toplevel
-    (let ((name-key `(,kind ,name)))
-      (when (boundp '*lexenv*)
-        (aver (producing-fasl-file))
-        (if (member name-key *fun-names-in-this-file* :test #'equal)
-            (compiler-style-warn 'same-file-redefinition-warning :name name)
-            (push name-key *fun-names-in-this-file*))))))
+(defun %compiler-defmacro (kind name)
+  (let ((name-key `(,kind ,name)))
+    (when (boundp '*lexenv*)
+      (aver (producing-fasl-file))
+      (if (member name-key *fun-names-in-this-file* :test #'equal)
+          (compiler-style-warn 'same-file-redefinition-warning :name name)
+          (push name-key *fun-names-in-this-file*)))))
 
 
 ;;; Entry point utilities

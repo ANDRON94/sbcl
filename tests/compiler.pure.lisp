@@ -226,9 +226,8 @@
       (checked-compile `(lambda (x)
                           (declare (type (0) x))
                           x)
-                       :allow-failure t)
-    (assert failure-p)
-    (assert-error (funcall fun 1) program-error)))
+                       :allow-warnings t)
+    (assert failure-p)))
 
 (with-test (:name (compile make-array :bad-type-specifier :bug-181))
   (multiple-value-bind (fun failure-p warnings)
@@ -516,7 +515,7 @@
                 (x &rest x)
                 (x &rest (y x))
                 (x &optional (y nil x))
-                (x &optional (y nil y)) ; TODO this case prints "caught ERROR: ..." but doesn't set failure-p
+                (x &optional (y nil y))
                 (x &key x)
                 (x &key (y nil x))
                 (&key (y nil z) (z nil w))
@@ -528,8 +527,7 @@
                                             (bar (&environment env)
                                               `',(macro-function 'foo env)))
                                    (bar)))
-                              ;; FIXME  :allow-failure is for the annotated case above
-                              :allow-failure t :allow-style-warnings t))))
+                              :allow-style-warnings t))))
       (assert style-warnings))))
 
 ;; Uh, this test is semi-bogus - it's trying to test that you can't
@@ -551,9 +549,9 @@
   (checked-compile `(lambda ()
                       (make-array nil :initial-element 11))))
 
-(assert-error (funcall (eval #'open) "assertoid.lisp"
+(assert-error (funcall (eval #'open) "compiler.pure.lisp"
                        :external-format '#:nonsense))
-(assert-error (funcall (eval #'load) "assertoid.lisp"
+(assert-error (funcall (eval #'load) "compiler.pure.lisp"
                        :external-format '#:nonsense))
 
 (assert (= (the (values integer symbol) (values 1 'foo 13)) 1))
@@ -4416,8 +4414,7 @@
                         (or (if (= d c)  2 (= 3 b)) 4)))
                    :allow-style-warnings t))
 
-(with-test (:name (compile :bug-913232)
-            :fails-on :interpreter) ; no idea why it fails randomly
+(with-test (:name (compile :bug-913232))
   (checked-compile `(lambda (x)
                       (declare (optimize speed)
                                (type (or (and (or (integer -100 -50)
@@ -4527,8 +4524,10 @@
    sb-int:simple-program-error))
 
 (with-test (:name (compile :malformed-type-declaraions))
-  (checked-compile '(lambda (a) (declare (type (integer 1 2 . 3) a)))
-                   :allow-failure t))
+  (assert (nth-value 1
+                     (checked-compile
+                      '(lambda (a) (declare (type (integer 1 2 . 3) a)) a)
+                      :allow-warnings t))))
 
 (with-test (:name :compiled-program-error-escaped-source)
   (assert
@@ -5064,7 +5063,7 @@
                        x))))
 
 (with-test (:name (compile :copy-more-arg)
-            :fails-on (not (or :x86 :x86-64 :arm :arm64)))
+                  :fails-on (or :alpha :hppa :mips :sparc))
   ;; copy-more-arg might not copy in the right direction
   ;; when there are more fixed args than stack frame slots,
   ;; and thus end up splatting a single argument everywhere.
@@ -5438,44 +5437,6 @@
      (let ((i (position x #(a b c d) :test 'eq)))
        (case i (4 'nope) (t 'okeydokey))))))
 
-;; Assert that DO-PACKED-TNS has unsurprising behavior if the body RETURNs.
-;; This isn't a test in the problem domain of CL - it's of an internal macro,
-;; and x86-64-specific not because of broken-ness, but because it uses
-;; known random TNs to play with. Printing "skipped on" for other backends
-;; would be somewhat misleading in as much as it means nothing about
-;; the correctness of the test on other architectures.
-#+x86-64
-(with-test (:name :do-packed-tn-iterator)
-  (dotimes (i (ash 1 6))
-    (labels ((make-tns (n)
-               (mapcar 'copy-structure
-                       (subseq `sb-vm::(,rax-tn ,rbx-tn ,rcx-tn) 0 n)))
-             (link (list)
-               (when list
-                 (setf (sb-c::tn-next (car list)) (link (cdr list)))
-                 (car list))))
-      (let* ((normal     (make-tns (ldb (byte 2 0) i)))
-             (restricted (make-tns (ldb (byte 2 2) i)))
-             (wired      (make-tns (ldb (byte 2 4) i)))
-             (expect     (append normal restricted wired))
-             (comp       (sb-c::make-empty-component))
-             (ir2-comp   (sb-c::make-ir2-component)))
-        (setf (sb-c::component-info comp) ir2-comp
-              (sb-c::ir2-component-normal-tns ir2-comp) (link normal)
-              (sb-c::ir2-component-restricted-tns ir2-comp) (link restricted)
-              (sb-c::ir2-component-wired-tns ir2-comp) (link wired))
-        (let* ((list)
-               (result (sb-c::do-packed-tns (tn comp 42) (push tn list))))
-          (assert (eq result 42))
-          (assert (equal expect (nreverse list))))
-        (let* ((n 0) (list)
-               (result (sb-c::do-packed-tns (tn comp 'bar)
-                         (push tn list)
-                         (if (= (incf n) 4) (return 'foo)))))
-          (assert (eq result (if (>= (length expect) 4) 'foo 'bar)))
-          (assert (equal (subseq expect 0 (min 4 (length expect)))
-                         (nreverse list))))))))
-
 ;; lp# 310267
 (with-test (:name (optimize :quality-multiply-specified :bug-310267))
   (let ((sb-c::*policy* sb-c::*policy*)) ; to keep this test pure
@@ -5772,17 +5733,21 @@
                      (the (eql #\A) y)))
     ((#\a #\A) t)))
 
-(with-test (:name (oddp fixnum :no-consing))
+(with-test (:name (oddp fixnum :no-consing)
+            :skipped-on :interpreter)
   (let ((f (checked-compile '(lambda (x) (oddp x)))))
     (ctu:assert-no-consing (funcall f most-positive-fixnum))))
-(with-test (:name (oddp bignum :no-consing))
+(with-test (:name (oddp bignum :no-consing)
+            :skipped-on :interpreter)
   (let ((f (checked-compile '(lambda (x) (oddp x))))
         (x (* most-positive-fixnum most-positive-fixnum 3)))
     (ctu:assert-no-consing (funcall f x))))
-(with-test (:name (logtest fixnum :no-consing :bug-1277690))
+(with-test (:name (logtest fixnum :no-consing :bug-1277690)
+            :skipped-on :interpreter)
   (let ((f (checked-compile '(lambda (x) (logtest x most-positive-fixnum)))))
     (ctu:assert-no-consing (funcall f 1))))
-(with-test (:name (logtest bignum :no-consing))
+(with-test (:name (logtest bignum :no-consing)
+            :skipped-on :interpreter)
   (let ((f (checked-compile '(lambda (x) (logtest x 1))))
         (x (* most-positive-fixnum most-positive-fixnum 3)))
     (ctu:assert-no-consing (funcall f x))))
@@ -6152,9 +6117,35 @@
                    s)))
     (('(1 2) 3) 6)))
 
-(with-test (:name (multiple-value-call :type-derivation)
-                  :fails-on :sbcl)
-  (checked-compile-and-assert (:allow-warnings t)
+(with-test (:name (multiple-value-call :type-checking-rest))
+  (checked-compile-and-assert (:allow-warnings t
+                               :optimize :safe)
+      `(lambda (list)
+         (multiple-value-call
+             (lambda (&optional a &rest r)
+               (declare ((satisfies eval) r)
+                        (ignore r))
+               (list a))
+           (values-list list)))
+    (('(1 list 2)) '(1))
+    (('(1)) (condition 'type-error))))
+
+(with-test (:name (multiple-value-call :type-checking-rest.2))
+  (checked-compile-and-assert (:allow-warnings t
+                               :optimize :safe)
+      `(lambda (list)
+         (multiple-value-call
+             (lambda (&optional a &rest r)
+               (declare (null r)
+                        (ignore r))
+               (list a))
+           (values-list list)))
+    (('(1 list 2)) (condition 'type-error))
+    (('(1)) '(1))))
+
+(with-test (:name (multiple-value-call :type-checking-rest :type-derivation))
+  (checked-compile-and-assert (:allow-warnings t
+                               :optimize :safe)
       `(lambda (list)
          (multiple-value-call
              (lambda (&optional a &rest r)
@@ -6162,7 +6153,8 @@
                         (ignore r))
                (list a))
            (values-list list)))
-    (('(1 2)) '(1))))
+    (('(1 2)) '(1))
+    (('(1)) (condition 'type-error))))
 
 (with-test (:name :delete-optional-dispatch-xep)
   (let ((name (gensym)))
@@ -6309,6 +6301,14 @@
   (checked-compile-and-assert ()
       `(lambda (x) (* #C(4.457268f31 0.0) 4 x -46253801283659))
     ((5.0f-9) #C(-4.123312f37 -0.0))))
+
+(with-test (:name :reducing-constants.2
+                  ;; x86 delays FPE signalling
+                  :fails-on :x86)
+  (checked-compile-and-assert (:allow-style-warnings t)
+      `(lambda () (*  1.0 2 (expt 2 127)))
+    (() #-(or arm64 arm) (condition 'floating-point-overflow)
+        #+(or arm64 arm) sb-ext:single-float-positive-infinity)))
 
 (with-test (:name (logbitp :past fixnum))
   (checked-compile-and-assert ()

@@ -6,16 +6,18 @@
   "HPPA")
 
 ;;;; FIXUP-CODE-OBJECT
+(defconstant-eqx +fixup-kinds+
+    #(:absolute :load :load11u :load-short :hi :branch)
+  #'equalp)
 (!with-bigvec-or-sap
-(defun fixup-code-object (code offset value kind &optional flavor)
+(defun fixup-code-object (code offset value kind flavor)
   (declare (ignore flavor))
   (unless (zerop (rem offset n-word-bytes))
     (error "Unaligned instruction?  offset=#x~X." offset))
-  (without-gcing
-   (let* ((sap (code-instructions code))
-          (inst (sap-ref-32 sap offset)))
-     (setf (sap-ref-32 sap offset)
-           (ecase kind
+  (let* ((sap (code-instructions code))
+         (inst (sap-ref-32 sap offset)))
+    (setf (sap-ref-32 sap offset)
+          (ecase kind
              (:absolute
               value)
              (:load
@@ -48,7 +50,8 @@
                 (logior (ash bits 3)
                         (mask-field (byte 1 1) inst)
                         (mask-field (byte 3 13) inst)
-                        (mask-field (byte 11 21) inst))))))))))
+                        (mask-field (byte 11 21) inst)))))))
+  nil))
 
 #-sb-xc-host (progn
 
@@ -68,8 +71,8 @@
 (defun internal-error-args (context)
   (declare (type (alien (* os-context-t)) context))
   (let* ((pc (context-pc context))
-         (error-number (sap-ref-8 pc 4)))
+         (trap-number (logand (sap-ref-8 pc 3) #x1f)))
     (declare (type system-area-pointer pc))
-    (values error-number
-            (sb!kernel::decode-internal-error-args (sap+ pc 5) error-number))))
+    (sb!kernel::decode-internal-error-args (sap+ pc 5) trap-number
+                                           (sap-ref-8 pc 4))))
 ) ; end PROGN

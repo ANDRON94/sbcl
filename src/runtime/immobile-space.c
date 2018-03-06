@@ -49,6 +49,7 @@
 #include "gc-internal.h"
 #include "gc-private.h"
 #include "genesis/gc-tables.h"
+#include "genesis/cons.h"
 #include "genesis/vector.h"
 #include "forwarding-ptr.h"
 #include "pseudo-atomic.h"
@@ -76,6 +77,11 @@ FILE * logfile;
 #endif
 
 void defrag_immobile_space(int* components, boolean verbose);
+
+uword_t FIXEDOBJ_SPACE_START, VARYOBJ_SPACE_START;
+uword_t immobile_space_lower_bound, immobile_space_max_offset;
+unsigned int immobile_range_1_max_offset, immobile_range_2_min_offset;
+unsigned int varyobj_space_size = VARYOBJ_SPACE_SIZE;
 
 unsigned asm_routines_end;
 
@@ -139,31 +145,6 @@ unsigned char* varyobj_page_gens;
 lispobj varyobj_holes;
 
 #define varyobj_page_touched(x) ((varyobj_page_touched_bits[x/32] >> (x&31)) & 1)
-
-static inline low_page_index_t find_fixedobj_page_index(void *addr)
-{
-  if (addr >= (void*)FIXEDOBJ_SPACE_START) {
-      // Must use full register size here to avoid truncation of quotient
-      // and bogus result!
-      page_index_t index =
-          ((uintptr_t)addr - (uintptr_t)FIXEDOBJ_SPACE_START) / IMMOBILE_CARD_BYTES;
-      if (index < (int)(FIXEDOBJ_SPACE_SIZE/IMMOBILE_CARD_BYTES))
-          return index;
-  }
-  return -1;
-}
-static inline low_page_index_t find_varyobj_page_index(void *addr)
-{
-  if (addr >= (void*)VARYOBJ_SPACE_START) {
-      // Must use full register size here to avoid truncation of quotient
-      // and bogus result!
-      size_t offset = (uintptr_t)addr - (uintptr_t)VARYOBJ_SPACE_START;
-      if (offset >= varyobj_space_size)
-          return -1;
-      return offset / IMMOBILE_CARD_BYTES;
-  }
-  return -1;
-}
 
 #ifdef VERIFY_PAGE_GENS
 void check_fixedobj_page(low_page_index_t);
@@ -286,6 +267,61 @@ static int get_freeish_page(int hint_page, int attributes)
   lose("No more immobile pages available");
 }
 
+/// The size classes are: 2w, 4w, 6w, 8w, ..., up to 20w.
+/// Each size class can store at most 2 different alignments. So for example in
+/// the size class for 14 words there will be a page hint for 14-word-aligned
+/// objects and at most one other alignment.
+#define MAX_SIZE_CLASSES 10
+#define MAX_HINTS_PER_CLASS 2
+long page_hints[MAX_SIZE_CLASSES*MAX_HINTS_PER_CLASS];
+static inline int hint_attributes(long hint) { return hint & 0xFFFFFFFF; }
+static int hint_page(long hint) { return hint>>32; }
+static long make_hint(int page, int attributes) {
+    return ((long)page << 32) | attributes;
+}
+
+static int get_hint(int attributes, int *page)
+{
+    long hint;
+    unsigned int size = attributes >> 16;
+    int hint_index = size - 2, limit = hint_index + 1, free_slot = -1;
+    if (hint_index > (int)(sizeof page_hints / sizeof (long)))
+        lose("Unexpectedly large fixedobj allocation request");
+    for ( ; hint_index <= limit; ++hint_index ) {
+#ifdef __ATOMIC_SEQ_CST
+        __atomic_load(&page_hints[hint_index], &hint, __ATOMIC_SEQ_CST);
+#else
+        hint = __sync_fetch_and_add(&page_hints[hint_index], 0);
+#endif
+        if (hint_attributes(hint) == attributes) {
+            *page = hint_page(hint);
+            return hint_index;
+        } else if (hint == 0 && free_slot < 0)
+            free_slot = hint_index;
+    }
+    if (free_slot<0)
+        lose("Should not happen\n"); // TODO: evict a hint
+    // Linearly search for a free page from the beginning
+    int free_page = get_freeish_page(0, attributes);
+    *page = free_page;
+    int existing = __sync_val_compare_and_swap(&page_hints[free_slot], 0,
+                                               make_hint(free_page, attributes));
+    if (existing) // collided. don't worry about it
+        return -1;
+    return free_slot;
+}
+
+static void unset_hint(int page)
+{
+    int attributes = fixedobj_pages[page].attr.packed;
+    unsigned int size = (attributes >> 16) & 0xff; // mask off the generation bits
+    int hint_index = size - 2;
+    if (hint_page(page_hints[hint_index]) == page)
+        page_hints[hint_index] = 0;
+    if (hint_page(page_hints[hint_index+1]) == page)
+        page_hints[hint_index+1] = 0;
+}
+
 // Unused, but possibly will be for some kind of collision-avoidance scheme
 // on claiming of new free pages.
 long immobile_alloc_collisions;
@@ -310,15 +346,15 @@ long immobile_alloc_collisions;
      masking. if the next address is above or equal to the page start,
      store it in the hint, otherwise mark the page full */
 
-lispobj alloc_immobile_obj(int page_attributes, lispobj header, int* hint)
+static lispobj* alloc_immobile_obj(int page_attributes, lispobj header)
 {
-  int page;
+  int hint_index, page;
   lispobj word;
   char * page_data, * obj_ptr, * next_obj_ptr, * limit, * next_free;
   int spacing_in_bytes = OBJ_SPACING(page_attributes) << WORD_SHIFT;
   const int npages = FIXEDOBJ_SPACE_SIZE / IMMOBILE_CARD_BYTES;
 
-  page = *hint;
+  hint_index = get_hint(page_attributes, &page);
   gc_dcheck(fixedobj_page_address(page) < (void*)fixedobj_free_pointer);
   do {
       page_data = fixedobj_page_address(page);
@@ -334,7 +370,7 @@ lispobj alloc_immobile_obj(int page_attributes, lispobj header, int* hint)
               // the next hole. Use it to update the freelist pointer.
               // Just slam it in.
               fixedobj_pages[page].free_index = next_obj_ptr + word - page_data;
-              return (lispobj)obj_ptr;
+              return (lispobj*)obj_ptr;
           }
           // If some other thread updated the free_index
           // to a larger value, use that. (See example below)
@@ -342,9 +378,14 @@ lispobj alloc_immobile_obj(int page_attributes, lispobj header, int* hint)
           obj_ptr = next_free > next_obj_ptr ? next_free : next_obj_ptr;
       }
       set_page_full(page);
+      int old_page = page;
       page = get_freeish_page(page+1 >= npages ? 0 : page+1,
                               page_attributes);
-      *hint = page;
+      if (hint_index >= 0) { // try to update the hint
+          __sync_val_compare_and_swap(page_hints + hint_index,
+                                      make_hint(old_page, page_attributes),
+                                      make_hint(page, page_attributes));
+      }
   } while (1);
 }
 
@@ -688,54 +729,9 @@ scavenge_immobile_roots(generation_index_t min_gen, generation_index_t max_gen)
     scavenge_immobile_newspace();
 }
 
-#include "genesis/layout.h"
-#define LAYOUT_SIZE (sizeof (struct layout)/N_WORD_BYTES)
-/// First 5 layouts: T, FUNCTION, STRUCTURE-OBJECT, LAYOUT, PACKAGE
-/// (These #defines ought to be emitted by genesis)
-#define LAYOUT_OF_LAYOUT  ((FIXEDOBJ_SPACE_START+3*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
-#define LAYOUT_OF_PACKAGE ((FIXEDOBJ_SPACE_START+4*LAYOUT_ALIGN)|INSTANCE_POINTER_LOWTAG)
-
-// As long as Lisp doesn't have any native allocators (vops and whatnot)
-// it doesn't need to access these values.
-int layout_page_hint, symbol_page_hint, fdefn_page_hint;
-
-// For the three different page characteristics that we need,
-// claim a page that works for those characteristics.
-void set_immobile_space_hints()
-{
-  // The allocator doesn't check whether each 'hint' points to an
-  // expected kind of page, so we have to ensure up front that
-  // allocations start on different pages. i.e. You can point to
-  // a totally full page, but you can't point to a wrong page.
-  // It doesn't work to just assign these to consecutive integers
-  // without also updating the page attributes.
-
-  // Object sizes must be multiples of 2 because the n_words value we pass
-  // to scavenge() is gotten from the page attributes, and scavenge asserts
-  // that the ending address is aligned to a doubleword boundary as expected.
-
-  // For 32-bit immobile space, LAYOUTs must be 256-byte-aligned so that the
-  // low byte of a pointer contains no information, and a layout pointer can
-  // be stored in the high 3 bytes point of an instance header.
-  // instance-length can be recovered from the layout, and need not be stored
-  // in each instance. Representation change in rev 092af9c078c made
-  // things more difficult, but not impossible.
-  layout_page_hint = get_freeish_page(0, MAKE_ATTR(LAYOUT_ALIGN / N_WORD_BYTES, // spacing
-                                                   ALIGN_UP(LAYOUT_SIZE,2),
-                                                   0));
-  symbol_page_hint = get_freeish_page(0, MAKE_ATTR(ALIGN_UP(SYMBOL_SIZE,2),
-                                                   ALIGN_UP(SYMBOL_SIZE,2),
-                                                   0));
-  fdefn_page_hint = get_freeish_page(0, MAKE_ATTR(ALIGN_UP(FDEFN_SIZE,2),
-                                                  ALIGN_UP(FDEFN_SIZE,2),
-                                                  0));
-}
-
 void write_protect_immobile_space()
 {
     immobile_scav_queue_head = 0;
-
-    set_immobile_space_hints();
 
     if (!ENABLE_PAGE_PROTECTION)
         return;
@@ -1063,6 +1059,7 @@ sweep_fixedobj_pages(int raise)
             }
         } else {
             dprintf((logfile,"page %d is all garbage\n", page));
+            unset_hint(page);
             fixedobj_pages[page].attr.packed = 0;
         }
 #ifdef DEBUG
@@ -1286,13 +1283,18 @@ void immobile_space_coreparse(uword_t fixedobj_len, uword_t varyobj_len)
     if ((uword_t)limit & (IMMOBILE_CARD_BYTES-1)) {
         int remainder = IMMOBILE_CARD_BYTES -
           ((uword_t)limit & (IMMOBILE_CARD_BYTES-1));
-        limit[0] = SIMPLE_ARRAY_FIXNUM_WIDETAG;
-        limit[1] = make_fixnum((remainder >> WORD_SHIFT) - 2);
+        lispobj array_length = make_fixnum((remainder >> WORD_SHIFT) - 2);
+        if (limit[0] == SIMPLE_ARRAY_FIXNUM_WIDETAG) {
+            gc_assert(limit[1] == array_length);
+        } else {
+            limit[0] = SIMPLE_ARRAY_FIXNUM_WIDETAG;
+            limit[1] = array_length;
+        }
         int size = sizetab[SIMPLE_ARRAY_FIXNUM_WIDETAG](limit);
         lispobj* __attribute__((unused)) padded_end = limit + size;
         gc_assert(!((uword_t)padded_end & (IMMOBILE_CARD_BYTES-1)));
     }
-    // Write-protect the pages occupied by the core file.
+    // Set the WP bits for pages occupied by the core file.
     // (There can be no inter-generation pointers.)
     if (ENABLE_PAGE_PROTECTION) {
         low_page_index_t page;
@@ -1497,6 +1499,14 @@ lispobj* find_preceding_object(lispobj* obj)
   }
 }
 
+lispobj* alloc_fixedobj(int nwords, uword_t header)
+{
+    return alloc_immobile_obj(MAKE_ATTR(ALIGN_UP(nwords,2), // spacing
+                                        ALIGN_UP(nwords,2), // size
+                                        0),
+                              header);
+}
+
 #include "genesis/vector.h"
 #include "genesis/instance.h"
 lispobj alloc_layout(lispobj slots)
@@ -1513,8 +1523,7 @@ lispobj alloc_layout(lispobj slots)
 #ifdef LISP_FEATURE_COMPACT_INSTANCE_HEADER
                          (LAYOUT_OF_LAYOUT << 32) |
 #endif
-                         (LAYOUT_SIZE-1)<<N_WIDETAG_BITS | INSTANCE_WIDETAG,
-                         &layout_page_hint);
+                         (LAYOUT_SIZE-1)<<N_WIDETAG_BITS | INSTANCE_WIDETAG);
 #ifndef LISP_FEATURE_COMPACT_INSTANCE_HEADER
     l->slots[0] = LAYOUT_OF_LAYOUT;
 #endif
@@ -1528,81 +1537,9 @@ lispobj alloc_layout(lispobj slots)
     return make_lispobj(l, INSTANCE_POINTER_LOWTAG);
 }
 
-#include "genesis/symbol.h"
-lispobj alloc_sym(lispobj name)
-{
-    // While there are different "kinds" of symbols in the defragmentation
-    // logic, we don't distinguish them when allocating,
-    // on the theory that contiguous allocations are preferable anyway.
-    struct symbol* s = (struct symbol*)
-      alloc_immobile_obj(MAKE_ATTR(ALIGN_UP(SYMBOL_SIZE,2), // spacing
-                                   ALIGN_UP(SYMBOL_SIZE,2), // size
-                                   0),
-                         (SYMBOL_SIZE-1)<<N_WIDETAG_BITS | SYMBOL_WIDETAG,
-                         &symbol_page_hint);
-    s->value = UNBOUND_MARKER_WIDETAG;
-    s->hash = 0;
-    s->info = NIL;
-    s->name = name;
-    s->package = NIL;
-    return make_lispobj(s, OTHER_POINTER_LOWTAG);
-}
-
-#include "genesis/fdefn.h"
-lispobj alloc_fdefn(lispobj name)
-{
-    struct fdefn* f = (struct fdefn*)
-      alloc_immobile_obj(MAKE_ATTR(ALIGN_UP(FDEFN_SIZE,2), // spacing
-                                   ALIGN_UP(FDEFN_SIZE,2), // size
-                                   0),
-                         (FDEFN_SIZE-1)<<N_WIDETAG_BITS | FDEFN_WIDETAG,
-                         &fdefn_page_hint);
-    f->name = name;
-    f->fun = NIL;
-    f->raw_addr = 0;
-    return make_lispobj(f, OTHER_POINTER_LOWTAG);
-}
-
-// Function trampolines are 6 words long:
-//  4 boxed words: code header, size, debug-info (a callable object), padding
-//  2 raw words: instruction bytes
+// FIXME: Figure out not to hardcode
 #define FUN_TRAMP_SIZE 6
-lispobj alloc_fun_tramp(lispobj callable)
-{
-    lispobj* obj = (lispobj*)
-      alloc_immobile_obj(MAKE_ATTR(FUN_TRAMP_SIZE, FUN_TRAMP_SIZE, 0),
-                         // header indicates 4 boxed words
-                         (4 << N_WIDETAG_BITS) | CODE_HEADER_WIDETAG,
-                         // KLUDGE: same page attributes as symbols,
-                         // so use the same hint.
-                         &symbol_page_hint);
-    obj[1] = make_fixnum(16);
-    obj[2] = callable;
-    obj[3] = 0;
-    return make_lispobj(obj, OTHER_POINTER_LOWTAG);
-}
-
-#if defined(LISP_FEATURE_IMMOBILE_CODE) && defined(LISP_FEATURE_COMPACT_INSTANCE_HEADER)
-#include "genesis/funcallable-instance.h"
-#define GF_SIZE (sizeof(struct funcallable_instance)/sizeof(lispobj)+2) /* = 6 */
-lispobj alloc_generic_function(lispobj slots)
-{
-    // GFs have no C header file to represent the layout, which is 6 words:
-    //   header, entry-point, fin-function, slots, raw data (x2)
-    lispobj* obj = (lispobj*)
-      alloc_immobile_obj(MAKE_ATTR(ALIGN_UP(GF_SIZE,2), // spacing
-                                   ALIGN_UP(GF_SIZE,2), // size
-                                   0),
-                         // 5 payload words following the header
-                         ((GF_SIZE-1)<<N_WIDETAG_BITS) | FUNCALLABLE_INSTANCE_WIDETAG,
-                         // KLUDGE: same page attributes as symbols,
-                         // so use the same hint.
-                         &symbol_page_hint);
-    ((struct funcallable_instance*)obj)->info[0] = slots;
-    ((struct funcallable_instance*)obj)->trampoline = (lispobj)(obj + 4);
-    return make_lispobj(obj, FUN_POINTER_LOWTAG);
-}
-#endif
+#define GF_SIZE 6
 
 #ifdef LISP_FEATURE_IMMOBILE_CODE
 //// Defragmentation
@@ -1789,8 +1726,7 @@ static void fixup_space(lispobj* where, size_t n_words)
               f->self = adjust_fun_entrypoint(f->self);
               adjust_words(SIMPLE_FUN_SCAV_START(f), SIMPLE_FUN_SCAV_NWORDS(f), 0);
           });
-          if (code->fixups)
-              fixup_immobile_refs(follow_fp, code->fixups, code);
+          fixup_immobile_refs(follow_fp, code->fixups, code);
           break;
         case CLOSURE_WIDETAG:
           where[1] = adjust_fun_entrypoint(where[1]);
@@ -1821,8 +1757,7 @@ static void fixup_space(lispobj* where, size_t n_words)
           if (is_vector_subtype(header_word, VectorValidHashing)) {
               struct vector* v = (struct vector*)where;
               lispobj* data = v->data;
-              gc_assert(v->length > 0 &&
-                        lowtag_of(data[0]) == INSTANCE_POINTER_LOWTAG &&
+              gc_assert(v->length > 0 && instancep(data[0]) &&
                         !(fixnum_value(v->length) & 1));  // length must be even
               boolean needs_rehash = 0;
               int i;
@@ -2131,7 +2066,7 @@ void defrag_immobile_space(int* components, boolean verbose)
 #endif  /* DEFRAGMENT_FIXEDOBJ_SUBSPACE */
 
 #ifdef LISP_FEATURE_X86_64
-    // Fix displacements in JMP and CALL instructions in code objects.
+    // Fix displacements in JMP, CALL, and LEA instructions in code objects.
     // There are 2 arrays in use:
     //  - the relocs[] array contains the address of any machine instruction
     //    that needs to be altered on account of space relocation.
@@ -2153,9 +2088,15 @@ void defrag_immobile_space(int* components, boolean verbose)
         int end_reloc_index = immobile_space_reloc_index[i*2+3];
         for ( ; reloc_index < end_reloc_index ; ++reloc_index ) {
             unsigned char* inst_addr = (unsigned char*)(long)immobile_space_relocs[reloc_index];
-            gc_assert(*inst_addr == 0xE8 || *inst_addr == 0xE9);
+            int inst_len = 5, // number of bytes in the instruction's encoding
+                inst_byte_num = 1; // where the displacement operand starts
+            switch (*inst_addr) { // opcode
+            case 0xE8: case 0xE9: break; // JMP or CALL
+            case 0x8D: inst_len = 6; inst_byte_num = 2; break; // LEA
+            default: lose("Can't fixup opcode %02x", *inst_addr);
+            }
             unsigned int target_addr =
-                (int)(long)inst_addr + 5 + (int)UNALIGNED_LOAD32(inst_addr+1);
+                (int)(long)inst_addr + inst_len + (int)UNALIGNED_LOAD32(inst_addr+inst_byte_num);
             int target_adjust = 0;
             // Both this code and the jumped-to code can move.
             // For this component, adjust by the displacement by (old - new).
@@ -2177,7 +2118,7 @@ void defrag_immobile_space(int* components, boolean verbose)
             // Otherwise perform the fixup where the instruction is now.
             char* fixup_loc = (immobile_space_p((lispobj)inst_addr) ?
                                (char*)tempspace_addr(inst_addr - code + load_addr) :
-                               (char*)inst_addr) + 1;
+                               (char*)inst_addr) + inst_byte_num;
             UNALIGNED_STORE32(fixup_loc,
                               UNALIGNED_LOAD32(fixup_loc)
                                 + target_adjust + (code - load_addr));
@@ -2289,6 +2230,10 @@ void verify_immobile_page_protection(int keep_gen, int new_gen)
 void fixup_immobile_refs(lispobj (*fixup_lispobj)(lispobj),
                          lispobj fixups, struct code* code)
 {
+    if (listp(fixups))
+        fixups = CONS(fixups)->car;
+    if (!fixups) // if no fixups, or only relative fixups
+        return;
     struct varint_unpacker unpacker;
     varint_unpacker_init(&unpacker, fixups);
     char* instructions = (char*)((lispobj*)code + code_header_words(code->header));
@@ -2298,7 +2243,7 @@ void fixup_immobile_refs(lispobj (*fixup_lispobj)(lispobj),
         // so that the magnitudes are smaller.
         loc += prev_loc;
         prev_loc = loc;
-        int* fixup_where = (int*)(instructions + loc);
+        void* fixup_where = instructions + loc;
         lispobj ptr = (lispobj)UNALIGNED_LOAD32(fixup_where);
         if (is_lisp_pointer(ptr)) {
             lispobj fixed = fixup_lispobj(ptr);

@@ -25,7 +25,7 @@
           ((not (typep (layout-info res) 'defstruct-description))
            (error "Class is not a structure class: ~S" name))
           (t
-           (sb!int:check-deprecated-type name)
+           (check-deprecated-type name)
            res))))
 
 (defun compiler-layout-ready-p (name)
@@ -771,18 +771,14 @@ unless :NAMED is also specified.")))
            (values name default default-p
                    (uncross type) type-p
                    read-only ro-p)))
-        (t (error 'simple-program-error
-                  :format-control "in DEFSTRUCT, ~S is not a legal slot ~
-                                   description."
-                  :format-arguments (list spec))))
+        (t (%program-error "in DEFSTRUCT, ~S is not a legal slot description."
+                           spec)))
 
     (when (find name (dd-slots defstruct) :test #'string= :key #'dsd-name)
-      (error 'simple-program-error
-             ;; Todo: indicate whether name is a duplicate in the directly
-             ;; specified slots vs. exists in the ancestor and so should
-             ;; be in the (:include ...) clause instead of where it is.
-             :format-control "duplicate slot name ~S"
-             :format-arguments (list name)))
+      ;; TODO: indicate whether name is a duplicate in the directly
+      ;; specified slots vs. exists in the ancestor and so should
+      ;; be in the (:include ...) clause instead of where it is.
+      (%program-error "duplicate slot name ~S" name))
     (setf accessor-name (if (dd-conc-name defstruct)
                             (symbolicate (dd-conc-name defstruct) name)
                             name))
@@ -939,14 +935,12 @@ unless :NAMED is also specified.")))
         (mapl (lambda (slots &aux (name (included-slot-name (car slots))))
                 (unless (find name (dd-slots included-structure)
                               :test #'string= :key #'dsd-name)
-                  (error 'simple-program-error
-                         :format-control "slot name ~S not present in included structure"
-                         :format-arguments (list name)))
+                  (%program-error "slot name ~S not present in included structure"
+                                 name))
                 (when (find name (cdr slots)
                             :test #'string= :key #'included-slot-name)
-                  (error 'simple-program-error
-                         :format-control "included slot name ~S specified more than once"
-                         :format-arguments (list name))))
+                  (%program-error "included slot name ~S specified more than once"
+                                 name)))
               modified-slots))
 
       (incf (dd-length dd) (dd-length included-structure))
@@ -1335,8 +1329,8 @@ or they must be declared locally notinline at each call site.~@:>"
 (defun mutable-layout-p (old-layout new-layout)
   (let ((old-bitmap (layout-bitmap old-layout))
         (new-bitmap (layout-bitmap new-layout)))
-    (assert (= old-bitmap (dd-bitmap (layout-info old-layout))))
-    (assert (= new-bitmap (dd-bitmap (layout-info new-layout))))
+    (aver (= old-bitmap (dd-bitmap (layout-info old-layout))))
+    (aver (= new-bitmap (dd-bitmap (layout-info new-layout))))
     (dotimes (i (dd-length (layout-info old-layout)) t)
       (when (and (logbitp i new-bitmap) ; a tagged (i.e. scavenged) slot
                  (not (logbitp i old-bitmap))) ; that was opaque bits
